@@ -1,0 +1,178 @@
+# Builds ArtCoreConvert.exe + Setup.exe on Windows; runs the tests on Linux (ffmpeg, Xvfb).
+# Every push / PR: artifacts on the run page (Actions → run → Artifacts).
+# Publishing a release (Releases → Draft a new release → tag 1.0.0 → Publish):
+# the installer and a portable zip are built and attached to that release.
+name: Build
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+  release:
+    types: [published]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: System packages (ffmpeg, Xvfb)
+        run: |
+          sudo apt-get update -q
+          sudo apt-get install -y -q ffmpeg xvfb libxcb-cursor0 libxkbcommon-x11-0 libxcb-icccm4 \
+            libxcb-keysyms1 libxcb-image0 libxcb-render-util0 libxcb-xinerama0 libegl1
+      - name: Python packages
+        run: python -m pip install -r requirements.txt pytest
+      - name: Tests (Qt under Xvfb, real encodes with the CPU encoders)
+        env:
+          QT_QPA_PLATFORM: xcb
+        run: xvfb-run -a -s "-screen 0 1600x1000x24" python -m pytest -q tests
+
+  windows:
+    needs: tests
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Check version matches the release tag
+        if: github.event_name == 'release'
+        shell: pwsh
+        run: |
+          $tag = "${{ github.event.release.tag_name }}".TrimStart("v", "V")
+          $code = (Select-String -Path convert/__init__.py -Pattern '^VERSION\s*=\s*"([^"]+)"').Matches[0].Groups[1].Value
+          $iss = (Select-String -Path setup.iss -Pattern '#define AppVersion\s+"([^"]+)"').Matches[0].Groups[1].Value
+          if ($tag -ne $code -or $tag -ne $iss) {
+            Write-Error "Release tag $tag does not match the code version (convert/__init__.py: $code, setup.iss: $iss)."
+            exit 1
+          }
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt pyinstaller pillow
+
+      - name: Download FFmpeg
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python tools/fetch_ffmpeg.py
+
+      - name: Smoke test from source (ffmpeg found, encoders, a real conversion)
+        env:
+          QT_QPA_PLATFORM: offscreen
+          ARTCORE_FFMPEG_DIR: ffmpeg/bin
+        shell: pwsh
+        run: |
+          python run.py --selftest
+          $c = $LASTEXITCODE
+          Get-Content "$env:TEMP\artcore_convert_selftest.txt"
+          exit $c
+
+      - name: Render icon
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: python tools/make_icon.py
+
+      - name: PyInstaller
+        run: >
+          python -m PyInstaller --noconfirm --clean --windowed
+          --name ArtCoreConvert
+          --icon assets/icon.ico
+          --version-file version_info.txt
+          --collect-data qtawesome
+          --exclude-module PySide6.QtQml
+          --exclude-module PySide6.QtQuick
+          --exclude-module PySide6.QtQuickWidgets
+          --exclude-module PySide6.QtQuick3D
+          --exclude-module PySide6.QtQuickControls2
+          --exclude-module PySide6.QtPdf
+          --exclude-module PySide6.QtPdfWidgets
+          --exclude-module PySide6.QtDataVisualization
+          --exclude-module PySide6.QtCharts
+          --exclude-module PySide6.QtGraphs
+          --exclude-module PySide6.QtWebEngineCore
+          --exclude-module PySide6.QtWebEngineWidgets
+          --exclude-module PySide6.QtWebChannel
+          --exclude-module PySide6.QtWebSockets
+          --exclude-module PySide6.QtMultimedia
+          --exclude-module PySide6.QtMultimediaWidgets
+          --exclude-module PySide6.QtSql
+          --exclude-module PySide6.QtTest
+          --exclude-module PySide6.QtDesigner
+          --exclude-module PySide6.QtHelp
+          --exclude-module PySide6.QtBluetooth
+          --exclude-module PySide6.QtPositioning
+          --exclude-module PySide6.QtLocation
+          --exclude-module PySide6.QtSensors
+          --exclude-module PySide6.QtSerialPort
+          --exclude-module PySide6.QtSvgWidgets
+          --exclude-module PySide6.Qt3DCore
+          --exclude-module PySide6.QtScxml
+          --exclude-module PySide6.QtStateMachine
+          --exclude-module PySide6.QtTextToSpeech
+          --exclude-module PySide6.QtRemoteObjects
+          --exclude-module PySide6.QtNfc
+          --exclude-module PySide6.QtSpatialAudio
+          --exclude-module PySide6.QtHttpServer
+          --exclude-module PySide6.QtOpenGLWidgets
+          run.py
+
+      - name: Trim unused Qt parts, add FFmpeg
+        shell: pwsh
+        run: |
+          python tools/trim_build.py dist/ArtCoreConvert
+          Copy-Item -Recurse ffmpeg dist/ArtCoreConvert/ffmpeg
+
+      - name: Self-test the built exe
+        shell: pwsh
+        run: |
+          Remove-Item "$env:TEMP\artcore_convert_selftest.txt" -ErrorAction SilentlyContinue
+          Remove-Item -Recurse "$env:TEMP\artcore_convert_selftest" -ErrorAction SilentlyContinue
+          $p = Start-Process -FilePath "dist\ArtCoreConvert\ArtCoreConvert.exe" -ArgumentList "--selftest" -Wait -PassThru
+          Get-Content "$env:TEMP\artcore_convert_selftest.txt"
+          if ($p.ExitCode -ne 0) { Write-Error "self-test failed (exit $($p.ExitCode))"; exit 1 }
+          $mb = [math]::Round(((Get-ChildItem dist\ArtCoreConvert -Recurse | Measure-Object Length -Sum).Sum / 1MB), 1)
+          Write-Host "dist size: $mb MB"
+
+      - name: Install Inno Setup
+        run: choco install innosetup --no-progress -y
+
+      - name: Build installer
+        shell: pwsh
+        run: |
+          $iscc = @("${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe", "$env:ProgramFiles\Inno Setup 6\ISCC.exe") |
+                  Where-Object { Test-Path $_ } | Select-Object -First 1
+          & $iscc setup.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Portable zip
+        shell: pwsh
+        run: |
+          Copy-Item LICENSE dist/ArtCoreConvert/LICENSE.txt
+          Copy-Item THIRD-PARTY.md dist/ArtCoreConvert/THIRD-PARTY.txt
+          Set-Content dist/ArtCoreConvert/portable.ini "[ArtCore]`r`n; delete this file to use %APPDATA%\ArtCoreConvert"
+          Compress-Archive -Path dist/ArtCoreConvert -DestinationPath installer/ArtCoreConvert-portable.zip
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ArtCoreConvert-${{ github.sha }}
+          path: installer/*
+
+      - name: Attach to the published release
+        if: github.event_name == 'release'
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "${{ github.event.release.tag_name }}" installer/* --clobber --repo "${{ github.repository }}"
