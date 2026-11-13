@@ -24,17 +24,20 @@ from .i18n import t
 from .runner import Runner
 
 COL_N, COL_FILE, COL_SRC, COL_PROFILE, COL_STATE = range(5)
-STATE_ICON = {"wait": ("fa6s.clock", style.MUTED), "probe": ("fa6s.magnifying-glass", style.MUTED),
-              "run": ("fa6s.gear", "#4dabf7"), "pause": ("fa6s.pause", "#ffc53d"),
-              "done": ("fa6s.circle-check", "#51cf66"), "error": ("fa6s.circle-xmark", "#ff6b6b"),
-              "stop": ("fa6s.ban", style.MUTED), "skip": ("fa6s.forward", style.MUTED)}
+def state_icon(status: str):
+    """The status icon of a queue row, in the colours of the theme."""
+    name, color = {"wait": ("fa6s.clock", "MUTED"), "probe": ("fa6s.magnifying-glass", "MUTED"),
+                   "run": ("fa6s.gear", "RUN"), "pause": ("fa6s.pause", "WARN"), "done": ("fa6s.circle-check", "OK"),
+                   "error": ("fa6s.circle-xmark", "ERR"), "stop": ("fa6s.ban", "MUTED"),
+                   "skip": ("fa6s.forward", "MUTED")}.get(status, ("fa6s.clock", "MUTED"))
+    return style.icon(name, getattr(style, color))
 EDITABLE = ("wait", "error", "stop", "skip", "done")
 
 
 def ctl_button(icon_name: str, tip: str, size: int = 18, slot=None, obj: str = "ctl") -> QToolButton:
     b = QToolButton()
     b.setObjectName(obj)
-    b.setIcon(style.icon(icon_name, "#ffffff"))
+    b.setIcon(style.icon(icon_name, "#ffffff" if obj == "primaryBtn" else style.ICON))
     b.setIconSize(QSize(size, size))
     b.setToolTip(tip)
     b.setCursor(Qt.PointingHandCursor)
@@ -822,8 +825,7 @@ class MainWindow(QMainWindow):
         it.setToolTip(COL_SRC, it.text(COL_SRC))
         it.setText(COL_PROFILE, J.describe(j.settings, self.av if self.av_ready else None, t))
         it.setToolTip(COL_PROFILE, it.text(COL_PROFILE))
-        icon, color = STATE_ICON.get(j.status, STATE_ICON["wait"])
-        it.setIcon(COL_STATE, style.icon(icon, color))
+        it.setIcon(COL_STATE, state_icon(j.status))
         if j.status in ("run", "pause"):
             text = f"{j.progress * 100:.1f}%"
         elif j.status == "done":
@@ -838,7 +840,7 @@ class MainWindow(QMainWindow):
         f.setBold(bold)
         for c in range(5):
             it.setFont(c, f)
-            it.setForeground(c, QColor("#8ab4ff") if bold else QColor(style.MUTED if j.status in ("done", "stop", "skip")
+            it.setForeground(c, QColor(style.RUN_TEXT) if bold else QColor(style.MUTED if j.status in ("done", "stop", "skip")
                                                                        else style.TEXT))
 
     def _renumber(self):
@@ -1137,7 +1139,7 @@ class MainWindow(QMainWindow):
             self.i_text.setText(t("probing"))
             return
         if info.error:
-            self.i_text.setText(f"<span style='color:#ff6b6b'>{_esc(info.error)}</span>")
+            self.i_text.setText(f"<span style='color:{style.ERR}'>{_esc(info.error)}</span>")
             return
         rows = [f"<b>{t('i_container')}</b>: {_esc(info.format_long or info.format)}",
                 f"<b>{t('i_duration')}</b>: {P.fmt_time(info.duration)} · <b>{t('i_size')}</b>: {P.fmt_size(info.size)}"
@@ -1160,11 +1162,11 @@ class MainWindow(QMainWindow):
                 rows += [track(s, fn(s)) for s in ss]
         warn = [t(w) for w in dict.fromkeys(J.plan(j)["warnings"])]
         if warn:
-            rows.append("<br>" + "<br>".join(f"<span style='color:#ffc53d'>⚠ {_esc(w)}</span>" for w in warn))
+            rows.append("<br>" + "<br>".join(f"<span style='color:{style.WARN}'>⚠ {_esc(w)}</span>" for w in warn))
         if j.status == "done" and j.out:
             rows.append(f"<br><b>{t('i_result')}</b>: {_esc(j.out)} ({P.fmt_size(j.out_size)})")
         elif j.status == "error" and j.error:
-            rows.append(f"<br><span style='color:#ff6b6b'>{_esc(j.error)}</span>")
+            rows.append(f"<br><span style='color:{style.ERR}'>{_esc(j.error)}</span>")
         self.i_text.setText("<br>".join(rows))
         self._show_thumb(j)
 
@@ -1444,7 +1446,7 @@ class MainWindow(QMainWindow):
         self.b_start.setEnabled(not busy or self.runner.paused)
         self.b_start.setText("  " + (t("resume") if busy and self.runner.paused else t("start")))
         self.b_pause.setEnabled(busy)
-        self.b_pause.setIcon(style.icon("fa6s.play" if self.runner.paused else "fa6s.pause", "#ffffff"))
+        self.b_pause.setIcon(style.icon("fa6s.play" if self.runner.paused else "fa6s.pause", style.ICON))
         self.b_pause.setToolTip((t("resume") if self.runner.paused else t("pause")) + " (Space)")
         self.b_stop.setEnabled(busy or self.running)
         has_sel = bool(self.view.selectedItems())
@@ -1549,12 +1551,12 @@ class MainWindow(QMainWindow):
 
     def settings_dialog(self):
         from .dialogs import SettingsDialog
-        lang = self.cfg.get("language")
+        lang, theme = self.cfg.get("language"), self.cfg.get("theme", "dark")
         if SettingsDialog(self.cfg, self).exec():
             config.save(self.cfg)
             for j in self.jobs:
                 self._refresh(j)
-            if lang != self.cfg.get("language"):
+            if lang != self.cfg.get("language") or theme != self.cfg.get("theme", "dark"):
                 QMessageBox.information(self, APP_TITLE, t("lang_restart"))
 
     def encoders_dialog(self):
@@ -1665,7 +1667,7 @@ class MainWindow(QMainWindow):
     # ── window ────────────────────────────────────────────────
     def showEvent(self, e):
         super().showEvent(e)
-        winint.dark_title_bar(int(self.winId()))
+        winint.dark_title_bar(int(self.winId()), style.IS_DARK)
         self.statusBar().setStyleSheet(f"color: {style.MUTED};")
 
     def resizeEvent(self, e):

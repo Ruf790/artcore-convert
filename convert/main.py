@@ -5,9 +5,9 @@ from __future__ import annotations
 import os
 import sys
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QWidget
 
 from . import APP_ID, APP_TITLE, VERSION, config, winint
 from .i18n import set_lang
@@ -24,6 +24,18 @@ def _send_to_running(paths: list[str]) -> bool:
     s.waitForBytesWritten(1000)
     s.disconnectFromServer()
     return True
+
+
+class TitleBars(QObject):
+    """Every window and dialog gets a title bar in the colours of the theme when it is first shown."""
+
+    def eventFilter(self, obj, ev):
+        if ev.type() == QEvent.Show and isinstance(obj, QWidget) and obj.isWindow() and \
+                not obj.property("acTitled"):
+            obj.setProperty("acTitled", True)
+            from . import style
+            winint.dark_title_bar(int(obj.winId()), style.IS_DARK)
+        return False
 
 
 def selftest() -> int:
@@ -117,8 +129,11 @@ def main() -> int:
     app.setApplicationName(APP_TITLE)
     app.setStyle("Fusion")
     from . import style
+    style.set_theme(cfg.get("theme", "dark"))
     app.setStyleSheet(style.stylesheet())
     app.setWindowIcon(style.app_icon())
+    title_bars = TitleBars(app)
+    app.installEventFilter(title_bars)
     if cfg.get("language", "ru") == "ru":
         from PySide6.QtCore import QLibraryInfo, QTranslator
         tr = QTranslator(app)

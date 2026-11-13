@@ -9,6 +9,7 @@ import sys
 
 DEFAULTS = {
     "language":      "ru",
+    "theme":         "dark",        # dark | light | auto (as Windows apps)
     "single_window": True,          # files opened from Explorer go to the running converter
     "check_updates": True,
     "last_update_check": 0,
@@ -89,6 +90,8 @@ def load() -> dict:
         cfg.update({k: v for k, v in saved.items() if k in DEFAULTS})
     if cfg.get("language") not in ("ru", "en"):
         cfg["language"] = "ru"
+    if cfg.get("theme") not in ("dark", "light", "auto"):
+        cfg["theme"] = "dark"
     if cfg.get("out_mode") not in ("source", "folder"):
         cfg["out_mode"] = "source"
     if cfg.get("priority") not in PRIORITIES:

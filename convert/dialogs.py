@@ -54,6 +54,11 @@ class SettingsDialog(QDialog):
         self.lang.addItem("English", "en")
         self.lang.setCurrentIndex(0 if cfg.get("language") == "ru" else 1)
         form.addRow(t("language"), self.lang)
+        self.theme = QComboBox()
+        for key in ("dark", "light", "auto"):
+            self.theme.addItem(t("theme_" + key), key)
+        self.theme.setCurrentIndex(max(0, self.theme.findData(cfg.get("theme", "dark"))))
+        form.addRow(t("theme"), self.theme)
         self.suffix = QLineEdit(cfg.get("out_suffix", "_convert"))
         self.suffix.setPlaceholderText(t("suffix_empty"))
         form.addRow(t("out_suffix"), self.suffix)
@@ -75,6 +80,7 @@ class SettingsDialog(QDialog):
 
     def accept(self):
         self.cfg["language"] = self.lang.currentData()
+        self.cfg["theme"] = self.theme.currentData()
         self.cfg["out_suffix"] = self.suffix.text().strip()
         for k, cb in self.checks.items():
             self.cfg[k] = cb.isChecked()
@@ -134,12 +140,17 @@ class EncodersDialog(QDialog):
                        (E.VENDOR_LABEL[e.vendor] if e.hw else e.ffname.replace("lib", "") + f" ({t('cpu')})"))
             it.setText(1, e.ffname)
             ok = av.ok.get(e.id)
-            it.setIcon(2, style.icon("fa6s.circle-check" if ok else "fa6s.circle-xmark", "#51cf66" if ok else style.MUTED))
-            why = av.errors.get(e.id, "")
-            it.setText(2, t("enc_ok") + (f", {max(e.bits)} bit" if ok else "") if ok else
-                       (t("enc_not_in_build") if e.id not in av.errors and not ok and not e.hw else
-                        t("enc_no_hw") + (f": {why}" if why else "")))
-            it.setToolTip(2, why)
+            it.setIcon(2, style.icon("fa6s.circle-check" if ok else "fa6s.circle-xmark", style.OK if ok else style.MUTED))
+            line = av.errors.get(e.id, "")
+            if ok:
+                text = t("enc_ok") + f", {max(e.bits)} bit"
+            elif not e.hw or e.id not in av.reasons:
+                text = t("enc_not_in_build")
+            else:
+                text = t("why_" + av.reasons[e.id])
+            it.setText(2, text)
+            it.setToolTip(2, f"{text}\n\nffmpeg: {line}" if line else text)
+            it.setToolTip(0, it.toolTip(2))
 
 
 class UpdateDialog(QDialog):

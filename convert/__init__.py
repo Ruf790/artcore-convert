@@ -1,6 +1,6 @@
 """ArtCore Convert — a video converter on FFmpeg with a Qt interface (NVENC / AMF / QSV / x264 / x265 / SVT-AV1)."""
-VERSION_TUPLE = (1, 0, 0, 0)
-VERSION       = "1.0.0"
+VERSION_TUPLE = (1, 0, 1, 0)
+VERSION       = "1.0.1"
 APP_TITLE     = "ArtCore Convert"
 APP_ID        = "ArtCore.Convert"
 REPO          = "Ruf790/artcore-convert"
