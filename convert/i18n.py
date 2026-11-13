@@ -229,7 +229,12 @@ STRINGS = {
                        "x264, x265, SVT-AV1.<br><br>FFmpeg {1}<br><small>{2}</small><br><br>GNU GPL v3 · "
                        "<a href='https://github.com/Ruf790/artcore-convert'>github.com/Ruf790/artcore-convert</a>"),
     "language":       ("Язык", "Language"),
-    "lang_restart":   ("Язык сменится после перезапуска программы.", "The language changes after a restart."),
+    "lang_restart":   ("Язык и оформление сменятся после перезапуска программы.",
+                       "The language and the look change after a restart."),
+    "theme":          ("Оформление", "Look"),
+    "theme_dark":     ("Тёмное", "Dark"),
+    "theme_light":    ("Светлое", "Light"),
+    "theme_auto":     ("Как в Windows", "As in Windows"),
     "out_suffix":     ("Добавлять к имени", "Add to the name"),
     "suffix_empty":   ("ничего", "nothing"),
     "suffix_hint":    ("Фильм.mkv → Фильм_convert.mkv. Исходник никогда не перезаписывается.",
@@ -247,16 +252,22 @@ STRINGS = {
     "enc_state":      ("Состояние", "State"),
     "enc_ok":         ("работает", "works"),
     "enc_no_hw":      ("нет на этом ПК", "not on this PC"),
+    "why_no_nvidia":  ("нет видеокарты NVIDIA", "no NVIDIA graphics card"),
+    "why_no_amd":     ("нет видеокарты AMD", "no AMD graphics card"),
+    "why_no_intel":   ("нет графики Intel (или она выключена)", "no Intel graphics (or it is turned off)"),
+    "why_driver_old": ("драйвер видеокарты устарел — обновите его", "the graphics driver is too old — update it"),
+    "why_gpu_old":    ("видеокарта не умеет этот кодек", "the graphics card can't do this codec"),
+    "why_unknown":    ("не запустился (подробности — в подсказке)", "didn't start (details in the tooltip)"),
     "enc_not_in_build": ("нет в этой сборке ffmpeg", "not in this ffmpeg build"),
     "enc_head":       ("FFmpeg {0} · видеокарта: {1}", "FFmpeg {0} · graphics card: {1}"),
     "enc_no_gpu":     ("не найдена (кодирует процессор)", "none found (the CPU encodes)"),
     "enc_found":      ("Видеокарта: {0}. Кодеры: {1}", "Graphics card: {0}. Encoders: {1}"),
     "enc_recheck":    ("Проверить заново", "Check again"),
-    "enc_dialog_hint": ("Кодер видеокарты проверяется настоящим кодированием нескольких кадров. «Нет на этом ПК» — "
-                        "видеокарта или драйвер его не умеют (например, AV1 есть только у NVIDIA RTX 40/50, "
+    "enc_dialog_hint": ("Кодер видеокарты проверяется настоящим кодированием нескольких кадров; наведите мышь на строку, "
+                        "чтобы увидеть ответ ffmpeg. Видеокарта или драйвер умеют не всё (например, AV1 есть только у NVIDIA RTX 40/50, "
                         "AMD RX 7000 и Intel Arc). Если поставили новую видеокарту или драйвер — «Проверить заново».",
-                        "A GPU encoder is checked by really encoding a few frames. «Not on this PC» — the card or the "
-                        "driver can't do it (AV1 needs an NVIDIA RTX 40/50, AMD RX 7000 or Intel Arc, for one). "
+                        "A GPU encoder is checked by really encoding a few frames; hover a row for ffmpeg's answer. Cards "
+                        "and drivers can't do everything (AV1 needs an NVIDIA RTX 40/50, AMD RX 7000 or Intel Arc, for one). "
                         "After a new card or driver — «Check again»."),
     # updates
     "upd_check_now":  ("Проверить обновления", "Check for updates"),

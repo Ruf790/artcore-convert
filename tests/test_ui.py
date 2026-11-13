@@ -148,3 +148,25 @@ def test_stop_and_pause(qapp, media, data_dir, tmp_path):
     j = w.jobs[0]
     assert j.status == "stop" and not os.listdir(str(tmp_path / "o"))
     w.close()
+
+
+def test_light_theme(qapp, media, data_dir):
+    from convert import style
+    try:
+        style.set_theme("light")
+        qapp.setStyleSheet(style.stylesheet())
+        assert not style.IS_DARK and style.TEXT == style.PALETTES["light"]["TEXT"]
+        assert style.PALETTES["light"]["PANEL"] in qapp.styleSheet()
+        w = _win(qapp, theme="light")
+        w.add_paths([os.path.join(media, "Movie (2017).mkv")])
+        assert pump(qapp, 10, lambda: w.jobs[0].status == "wait")
+        w.view.setCurrentItem(w.items[w.jobs[0].uid])
+        pump(qapp, 0.3)
+        w.grab()
+        from convert.dialogs import EncodersDialog
+        d = EncodersDialog(w.av, True, w)
+        d.grab()
+        w.close()
+    finally:
+        style.set_theme("dark")
+        qapp.setStyleSheet(style.stylesheet())

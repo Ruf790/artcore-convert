@@ -56,7 +56,8 @@ class Available:
     def __init__(self, ok: dict | None = None):
         self.ok: dict[str, bool] = dict(ok or {})
         self.audio: set[str] = set()
-        self.errors: dict[str, str] = {}            # encoder id → why its test failed (last ffmpeg line)
+        self.errors: dict[str, str] = {}            # encoder id → the telling ffmpeg line of its failed test
+        self.reasons: dict[str, str] = {}           # encoder id → why_* key (no_amd, driver_old, …)
 
     def works(self, enc_id: str) -> bool:
         if is_auto(enc_id):
@@ -99,7 +100,40 @@ def ffmpeg_encoders() -> set[str]:
     return names
 
 
-def _try(e: VEnc) -> tuple[bool, str]:
+# ffmpeg's words → why a hardware encoder can't run here (the why_* strings of i18n)
+WHY = (
+    ("nvidia", ("nvcuda.dll", "cannot load libcuda", "cuinit", "no nvidia", "cuda_error_no_device"), "no_nvidia"),
+    ("nvidia", ("driver does not support the required nvenc api", "minimum required nvidia driver"), "driver_old"),
+    ("nvidia", ("no capable devices found", "unsupported device", "codec not supported", "not supported by the device"),
+     "gpu_old"),
+    ("amd", ("amfrt64.dll", "amfrt32.dll", "dll amfrt", "failed to open amf", "amf runtime", "cannot load amf"), "no_amd"),
+    ("amd", ("codec not supported", "encoder not supported", "amf_not_supported", "no device"), "gpu_old"),
+    ("intel", ("mfx session", "mfx_err_unsupported", "unsupported", "no device available", "device creation failed",
+               "failed to create a vaapi", "libvpl", "mfxinit", "-9 "), "no_intel"),
+)
+GENERIC_FFMPEG = ("nothing was written", "conversion failed", "error while opening encoder", "exiting with exit code",
+                  "could not open encoder before eof", "error sending frames", "terminating thread", "task finished")
+
+
+def why(e: VEnc, stderr: str) -> tuple[str, str]:
+    """(why_* key, the most telling line) for a failed hardware test."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    low_all = "\n".join(lines).lower()
+    key = ""
+    for vendor, words, k in WHY:
+        if vendor == e.vendor and any(w in low_all for w in words):
+            key = k
+            break
+    useful = [ln for ln in lines if not any(g in ln.lower() for g in GENERIC_FFMPEG)]
+    line = next((ln for ln in useful if any(x in ln.lower() for x in ("cannot", "failed", "error", "not supported",
+                                                                       "unsupported", "no capable", "dll"))),
+                useful[-1] if useful else (lines[-1] if lines else ""))
+    import re
+    line = re.sub(r"^\[[^\]]*@ [0-9a-fx]+\]\s*", "", line)          # «[h264_amf @ 0000…] » prefix
+    return key or {"nvidia": "no_nvidia", "amd": "no_amd", "intel": "no_intel"}.get(e.vendor, "unknown"), line
+
+
+def _try(e: VEnc) -> tuple[bool, str, str]:
     """Encode 5 black frames with this encoder and its normal arguments (10-bit too when it has it)."""
     exe = ff.ffmpeg()
     args = [exe, "-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30:d=0.2",
@@ -108,10 +142,12 @@ def _try(e: VEnc) -> tuple[bool, str]:
     args += ["-f", "null", "-"]
     try:
         r = ff.run(args, 30)
-        lines = [ln for ln in (r.stderr or "").strip().splitlines() if ln.strip()]
-        return r.returncode == 0, (lines[-1] if lines else f"exit {r.returncode}") if r.returncode else ""
+        if r.returncode == 0:
+            return True, "", ""
+        key, line = why(e, r.stderr)
+        return False, key, line or f"exit {r.returncode}"
     except Exception as ex:
-        return False, str(ex)
+        return False, "unknown", str(ex)
 
 
 def detect(cache: dict | None = None) -> Available:
@@ -126,15 +162,19 @@ def detect(cache: dict | None = None) -> Available:
         if not e.hw:
             av.ok[e.id] = e.ffname in names
     hw = [e for e in VIDEO if e.hw and e.ffname in names]
-    if isinstance(cached, dict) and all(e.id in cached for e in hw):
+    # the cache: {id: [ok, why key, line]} (1.0.0 kept a bare bool — those are tested again)
+    if isinstance(cached, dict) and all(isinstance(cached.get(e.id), list) for e in hw):
         for e in hw:
-            av.ok[e.id] = bool(cached[e.id])
+            ok, key, line = (list(cached[e.id]) + ["", ""])[:3]
+            av.ok[e.id] = bool(ok)
+            if not ok:
+                av.reasons[e.id], av.errors[e.id] = key, line
     else:
         with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
-            for e, (ok, err) in zip(hw, pool.map(_try, hw)):
+            for e, (ok, key, line) in zip(hw, pool.map(_try, hw)):
                 av.ok[e.id] = ok
-                if err:
-                    av.errors[e.id] = err[:300]
+                if not ok:
+                    av.reasons[e.id], av.errors[e.id] = key, line[:300]
     for e in VIDEO:
         av.ok.setdefault(e.id, False)
     return av
@@ -142,7 +182,8 @@ def detect(cache: dict | None = None) -> Available:
 
 def cache_entry(av: Available) -> dict:
     ver = ff.version()
-    return {ver: {e.id: av.ok.get(e.id, False) for e in VIDEO if e.hw}} if ver else {}
+    return {ver: {e.id: [av.ok.get(e.id, False), av.reasons.get(e.id, ""), av.errors.get(e.id, "")]
+                  for e in VIDEO if e.hw}} if ver else {}
 
 
 # ── arguments ────────────────────────────────────────────────

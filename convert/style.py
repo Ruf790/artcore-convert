@@ -4,14 +4,45 @@ from __future__ import annotations
 from PySide6.QtCore import QRectF, Qt
 from PySide6.QtGui import QColor, QIcon, QLinearGradient, QPainter, QPainterPath, QPixmap
 
-ACCENT = "#0d6efd"
-ACCENT2 = "#6f42c1"
-BG = "#0f1115"
-PANEL = "#171a21"
-PANEL2 = "#1f232c"
-BORDER = "#2b303b"
-TEXT = "#e9ecef"
-MUTED = "#9aa3b2"
+PALETTES = {
+    "dark": dict(ACCENT="#0d6efd", ACCENT2="#6f42c1", BG="#0f1115", PANEL="#171a21", PANEL2="#1f232c",
+                 BORDER="#2b303b", TEXT="#e9ecef", MUTED="#9aa3b2", STRONG="#ffffff", ICON="#ffffff",
+                 HOVER="rgba(255,255,255,38)", PRESSED="rgba(255,255,255,60)", SCROLL="rgba(255,255,255,50)",
+                 ALT="#1a1d25", SEL="rgba(13,110,253,95)", SEL_TEXT="#ffffff", HANDLE="#ffffff",
+                 PROG_TEXT="#ffffff", OK="#51cf66", ERR="#ff6b6b", WARN="#ffc53d", RUN="#4dabf7",
+                 RUN_TEXT="#8ab4ff"),
+    "light": dict(ACCENT="#0d6efd", ACCENT2="#6f42c1", BG="#f3f5f9", PANEL="#ffffff", PANEL2="#eef1f6",
+                  BORDER="#d5dae3", TEXT="#1c2027", MUTED="#667085", STRONG="#0b0d12", ICON="#2a2f3a",
+                  HOVER="rgba(0,0,0,20)", PRESSED="rgba(0,0,0,36)", SCROLL="rgba(0,0,0,55)",
+                  ALT="#f7f8fb", SEL="rgba(13,110,253,45)", SEL_TEXT="#0b0d12", HANDLE="#0d6efd",
+                  PROG_TEXT="#1c2027", OK="#2f9e44", ERR="#e03131", WARN="#d48806", RUN="#1c7ed6",
+                  RUN_TEXT="#0b5ed7"),
+}
+THEME = "dark"
+IS_DARK = True
+ACCENT = ACCENT2 = BG = PANEL = PANEL2 = BORDER = TEXT = MUTED = STRONG = ICON = ""
+OK = ERR = WARN = RUN = RUN_TEXT = ""
+
+
+def set_theme(name: str) -> str:
+    """dark | light | auto (as Windows apps are set: the Qt colour scheme). Call before any window is built;
+    the module's colour names follow the theme. Returns the theme in use."""
+    global THEME, IS_DARK
+    if name == "auto":
+        name = "dark"
+        try:
+            from PySide6.QtCore import Qt as _Qt
+            from PySide6.QtGui import QGuiApplication
+            app = QGuiApplication.instance()
+            if app is not None and app.styleHints().colorScheme() == _Qt.ColorScheme.Light:
+                name = "light"
+        except Exception:
+            pass
+    THEME = name if name in PALETTES else "dark"
+    IS_DARK = THEME == "dark"
+    globals().update(PALETTES[THEME])
+    _icons.clear()
+    return THEME
 
 
 def _check_png() -> str:
@@ -41,16 +72,18 @@ def _icon_png(name: str, color: str, file: str, px: int = 12) -> str:
 
 
 def stylesheet() -> str:
-    return (QSS.replace("%CHECK%", _check_png())
-            .replace("%CLOSE%", _icon_png("fa6s.xmark", MUTED, "artcore_convert_close.png"))
-            .replace("%CLOSE_HOT%", _icon_png("fa6s.xmark", "#ffffff", "artcore_convert_close_hot.png")))
+    return (QSS.format(**PALETTES[THEME])
+            .replace("%CHECK%", _check_png())
+            .replace("%CLOSE%", _icon_png("fa6s.xmark", MUTED, f"artcore_convert_close_{THEME}.png"))
+            .replace("%CLOSE_HOT%", _icon_png("fa6s.xmark", STRONG, f"artcore_convert_close_hot_{THEME}.png")))
 
 
 _icons: dict = {}
 
 
-def icon(name: str, color: str = TEXT):
+def icon(name: str, color: str = ""):
     """qtawesome icon, cached (a playlist row asks for two of them; 1000+ rows)."""
+    color = color or TEXT
     k = (name, color)
     ic = _icons.get(k)
     if ic is None:
@@ -157,7 +190,7 @@ def app_icon() -> QIcon:
     return ic
 
 
-QSS = f"""
+QSS = """
 QWidget {{ color: {TEXT}; font-size: 10pt; }}
 QMainWindow, QDialog {{ background: {BG}; }}
 QToolTip {{ background: {PANEL2}; color: {TEXT}; border: 1px solid {BORDER}; padding: 4px 7px; border-radius: 6px; }}
@@ -174,15 +207,15 @@ QPushButton#primary {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:
                        border: none; color: #ffffff; font-weight: 600; }}
 QPushButton#primary:hover {{ background: {ACCENT}; }}
 QToolButton#ctl {{ background: transparent; border: none; border-radius: 8px; padding: 6px; }}
-QToolButton#ctl:hover {{ background: rgba(255,255,255,38); }}
-QToolButton#ctl:pressed {{ background: rgba(255,255,255,60); }}
+QToolButton#ctl:hover {{ background: {HOVER}; }}
+QToolButton#ctl:pressed {{ background: {PRESSED}; }}
 QToolButton#ctl::menu-indicator {{ image: none; width: 0; }}
 QToolButton#ctlText {{ background: transparent; border: none; border-radius: 8px; padding: 6px 8px;
                        font-weight: 600; }}
-QToolButton#ctlText:hover {{ background: rgba(255,255,255,38); }}
+QToolButton#ctlText:hover {{ background: {HOVER}; }}
 QToolButton#ctlText::menu-indicator {{ image: none; width: 0; }}
-QLabel#time {{ font-size: 10pt; color: #ffffff; padding: 0 6px; }}
-QLabel#title {{ font-size: 13pt; font-weight: 600; color: #ffffff; }}
+QLabel#time {{ font-size: 10pt; color: {STRONG}; padding: 0 6px; }}
+QLabel#title {{ font-size: 13pt; font-weight: 600; color: {STRONG}; }}
 QLabel#badge {{ background: rgba(255,255,255,30); border: 1px solid rgba(255,255,255,60); border-radius: 5px;
                 padding: 1px 6px; font-size: 8.5pt; font-weight: 700; color: #ffffff; }}
 QLabel#badgeHdr {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #f59f00, stop:1 #e8590c);
@@ -192,7 +225,7 @@ QSlider#volume::sub-page:horizontal {{ background: #ffffff; border-radius: 2px; 
 QSlider#volume::handle:horizontal {{ background: #ffffff; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }}
 QListWidget#playlist {{ background: transparent; border: none; outline: none; }}
 QListWidget#playlist::item {{ padding: 8px 10px; border-radius: 8px; color: {TEXT}; }}
-QListWidget#playlist::item:hover {{ background: rgba(255,255,255,22); }}
+QListWidget#playlist::item:hover {{ background: {HOVER}; }}
 QListWidget#playlist::item:selected {{ background: rgba(13,110,253,90); }}
 QListWidget#recent {{ background: transparent; border: none; outline: none; }}
 QListWidget#recent::item {{ padding: 9px 12px; border-radius: 9px; }}
@@ -206,13 +239,13 @@ QLineEdit, QComboBox {{ background: {PANEL2}; border: 1px solid {BORDER}; border
 QLineEdit:focus, QComboBox:focus {{ border-color: {ACCENT}; }}
 QComboBox QAbstractItemView {{ background: {PANEL}; border: 1px solid {BORDER}; selection-background-color: {ACCENT}; }}
 QScrollBar:vertical {{ background: transparent; width: 8px; margin: 0; }}
-QScrollBar::handle:vertical {{ background: rgba(255,255,255,50); border-radius: 4px; min-height: 30px; }}
+QScrollBar::handle:vertical {{ background: {SCROLL}; border-radius: 4px; min-height: 30px; }}
 QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical {{ height: 0; }}
 QTreeWidget#playlist {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 12px; outline: none;
-                        alternate-background-color: #1a1d25; padding: 4px; }}
+                        alternate-background-color: {ALT}; padding: 4px; }}
 QTreeWidget#playlist::item {{ padding: 5px 4px; border: none; }}
-QTreeWidget#playlist::item:hover {{ background: rgba(255,255,255,18); }}
-QTreeWidget#playlist::item:selected {{ background: rgba(13,110,253,95); color: #ffffff; }}
+QTreeWidget#playlist::item:hover {{ background: {HOVER}; }}
+QTreeWidget#playlist::item:selected {{ background: {SEL}; color: {SEL_TEXT}; }}
 QHeaderView::section {{ background: {PANEL}; color: {MUTED}; border: none; border-bottom: 1px solid {BORDER};
                         padding: 6px 6px; font-size: 9pt; font-weight: 600; }}
 QSplitter::handle {{ background: transparent; }}
@@ -222,30 +255,30 @@ QWidget#mini {{ background: {PANEL}; border: 1px solid {BORDER}; border-radius: 
 QLabel#artist {{ font-size: 11.5pt; color: {TEXT}; }}
 QLabel#album {{ font-size: 10pt; color: {MUTED}; }}
 QLabel#format {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 rgba(13,110,253,70), stop:1 rgba(111,66,193,70));
-                 border: 1px solid rgba(255,255,255,40); border-radius: 7px; padding: 3px 9px; font-size: 9pt;
-                 font-weight: 600; color: #ffffff; }}
+                 border: 1px solid {BORDER}; border-radius: 7px; padding: 3px 9px; font-size: 9pt;
+                 font-weight: 600; color: {STRONG}; }}
 QLabel#hint {{ color: {MUTED}; font-size: 9pt; }}
 QToolButton#on {{ background: rgba(13,110,253,70); border: none; border-radius: 8px; padding: 6px; }}
 QToolButton#on:hover {{ background: rgba(13,110,253,110); }}
 QToolButton#play {{ border: none; border-radius: 22px; padding: 10px;
                     background: qlineargradient(x1:0, y1:0, x2:1, y2:1, stop:0 {ACCENT}, stop:1 {ACCENT2}); }}
 QToolButton#play:hover {{ background: {ACCENT}; }}
-QSlider::groove:horizontal {{ height: 4px; background: rgba(255,255,255,50); border-radius: 2px; }}
+QSlider::groove:horizontal {{ height: 4px; background: {SCROLL}; border-radius: 2px; }}
 QSlider::sub-page:horizontal {{ background: {ACCENT}; border-radius: 2px; }}
-QSlider::handle:horizontal {{ background: #ffffff; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }}
+QSlider::handle:horizontal {{ background: {HANDLE}; width: 12px; height: 12px; margin: -4px 0; border-radius: 6px; }}
 QDoubleSpinBox, QSpinBox {{ background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px 6px; }}
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: 10px; margin-top: 12px; padding: 12px 10px 8px 10px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {MUTED}; }}
 QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; top: -1px; }}
 QTabBar::tab {{ background: transparent; padding: 7px 14px; color: {MUTED}; border: none; }}
-QTabBar::tab:selected {{ color: #ffffff; border-bottom: 2px solid {ACCENT}; }}
+QTabBar::tab:selected {{ color: {STRONG}; border-bottom: 2px solid {ACCENT}; }}
 QTabBar#plTabs::tab {{ padding: 6px 8px 6px 12px; min-width: 60px; max-width: 220px; }}
 QTabBar#plTabs::tab:hover:!selected {{ color: {TEXT}; }}
 QTabBar#plTabs::close-button {{ image: url(%CLOSE%); subcontrol-position: right; border-radius: 4px;
                                margin-left: 4px; padding: 2px; }}
-QTabBar#plTabs::close-button:hover {{ image: url(%CLOSE_HOT%); background: rgba(255,255,255,30); }}
+QTabBar#plTabs::close-button:hover {{ image: url(%CLOSE_HOT%); background: {HOVER}; }}
 QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0; }}
-QScrollBar::handle:horizontal {{ background: rgba(255,255,255,50); border-radius: 4px; min-width: 30px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 4px; min-width: 30px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 QToolButton#primaryBtn {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2});
                           border: none; border-radius: 9px; padding: 7px 16px; color: #ffffff; font-weight: 700; }}
@@ -253,7 +286,7 @@ QToolButton#primaryBtn:hover {{ background: {ACCENT}; }}
 QToolButton#primaryBtn:disabled {{ background: {PANEL2}; color: {MUTED}; }}
 QToolButton:disabled {{ color: {MUTED}; }}
 QProgressBar {{ background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 7px; text-align: center;
-                color: #ffffff; min-height: 18px; font-size: 9pt; }}
+                color: {PROG_TEXT}; min-height: 18px; font-size: 9pt; }}
 QProgressBar::chunk {{ border-radius: 6px;
                        background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2}); }}
 QRadioButton::indicator {{ width: 15px; height: 15px; border-radius: 8px; border: 1px solid {BORDER}; background: {PANEL2}; }}
@@ -262,6 +295,9 @@ QRadioButton::indicator:checked {{ background: qradialgradient(cx:0.5, cy:0.5, r
 QStatusBar {{ background: {BG}; }}
 QStatusBar::item {{ border: none; }}
 QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0; }}
-QScrollBar::handle:horizontal {{ background: rgba(255,255,255,50); border-radius: 4px; min-width: 30px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 4px; min-width: 30px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 """
+
+
+set_theme("dark")

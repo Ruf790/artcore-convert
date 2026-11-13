@@ -144,3 +144,30 @@ def test_options_known_to_this_ffmpeg(enc):
     if probs and probs[0].endswith("not in this build"):
         pytest.skip(probs[0])
     assert probs == []
+
+
+def test_why_a_gpu_encoder_fails():
+    amf = """[h264_amf @ 000002a08eccec00] DLL amfrt64.dll failed to open
+[vost#0:0/h264_amf @ 0001] Error while opening encoder - maybe incorrect parameters
+[out#0/null @ 000002a08eccec00] Nothing was written into output file, because at least one of its streams received no packets."""
+    assert E.why(E.BY_ID["amf_h264"], amf) == ("no_amd", "DLL amfrt64.dll failed to open")
+    qsv = "[hevc_qsv @ 0x1] Error creating a MFX session: -9.\n[out#0/null @ 0x2] Nothing was written into output file"
+    assert E.why(E.BY_ID["qsv_hevc"], qsv) == ("no_intel", "Error creating a MFX session: -9.")
+    old = ("[av1_nvenc @ 0x1] Driver does not support the required nvenc API version. Required: 13.0 Found: 12.1\n"
+           "[av1_nvenc @ 0x1] The minimum required Nvidia driver for nvenc is 570.0 or newer")
+    assert E.why(E.BY_ID["nvenc_av1"], old)[0] == "driver_old"
+    assert E.why(E.BY_ID["nvenc_av1"], "[av1_nvenc @ 0x1] No capable devices found")[0] == "gpu_old"
+    assert E.why(E.BY_ID["nvenc_h264"], "")[0] == "no_nvidia"
+
+
+def test_cache_keeps_reasons(monkeypatch):
+    from convert import ff
+    monkeypatch.setattr(ff, "version", lambda: "test-1")
+    av = E.Available({"nvenc_hevc": True})
+    av.ok.update({e.id: e.id == "nvenc_hevc" for e in E.VIDEO})
+    av.reasons["amf_hevc"], av.errors["amf_hevc"] = "no_amd", "DLL amfrt64.dll failed to open"
+    cache = E.cache_entry(av)
+    assert cache["test-1"]["amf_hevc"] == [False, "no_amd", "DLL amfrt64.dll failed to open"]
+    monkeypatch.setattr(E, "ffmpeg_encoders", lambda: {e.ffname for e in E.VIDEO})
+    back = E.detect(cache)                                    # from the cache: no test encodes
+    assert back.ok["nvenc_hevc"] and back.reasons["amf_hevc"] == "no_amd"
