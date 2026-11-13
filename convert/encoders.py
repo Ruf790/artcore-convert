@@ -183,7 +183,7 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
         out += ["-quality", AMF_QUALITY[sp]]
         if rc == "quality" or kbps <= 0:
             out += ["-rc", "cqp", "-qp_i", str(q), "-qp_p", str(q)]
-            if e.family != "av1":
+            if e.family == "h264":                       # HEVC / AV1 AMF have no qp_b (no B-frame QP of their own)
                 out += ["-qp_b", str(q)]
         else:
             out += ["-rc", "vbr_peak", "-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k"]
