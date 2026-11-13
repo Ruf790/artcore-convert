@@ -232,9 +232,14 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                 args += ["-vf", ",".join(vf)]
             if bits >= 10 and s.hdr in ("HDR10", "HLG"):                  # keep the HDR colours
                 c = s.color
-                args += ["-color_primaries", c.get("color_primaries", "bt2020"),
-                         "-color_trc", c.get("color_transfer", "smpte2084"),
-                         "-colorspace", c.get("color_space", "bt2020nc")]
+                prim = c.get("color_primaries", "bt2020")
+                trc = c.get("color_transfer", "smpte2084" if s.hdr == "HDR10" else "arib-std-b67")
+                mat = c.get("color_space", "bt2020nc")
+                args += ["-color_primaries", prim, "-color_trc", trc, "-colorspace", mat]
+                if enc.id == "x265":                                      # into the VUI itself, every build
+                    i = args.index("-x265-params") + 1
+                    args[i] += f":colorprim={prim}:transfer={trc}:colormatrix={mat}" + \
+                        (":hdr10=1:repeat-headers=1" if s.hdr == "HDR10" else "")
         if cont == "mp4" and ((copy_v and s.codec == "hevc") or (enc is not None and enc.family == "hevc")):
             args += ["-tag:v", "hvc1"]                                      # plays on Apple / TVs
     # audio

@@ -37,7 +37,8 @@ def media(tmp_path_factory):
        "-metadata:s:a:1", "language=eng", "-metadata:s:s:0", "language=rus",
        os.path.join(d, "Movie (2017).mkv"))
     ff("-f", "lavfi", "-i", "testsrc=s=1280x720:r=24:d=2", "-f", "lavfi", "-i", "sine=f=600:d=2",
-       "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le", "-x265-params", "log-level=error",
+       "-c:v", "libx265", "-preset", "ultrafast", "-pix_fmt", "yuv420p10le",
+       "-x265-params", "log-level=error:colorprim=bt2020:transfer=smpte2084:colormatrix=bt2020nc",
        "-color_primaries", "bt2020", "-color_trc", "smpte2084", "-colorspace", "bt2020nc", "-c:a", "flac",
        os.path.join(d, "hdr.mkv"))
     ff("-f", "lavfi", "-i", "testsrc2=s=640x360:r=25:d=2", "-f", "lavfi", "-i", "sine=f=500:d=2",
