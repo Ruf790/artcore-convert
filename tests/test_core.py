@@ -136,3 +136,11 @@ def test_presets_and_queue_roundtrip():
     j.status = "run"
     k = J.Job.from_dict(j.to_dict())
     assert k.status == "wait" and k.settings == j.settings and k.tracks == j.tracks and k.preset == "phone"
+
+
+@pytest.mark.parametrize("enc", E.VIDEO, ids=lambda e: e.id)
+def test_options_known_to_this_ffmpeg(enc):
+    probs = E.check_options(enc)
+    if probs and probs[0].endswith("not in this build"):
+        pytest.skip(probs[0])
+    assert probs == []

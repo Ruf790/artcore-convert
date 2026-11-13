@@ -253,3 +253,48 @@ CONTAINER_SUBS = {
     "mp4": {"mov_text"},                                    # text subtitles are converted to mov_text
 }
 TEXT_SUBS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
+
+
+# ── self-check without the hardware ──────────────────────────
+GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params"}
+
+
+def check_options(e: VEnc) -> list[str]:
+    """Every option (and named value) our arguments use must be in `ffmpeg -h encoder=<name>` — this works
+    with no graphics card, so CI catches an NVENC / AMF / QSV argument a new ffmpeg no longer takes."""
+    exe = ff.ffmpeg()
+    try:
+        helptext = ff.run([exe, "-hide_banner", "-h", f"encoder={e.ffname}"], 20).stdout
+    except Exception as ex:
+        return [f"{e.ffname}: {ex}"]
+    if "is not recognized" in helptext or not helptext.strip():
+        return [f"{e.ffname}: not in this build"]
+    lines = helptext.splitlines()
+    opts: dict[str, set[str]] = {}
+    cur = None
+    for ln in lines:
+        st = ln.strip()
+        if st.startswith("-"):
+            cur = st.split()[0][1:]
+            opts[cur] = set()
+        elif cur and st and ln.startswith("     ") and not st.startswith("-"):
+            opts[cur].add(st.split()[0])                   # a named value of the option above
+    pix = next((ln.split(":", 1)[1].split() for ln in lines if "Supported pixel formats" in ln), [])
+    problems = []
+    for rc in ("quality", "bitrate"):
+        for speed in range(1, 8):
+            for bits in e.bits:
+                a = video_args(e, {"rc": rc, "quality": e.q_default, "bitrate": 5000, "speed": speed}, bits, 60)
+                for i in range(0, len(a) - 1, 2):
+                    k, v = a[i].lstrip("-"), a[i + 1]
+                    if k == "pix_fmt":
+                        if pix and v not in pix:
+                            problems.append(f"{e.ffname}: pix_fmt {v} not in {pix}")
+                        continue
+                    if k in GENERIC:
+                        continue
+                    if k not in opts:
+                        problems.append(f"{e.ffname}: no option -{k}")
+                    elif opts[k] and not v.lstrip("-").isdigit() and v not in opts[k]:
+                        problems.append(f"{e.ffname}: -{k} has no value {v} ({', '.join(sorted(opts[k]))})")
+    return sorted(set(problems))

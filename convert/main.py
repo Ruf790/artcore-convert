@@ -52,6 +52,10 @@ def selftest() -> int:
         missing = need - av.audio
         if missing:
             raise RuntimeError(f"this ffmpeg build lacks {sorted(missing)}")
+        problems = [p for e in E.VIDEO for p in E.check_options(e)]   # GPU arguments vs this ffmpeg, no GPU needed
+        lines.append(f"options of {len(E.VIDEO)} encoders checked: " + ("ok" if not problems else "; ".join(problems)))
+        if problems:
+            raise RuntimeError("encoder options: " + "; ".join(problems))
         src = os.path.join(tmp, "clip.mkv")
         os.makedirs(tmp, exist_ok=True)
         r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
