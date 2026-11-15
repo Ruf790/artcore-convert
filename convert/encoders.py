@@ -207,9 +207,15 @@ VPX_CPU = ("5", "4", "3", "2", "2", "1", "0")
 XVID_ME = ("1", "2", "3", "4", "5", "6", "6")
 
 
-def pix_fmt(e: VEnc, bits: int) -> str:
+def pix_fmt(e: VEnc, bits: int, chroma: str = "420") -> str:
+    """chroma 422 / 444 (1.3, the Pixel format row) only for the encoders that write it (filters.CHROMAS)."""
     if e.id == "prores":
-        return "yuv422p10le"
+        return "yuv444p10le" if chroma == "444" else "yuv422p10le"
+    from .filters import CHROMAS
+    if chroma in ("422", "444") and chroma in CHROMAS.get(e.id, ()):
+        if e.hw:
+            return "yuv444p16le" if bits >= 10 and 10 in e.bits else "yuv444p"
+        return f"yuv{chroma}p10le" if bits >= 10 and 10 in e.bits else f"yuv{chroma}p"
     if bits >= 10 and 10 in e.bits:
         return "p010le" if e.hw else "yuv420p10le"
     return "nv12" if e.vendor in ("amd", "intel") else "yuv420p"
@@ -229,7 +235,9 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
     if e.id == "gif":                                      # the palette filters do it all
         return out
     if e.id == "prores":                                   # the «quality» is the profile: 1 Proxy … 4 HQ
-        return ["-profile:v", str(q - 1), "-vendor", "apl0", "-pix_fmt", pix_fmt(e, bits)]
+        chroma = str(v.get("chroma", "422"))
+        prof = "4" if chroma == "444" else str(q - 1)              # 4444 for 4:4:4
+        return ["-profile:v", prof, "-vendor", "apl0", "-pix_fmt", pix_fmt(e, bits, chroma)]
     if e.vendor == "nvidia":
         out += ["-preset", NV_PRESETS[sp], "-tune", "hq"]
         if rc == "quality" or kbps <= 0:
@@ -260,8 +268,8 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
         out += ["-deadline", "good", "-cpu-used", VPX_CPU[sp], "-row-mt", "1"]
         out += ["-crf", str(q), "-b:v", "0"] if rc == "quality" or kbps <= 0 else \
             ["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"]
-        if bits >= 10:
-            out += ["-profile:v", "2"]
+        if bits >= 10 and str(v.get("chroma", "420")) == "420":
+            out += ["-profile:v", "2"]                       # 4:2:2 / 4:4:4: libvpx picks profile 1 / 3
     elif e.family in ("mpeg4", "mpeg2video"):            # Xvid / FFmpeg MPEG-4 / MPEG-2: q = qscale 1..31
         if e.id == "xvid":
             out += ["-me_quality", XVID_ME[sp]]
@@ -277,9 +285,10 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
             out += ["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"]
         if e.id == "x265":
             out += ["-x265-params", "log-level=error"]
-    out += ["-pix_fmt", pix_fmt(e, bits)]
-    if e.family not in ("h264", "hevc"):
-        return out
+    chroma = str(v.get("chroma", "420"))
+    out += ["-pix_fmt", pix_fmt(e, bits, chroma)]
+    if e.family not in ("h264", "hevc") or not out[-1].startswith(("yuv420", "nv12", "p010")):
+        return out                                       # 4:2:2 / 4:4:4: the encoder picks the profile
     if bits >= 10 and 10 in e.bits and e.family == "hevc":
         out += ["-profile:v", "main10"]
     elif e.family == "h264":

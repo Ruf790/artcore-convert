@@ -10,6 +10,9 @@ Settings are a plain dict (JSON in the queue / presets):
               normalize: bool, tracks: all | first}
   subs       all | first | none
   meta       bool (title, tags, chapters)
+  filters    {name: {on, …}} — 1.3, the video filter rows (filters.py)
+  audio also: delay (ms, + / −), gain (dB), rate (Hz, 0 = as is), abits (16 / 24 / 32, 0 = as is),
+             channels keep | mono | stereo | 5.1 | 7.1 — and each of them per track in Job.tracks
 Per-file choices of the Streams tab are in Job.tracks: {stream index: {"keep": bool, "codec": "" | id}}.
 Per-file edits (1.1): Job.trim — pieces [[start, end], …] in seconds of the source (Job.trim_cut: the pieces are
 thrown out instead of kept); Job.meta — {"tags": {key: value} | None, "streams": {index: {lang, title, default,
@@ -23,6 +26,7 @@ import tempfile
 from dataclasses import dataclass, field
 
 from . import encoders as E
+from . import filters as F
 from .probe import MediaInfo, Stream
 
 DEFAULT_SETTINGS = {
@@ -34,6 +38,7 @@ DEFAULT_SETTINGS = {
     "subs": "all",
     "lang": "",          # «Select streams»: only the audio / subtitles of this language ("" = any)
     "meta": True,
+    "filters": F.defaults(),     # 1.3: the filter rows of the Streams tab (filters.py)
 }
 
 PRESETS = {      # built-in; quality 0 = the encoder's own default
@@ -63,7 +68,9 @@ def merged(*parts: dict) -> dict:
     out = copy.deepcopy(DEFAULT_SETTINGS)
     for p in parts:
         for k, v in (p or {}).items():
-            if isinstance(v, dict) and isinstance(out.get(k), dict):
+            if k == "filters":
+                F.merge(out["filters"], v if isinstance(v, dict) else {})
+            elif isinstance(v, dict) and isinstance(out.get(k), dict):
                 out[k].update(v)
             elif k in out:
                 out[k] = v
@@ -100,13 +107,14 @@ class Job:
     chapters: list | None = None                    # None = from the source; [[start, title], …]
     dest: str = ""                                  # «Save as…»: the result's path (the extension follows the format)
     log_path: str = ""                              # the log of the last run
+    crop_found: list | None = None                  # 1.3: [l, t, r, b] the automatic crop found ([] = none)
 
     def to_dict(self) -> dict:
         return {"src": self.src, "settings": self.settings, "preset": self.preset, "tracks": self.tracks,
                 "status": self.status if self.status in ("done", "error", "stop", "skip") else "wait",
                 "out": self.out if self.status == "done" else "", "error": self.error,
                 "trim": self.trim, "trim_cut": self.trim_cut, "meta": self.meta, "chapters": self.chapters,
-                "dest": self.dest, "log": self.log_path}
+                "dest": self.dest, "log": self.log_path, "crop_found": self.crop_found}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Job":
@@ -116,6 +124,8 @@ class Job:
         j.trim_cut = bool(d.get("trim_cut"))
         j.dest = str(d.get("dest") or "")
         j.log_path = str(d.get("log") or "")
+        cf = d.get("crop_found")
+        j.crop_found = [int(x) for x in cf][:4] if isinstance(cf, list) and len(cf) in (0, 4) else None
         j.meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         ch = d.get("chapters")
         j.chapters = [[float(c[0]), str(c[1])] for c in ch if isinstance(c, (list, tuple)) and len(c) >= 2] \
@@ -138,7 +148,7 @@ class Job:
         """The audio settings of one track: the common ones with this track's own (Streams tab) laid over."""
         out = dict(self.settings.get("audio", {}))
         t = self.track(s)
-        for k in ("kbps", "channels", "normalize"):
+        for k in ("kbps", "channels", "normalize") + F.AUDIO_FILTER_KEYS:
             if k in t:
                 out[k] = t[k]
         return out
@@ -364,8 +374,8 @@ def plan(job: Job) -> dict:
             break
         codec = t.get("codec") or a_cfg.get("codec", "auto")
         tc = job.acfg(s)
+        changes = F.audio_on(tc)
         if codec == "auto":
-            changes = tc.get("channels", "keep") != "keep" or tc.get("normalize")
             codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
         if codec == "copy" and not c.takes_audio(s.codec):
             codec = c.a_default
@@ -373,6 +383,12 @@ def plan(job: Job) -> dict:
         elif codec != "copy" and not c.takes_audio(E.A_CODEC.get(codec, codec)):
             codec = c.a_default
             w.append("w_audio_reencoded")
+        if codec == "copy" and changes:                           # a filter can't work on copied sound
+            same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
+            codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
+            if codec == same:
+                out["same_rate"].add(s.index)
+            w.append("w_afilter_copy")
         if codec == "copy" and recut:
             same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
             codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
@@ -422,22 +438,39 @@ def out_bits(job: Job, enc: E.VEnc | None) -> int:
     return 10 if want == "10" and 10 in enc.bits else 8
 
 
-def video_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
-    v, src = job.settings.get("video", {}), job.info.video if job.info else None
+OVERLAY = "\x00overlay"          # where the picture is laid on (the chain is cut there into two)
+
+
+def video_chain(job: Job, enc: E.VEnc | None = None, transforms: str = "", detect: bool = False) -> list[str]:
+    """The video filters in their order (filters.py); OVERLAY marks the overlay. detect: the first pass of the
+    two-pass stabilisation — the chain up to vidstabdetect."""
     gif = enc is not None and enc.id == "gif"
-    out = []
-    deint = v.get("deint", "auto")
-    if deint == "on" or (deint == "auto" and src is not None and src.interlaced):
-        out.append("bwdif=mode=send_frame:parity=auto:deint=all")
-    fps = float(v.get("fps", 0) or 0)
-    if gif and not fps:
-        fps = 15.0
-    if fps and src is not None and (not src.fps or fps < src.fps - 0.01):
-        out.append(f"fps={fps:g}")
+    bits = out_bits(job, enc)
+    out = F.interlace_filters(job) + F.delogo_filter(job) + F.crop_filter(job) + F.tonemap_filters(job, enc, bits)
+    out += F.rotate_filters(job)
+    if detect:
+        return out + F.deshake_filters(job, transforms, detect=True)
+    out += F.deshake_filters(job, transforms) + F.denoise_filters(job)
     out += scale_filters(job, enc)
+    out += F.pad_filter(job) + F.aspect_filter(job) + F.color_filters(job) + F.sharpen_filter(job)
+    out += F.grain_filter(job) + F.fps_filters(job, enc)
+    if F.is_on(job, "overlay") and not gif:
+        out.append(OVERLAY)
+    out += F.colorspace_filter(job, enc, bits)
     if gif:
         out.append("split[g0][g1];[g0]palettegen=stats_mode=diff[gp];[g1][gp]paletteuse=dither=bayer:bayer_scale=5")
     return out
+
+
+def video_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
+    """The chain as one -vf (the overlay left out: build_args lays it on in the filter graph)."""
+    return [f for f in video_chain(job, enc) if f != OVERLAY]
+
+
+def needs_vidstab(job: Job) -> bool:
+    return F.is_on(job, "deshake") and F.fset(job.settings, "deshake").get("method") == "vidstab" and \
+        job.settings.get("video", {}).get("mode", "encode") == "encode" and job.info is not None and \
+        job.info.video is not None and not E.container(job.settings.get("container", "mkv")).audio_only
 
 
 RESOLUTIONS = ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720), (1024, 576), (854, 480), (640, 360),
@@ -473,18 +506,18 @@ def out_size(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
     src = job.info.video if job.info else None
     if src is None or not src.width:
         return 0, 0
+    fw, fh, sar = F.pre_scale(job)
     w, h = target_box(job, enc)
-    if not w:
-        return src.width, src.height
     v = job.settings.get("video", {})
+    if not w:
+        return F.post_pad(job, fw, fh)
     if v.get("fit", "fit") in ("stretch", "pad"):
-        return w, h
-    sar = _ratio(src.sar) if src.sar and src.sar not in ("0:1", "1:1") else 1.0
-    dw, dh = src.width * sar, float(src.height)
+        return F.post_pad(job, w, h)
+    dw, dh = fw * sar, float(fh)
     k = min(w / dw, h / dh)
     if not v.get("upscale"):
         k = min(k, 1.0)
-    return _even(dw * k), _even(dh * k)
+    return F.post_pad(job, _even(dw * k), _even(dh * k))
 
 
 def scale_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
@@ -494,21 +527,21 @@ def scale_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
     w, h = target_box(job, enc)
     if src is None or not src.width or not w:
         return []
+    fw, fh, sar = F.pre_scale(job)                       # the frame after crop / rotation
     v = job.settings.get("video", {})
     mode = v.get("fit", "fit")
-    anamorphic = bool(src.sar) and src.sar not in ("0:1", "1:1") and abs(_ratio(src.sar) - 1.0) > 0.001
+    anamorphic = abs(sar - 1.0) > 0.001
     if mode == "stretch":
-        if (w, h) == (src.width, src.height) and not anamorphic:
+        if (w, h) == (fw, fh) and not anamorphic:
             return []
         return [f"scale={w}:{h}:flags=lanczos", "setsar=1"]
-    sar = _ratio(src.sar) if anamorphic else 1.0
-    dw, dh = src.width * sar, float(src.height)
+    dw, dh = fw * sar, float(fh)
     k = min(w / dw, h / dh)
     if not v.get("upscale"):
         k = min(k, 1.0)
     ow, oh = _even(dw * k), _even(dh * k)
     out = []
-    if (ow, oh) != (src.width, src.height) or anamorphic:
+    if (ow, oh) != (fw, fh) or anamorphic:
         out += [f"scale={ow}:{oh}:flags=lanczos", "setsar=1"]
     if mode == "pad" and (ow, oh) != (w, h):
         out.append(f"pad={w}:{h}:({w}-iw)/2:({h}-ih)/2:color=black")
@@ -542,16 +575,42 @@ def _concat_list(path: str, src: str, segs) -> None:
             f.write(f"file '{q}'\ninpoint {a:.3f}\noutpoint {b:.3f}\n")
 
 
-def work_file(job: Job, kind: str, work_dir: str | None = None) -> str:
+def work_file(job: Job, kind: str, work_dir: str | None = None, ext: str = "txt") -> str:
     d = work_dir or os.path.join(tempfile.gettempdir(), "ArtCoreConvert")
     os.makedirs(d, exist_ok=True)
-    return os.path.join(d, f"job{job.uid}_{os.getpid()}_{kind}.txt")
+    return os.path.join(d, f"job{job.uid}_{os.getpid()}_{kind}.{ext}")
+
+
+WORK_KINDS = (("pieces", "txt"), ("chapters", "txt"), ("vidstab", "trf"))
+
+
+def pre_passes(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode: bool = True,
+               work_dir: str | None = None) -> list[list[str]]:
+    """The commands that run before the conversion: the analysis pass of vidstab (writes the motion file)."""
+    if not needs_vidstab(job):
+        return []
+    return [build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, analysis=True)]
+
+
+def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, detect: bool) -> list[str]:
+    """The video part of the filter graph: src → the chain (with the overlay laid on) → [vout]."""
+    chain = video_chain(job, enc, transforms, detect)
+    if OVERLAY not in chain or ov_in is None:
+        chain = [f for f in chain if f != OVERLAY]
+        return [f"{src}{','.join(chain) if chain else 'null'}[vout]"]
+    i = chain.index(OVERLAY)
+    pre, post = chain[:i], chain[i + 1:]
+    ov_chain, ov = F.overlay_parts(job, out_size(job, enc)[0])
+    out = [f"{src}{','.join(pre) if pre else 'null'}[vpre]", f"[{ov_in}:v]{ov_chain}[wm]",
+           f"[vpre][wm]{ov}" + ("," + ",".join(post) if post else "") + "[vout]"]
+    return out
 
 
 def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode: bool = True,
-               work_dir: str | None = None) -> list[str]:
+               work_dir: str | None = None, analysis: bool = False) -> list[str]:
     """The whole ffmpeg command line. Progress goes to stdout (-progress pipe:1), the log to stderr.
-    Trim with several pieces and our own chapters need small text files: they go to work_dir (temp)."""
+    Trim with several pieces and our own chapters need small text files: they go to work_dir (temp).
+    analysis: the first pass of the two-pass stabilisation (video only, into nothing)."""
     st = job.settings
     v = st.get("video", {})
     cont = st.get("container", "mkv")
@@ -572,9 +631,12 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         job.enc_used = "copy" if p["video"] else ""
     if not p["video"] and not p["audio"]:
         raise RuntimeError("nothing_out")
+    if analysis:
+        p = dict(p, audio=[], subs=[])
     segs = segments(job)
     joined = multi_encode(job)
-    meta_on = st.get("meta", True)
+    meta_on = st.get("meta", True) and not analysis
+    transforms = work_file(job, "vidstab", work_dir, "trf") if needs_vidstab(job) else ""
     hw = ["-hwaccel", "auto"] if enc is not None and enc.hw and hw_decode else []
     args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:1"]
     # inputs: 0 = the source (or the concat list); meta_in = where the file's tags / chapters come from
@@ -594,8 +656,15 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         _concat_list(lst, job.src, segs)
         args += ["-f", "concat", "-safe", "0", "-i", lst, "-i", job.src]
         n_in, meta_in = 2, 1
+    ov_in = None                                                  # the picture of the Overlay row
+    if enc is not None and enc.id != "gif" and F.is_on(job, "overlay") and not analysis:
+        args += ["-i", F.fset(st, "overlay")["path"]]
+        ov_in = n_in
+        n_in += 1
     chapters = out_chapters(job)
-    if chapters is not None and c.chapters:
+    if analysis:
+        args += ["-map_metadata", "-1", "-map_chapters", "-1"]
+    elif chapters is not None and c.chapters:
         mf = work_file(job, "chapters", work_dir)
         with open(mf, "w", encoding="utf-8") as f:
             f.write(ffmetadata(chapters))
@@ -606,33 +675,35 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     else:
         args += ["-map_metadata", str(meta_in) if meta_on else "-1",
                  "-map_chapters", str(meta_in) if meta_on and c.chapters and chapters is None else "-1"]
-    a_cfg = st.get("audio", {})
     graph = []
+    in_graph = joined or ov_in is not None                       # the video goes through -filter_complex
     # video
     for s in p["video"]:
-        if joined:
-            pass                                                  # mapped from the graph below
-        else:
+        if not in_graph:
             args += ["-map", f"0:{s.index}"]
         if copy_v:
             args += ["-c:v", "copy"]
         else:
             bits = out_bits(job, enc)
             dur = out_duration(job)
-            a_total = sum(audio_kbps(cd, a.channels if job.acfg(a).get("channels", "keep") == "keep" else
-                                     (2 if job.acfg(a).get("channels") == "stereo" else 6), job.acfg(a)) or
+            a_total = sum(audio_kbps(cd, F.layout_channels(job.acfg(a).get("channels", "keep"), a.channels, 8),
+                                     job.acfg(a)) or
                           (a.bitrate // 1000 if cd == "copy" else 0) for a, cd in p["audio"])
             vv = dict(v)
             vv["audio_kbps"] = a_total
+            vv["chroma"] = F.chroma(job, enc)
             if not vv.get("quality"):
                 vv["quality"] = enc.q_default
-            vf = video_filters(job, enc)
-            if joined:
-                pass
-            elif vf:
-                args += ["-vf", ",".join(vf)]
+            if not in_graph:
+                vf = video_chain(job, enc, transforms, analysis)
+                if vf:
+                    args += ["-vf", ",".join(vf)]
+            if analysis:
+                args += ["-an", "-sn", "-dn", "-f", "null", "-"]
+                return _with_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
             args += ["-c:v", enc.ffname] + E.video_args(enc, vv, bits, dur)
-            if bits >= 10 and s.hdr in ("HDR10", "HLG") and enc.family in ("hevc", "av1", "vp9"):   # keep HDR
+            args += F.fps_args(job)
+            if F.hdr_keeps(job, enc, bits) and not F.tonemap_on(job, enc, bits):      # keep HDR
                 cl = s.color
                 prim = cl.get("color_primaries", "bt2020")
                 trc = cl.get("color_transfer", "smpte2084" if s.hdr == "HDR10" else "arib-std-b67")
@@ -642,6 +713,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                     i = args.index("-x265-params") + 1
                     args[i] += f":colorprim={prim}:transfer={trc}:colormatrix={mat}" + \
                         (":hdr10=1:repeat-headers=1" if s.hdr == "HDR10" else "")
+            else:
+                args += F.color_tags(job, enc, bits)
         fam = s.codec if copy_v else enc.family
         if cont in ("mp4", "mov") and fam == "hevc":
             args += ["-tag:v", "hvc1"]                                      # plays on Apple / TVs
@@ -649,38 +722,24 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
             args += ["-tag:v", "XVID"]
         if cont == "gif":
             args += ["-loop", "0"]
-    # the concat filter: every piece's video + sound → one
-    if joined:
-        s0 = p["video"][0]
-        ins = "".join(f"[{i}:{s0.index}]" + "".join(f"[{i}:{a.index}]" for a, _ in p["audio"]) for i in range(len(segs)))
-        outs = "[vj]" + "".join(f"[aj{k}]" for k in range(len(p["audio"])))
-        graph.append(f"{ins}concat=n={len(segs)}:v=1:a={len(p['audio'])}{outs}")
-        vf = video_filters(job, enc)
-        graph.append("[vj]" + (",".join(vf) if vf else "null") + "[vout]")
-        vi = args.index("-c:v")
-        args[vi:vi] = ["-map", "[vout]"]
+    _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
     # audio
     for n, (s, codec) in enumerate(p["audio"]):
         a_cfg = job.acfg(s)
-        norm = a_cfg.get("normalize") and codec != "copy"
+        af = F.audio_filters(a_cfg, codec, s.rate) if codec != "copy" else []
         if joined:
-            if norm:
-                graph.append(f"[aj{n}]loudnorm=I=-16:TP=-1.5:LRA=11[ao{n}]")
-            args += ["-map", f"[ao{n}]" if norm else f"[aj{n}]"]
+            if af:
+                graph.append(f"[aj{n}]{','.join(af)}[ao{n}]")
+            args += ["-map", f"[ao{n}]" if af else f"[aj{n}]"]
         else:
             args += ["-map", f"0:{s.index}"]
         if codec == "copy":
             args += [f"-c:a:{n}", "copy"]
             continue
         a = E.A_BY_ID[codec]
-        ch = s.channels
-        want = a_cfg.get("channels", "keep")
-        if want == "stereo":
-            ch = min(ch, 2) if ch else 2
-        elif want == "5.1" and ch > 6:
-            ch = 6
-        ch = min(ch or 2, a.max_ch)
-        args += [f"-c:a:{n}", a.ffname]
+        ch = F.layout_channels(a_cfg.get("channels", "keep"), s.channels, a.max_ch)
+        ffname, bits_args = F.audio_bits_args(codec, a.ffname, a_cfg, n)
+        args += [f"-c:a:{n}", ffname] + bits_args
         if ch != s.channels or (codec == "opus" and ch > 2):          # opus wants the plain 5.1 / 7.1 layout
             args += [f"-ac:a:{n}", str(ch)]
         k = audio_kbps(codec, ch, a_cfg)
@@ -690,8 +749,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
             args += [f"-b:a:{n}", f"{k}k"]
         if codec == "opus" and ch > 2:
             args += [f"-mapping_family:a:{n}", "1"]
-        if norm and not joined:
-            args += [f"-filter:a:{n}", "loudnorm=I=-16:TP=-1.5:LRA=11"]
+        if af and not joined:
+            args += [f"-filter:a:{n}", ",".join(af)]
     if graph:
         fi = args.index("-map_metadata")
         args[fi:fi] = ["-filter_complex", ";".join(graph)]
@@ -709,6 +768,37 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     if cont == "mp3":
         args += ["-id3v2_version", "3"]
     args += ["-f", c.fmt, out_path]
+    return args
+
+
+def _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph):
+    """The concat of the pieces and / or the overlay: the video's part of -filter_complex, mapped as [vout]."""
+    if not p["video"] or (not joined and ov_in is None):
+        return
+    s0 = p["video"][0]
+    if joined:
+        ins = "".join(f"[{i}:{s0.index}]" + "".join(f"[{i}:{a.index}]" for a, _ in p["audio"])
+                      for i in range(len(segs)))
+        outs = "[vj]" + "".join(f"[aj{k}]" for k in range(len(p["audio"])))
+        graph.append(f"{ins}concat=n={len(segs)}:v=1:a={len(p['audio'])}{outs}")
+        src = "[vj]"
+    else:
+        src = f"[0:{s0.index}]"
+    graph += _graph_video(job, enc, src, ov_in, transforms, analysis)
+    if analysis:
+        return
+    vi = args.index("-c:v")
+    args[vi:vi] = ["-map", "[vout]"]
+
+
+def _with_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph):
+    """The analysis pass: the graph goes in, [vout] is the one output."""
+    if joined:
+        _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
+        fi = args.index("-map_metadata")
+        args[fi:fi] = ["-filter_complex", ";".join(graph)]
+        ai = args.index("-an")
+        args[ai:ai] = ["-map", "[vout]"]
     return args
 
 

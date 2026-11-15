@@ -19,7 +19,9 @@ from . import config, logs, style, winint
 from . import encoders as E
 from . import job as J
 from . import probe as P
+from . import filters as F
 from .edit_tabs import ChaptersTab, MetaTab, TrimTab
+from .filter_ui import FilterRows, FrameOverlay
 from .i18n import t
 from .runner import Runner
 from .timeline import MediaWorker
@@ -52,6 +54,35 @@ def _hint(text: str = "") -> QLabel:
     lab.setObjectName("hint")
     lab.setWordWrap(True)
     return lab
+
+
+def _gain_box():
+    from PySide6.QtWidgets import QDoubleSpinBox
+    b = QDoubleSpinBox()
+    b.setRange(-30.0, 30.0)
+    b.setSingleStep(0.5)
+    b.setDecimals(1)
+    b.setSuffix(" " + t("db"))
+    b.setKeyboardTracking(False)
+    b.setToolTip(t("a_gain_tip"))
+    return b
+
+
+def _rate_box(first: str) -> QComboBox:
+    b = QComboBox()
+    b.addItem(first, 0)
+    for r in F.SAMPLE_RATES[1:]:
+        b.addItem(f"{r / 1000:g} kHz", r)
+    return b
+
+
+def _abits_box(first: str) -> QComboBox:
+    b = QComboBox()
+    b.addItem(first, 0)
+    for x in (16, 24, 32):
+        b.addItem(f"{x} bit", x)
+    b.setToolTip(t("a_abits_tip"))
+    return b
 
 
 def _scroll(inner: QWidget) -> QScrollArea:
@@ -185,6 +216,8 @@ class MainUI:
         self.trim_tab.changed.connect(self._job_edited)
         self.trim_tab.media_wanted.connect(self._want_media)
         self.trim_tab.position_changed.connect(lambda _s: None)
+        self.frame_ov = FrameOverlay(self.trim_tab.stage)          # 1.3: the crop / logo frame over the picture
+        self.frame_ov.drawn.connect(self._delogo_drawn)
         v.addWidget(self._build_top())
         self.split = QSplitter(Qt.Horizontal)
         self.split.setChildrenCollapsible(False)
@@ -571,26 +604,13 @@ class MainUI:
         g.setHorizontalSpacing(8)
         g.setVerticalSpacing(5)
         self._vrows = g
-        self.v_deint = QComboBox()
-        for key in ("auto", "on", "off"):
-            self.v_deint.addItem(t("deint_" + key), key)
-        self.v_deint.currentIndexChanged.connect(lambda: self._set("video", "deint", self.v_deint.currentData()))
         self.v_res = QComboBox()
         self.v_res.setMaxVisibleItems(16)
         self.v_res.currentIndexChanged.connect(self._res_picked)
-        self.v_fps = QComboBox()
-        self.v_fps.addItem(t("as_source"), 0)
-        for x in (60, 50, 30, 25, 24, 15):
-            self.v_fps.addItem(f"{x} fps", x)
-        self.v_fps.currentIndexChanged.connect(lambda: self._set("video", "fps", self.v_fps.currentData()))
-        self.v_bits = QComboBox()
-        for key in ("auto", "8", "10"):
-            self.v_bits.addItem(t("bits_" + key), key)
-        self.v_bits.currentIndexChanged.connect(lambda: self._set("video", "bits", self.v_bits.currentData()))
         self.v_color = QLabel("—")
         self.v_color.setObjectName("hint")
-        rows = ((t("deint"), self.v_deint, None), (t("resolution"), self.v_res, lambda: self.res_dialog.exec()),
-                (t("fps"), self.v_fps, None), (t("bit_depth"), self.v_bits, None), (t("color"), self.v_color, None))
+        # 1.3: Interlace, Framerate and the bit depth are filter rows below
+        rows = ((t("resolution"), self.v_res, lambda: self.res_dialog.exec()), (t("color"), self.v_color, None))
         for r, (name, wdg, gear) in enumerate(rows):
             g.addWidget(QLabel(name), r, 0)
             g.addWidget(wdg, r, 1)
@@ -625,6 +645,14 @@ class MainUI:
         g.addWidget(self.v_enc_hint, r + 2, 0, 1, 3)
         g.setColumnStretch(1, 1)
         lay.addWidget(self.v_body)
+        # 1.3: the video filters (☑ · name · value · ⚙)
+        self.f_head = self._section(t("f_section"))
+        lay.addWidget(self.f_head)
+        self.f_rows = FilterRows()
+        self.f_rows.toggled.connect(self._filter_toggled)
+        self.f_rows.gear.connect(self._filter_gear)
+        lay.addWidget(self.f_rows)
+        self.f_dialogs: dict = {}
         # sound: the settings of every track (each track below can have its own)
         lay.addWidget(self._section(t("audio_common")))
         ab = QWidget()
@@ -644,13 +672,27 @@ class MainUI:
             self.a_kbps.addItem(f"{k} kbit/s", k)
         self.a_kbps.currentIndexChanged.connect(lambda: self._set("audio", "kbps", self.a_kbps.currentData()))
         self.a_ch = QComboBox()
-        for key in ("keep", "stereo", "5.1"):
+        for key in F.LAYOUTS:
             self.a_ch.addItem(t("ch_" + key.replace(".", "")), key)
         self.a_ch.currentIndexChanged.connect(lambda: self._set("audio", "channels", self.a_ch.currentData()))
         self.a_norm = QCheckBox(t("normalize"))
         self.a_norm.toggled.connect(lambda on: self._set("audio", "normalize", bool(on)))
+        self.a_gain = _gain_box()
+        self.a_gain.valueChanged.connect(lambda x: self._set("audio", "gain", round(float(x), 1)))
+        self.a_rate = _rate_box(t("as_source"))
+        self.a_rate.currentIndexChanged.connect(lambda: self._set("audio", "rate", self.a_rate.currentData()))
+        self.a_abits = _abits_box(t("as_source"))
+        self.a_abits.currentIndexChanged.connect(lambda: self._set("audio", "abits", self.a_abits.currentData()))
+        vol = QHBoxLayout()
+        vol.addWidget(self.a_gain)
+        vol.addWidget(self.a_norm, 1)
         for r, (name, wdg) in enumerate(((t("codec"), self.a_codec), (t("bitrate"), self.a_kbps),
-                                         (t("channels"), self.a_ch), ("", self.a_norm))):
+                                         (t("channels"), self.a_ch), (t("volume"), vol), (t("a_rate"), self.a_rate),
+                                         (t("a_abits"), self.a_abits))):
+            if isinstance(wdg, QHBoxLayout):
+                ag.addWidget(QLabel(name), r, 0)
+                ag.addLayout(wdg, r, 1)
+                continue
             ag.addWidget(QLabel(name), r, 0)
             ag.addWidget(wdg, r, 1)
         ag.setColumnStretch(1, 1)
@@ -728,7 +770,7 @@ class MainUI:
             if audio:
                 ch = QComboBox()
                 ch.addItem(t("tr_default") + f" ({t('ch_' + j.settings['audio'].get('channels', 'keep').replace('.', ''))})", "")
-                for key in ("keep", "stereo", "5.1"):
+                for key in F.LAYOUTS:
                     ch.addItem(t("ch_" + key.replace(".", "")), key)
                 ch.setCurrentIndex(max(0, ch.findData(tr.get("channels", ""))))
                 ch.currentIndexChanged.connect(lambda _i, b=ch, idx=s.index: self._track_opt(idx, "channels", b.currentData()))
@@ -752,16 +794,48 @@ class MainUI:
                     kb.addItem(f"{k} kbit/s", k)
                 kb.setCurrentIndex(max(0, kb.findData(int(tr.get("kbps", 0) or 0))))
                 kb.currentIndexChanged.connect(lambda _i, b=kb, idx=s.index: self._track_opt(idx, "kbps", b.currentData()))
+                # 1.3: delay, gain, sample rate, bit depth of this track
+                dl = QSpinBox()
+                dl.setObjectName("trackDelay")
+                dl.setRange(-60000, 60000)
+                dl.setSingleStep(10)
+                dl.setSuffix(" " + t("ms"))
+                dl.setKeyboardTracking(False)
+                dl.setToolTip(t("a_delay_tip"))
+                dl.setValue(int(tr.get("delay", 0) or 0))
+                dl.valueChanged.connect(lambda x, idx=s.index: self._track_opt(idx, "delay", int(x)))
+                gn = _gain_box()
+                gn.setObjectName("trackGain")
+                gn.setValue(float(j.acfg(s).get("gain", 0) or 0))
+                gn.valueChanged.connect(lambda x, idx=s.index: self._track_opt(idx, "gain", round(float(x), 1)))
+                rt = _rate_box(t("tr_default"))
+                rt.setObjectName("trackRate")
+                rt.setCurrentIndex(max(0, rt.findData(int(tr.get("rate", 0) or 0))))
+                rt.currentIndexChanged.connect(lambda _i, b=rt, idx=s.index: self._track_opt(idx, "rate", b.currentData()))
+                ab = _abits_box(t("tr_default"))
+                ab.setObjectName("trackBits")
+                ab.setCurrentIndex(max(0, ab.findData(int(tr.get("abits", 0) or 0))))
+                ab.currentIndexChanged.connect(lambda _i, b=ab, idx=s.index: self._track_opt(idx, "abits", b.currentData()))
                 g.addWidget(QLabel(t("channels")), 0, 0)
                 g.addWidget(ch, 0, 1)
                 g.addWidget(QLabel(t("volume")), 1, 0)
-                g.addWidget(vol, 1, 1)
-                g.addWidget(QLabel(t("codec") + ":"), 2, 0)
+                vrow = QHBoxLayout()
+                vrow.addWidget(gn)
+                vrow.addWidget(vol, 1)
+                g.addLayout(vrow, 1, 1)
+                g.addWidget(QLabel(t("a_delay")), 2, 0)
+                g.addWidget(dl, 2, 1)
+                g.addWidget(QLabel(t("a_rate")), 3, 0)
+                rrow = QHBoxLayout()
+                rrow.addWidget(rt, 1)
+                rrow.addWidget(ab, 1)
+                g.addLayout(rrow, 3, 1)
+                g.addWidget(QLabel(t("codec") + ":"), 4, 0)
                 row = QHBoxLayout()
                 row.addWidget(codec, 2)
                 row.addWidget(kb, 1)
-                g.addLayout(row, 2, 1)
-                for wdg in (ch, vol, codec, kb):
+                g.addLayout(row, 4, 1)
+                for wdg in (ch, vol, codec, kb, dl, gn, rt, ab):
                     wdg.setEnabled(ed and keep)
             else:
                 how = out_subs.get(s.index)
@@ -797,7 +871,7 @@ class MainUI:
             return
         j = jobs[0]
         tr = j.tracks.setdefault(str(idx), {})
-        if value in ("", 0, None) and key != "normalize":
+        if (value in ("", 0, None) or (key == "gain" and abs(float(value)) < 0.05)) and key != "normalize":
             tr.pop(key, None)
         else:
             tr[key] = value
@@ -831,6 +905,7 @@ class MainUI:
         QTimer.singleShot(0, self._fill_tracks)
         self._show_info(j)
         self.meta_tab.set_job(j, True)
+        self._gain_preview()
 
     @staticmethod
     def _a_label(codec: str | None) -> str:
@@ -1072,7 +1147,8 @@ class MainUI:
 
     def _on_wave(self, path: str, peaks: list):
         if path == getattr(self, "_media_src", ""):
-            self.trim_tab.bar.set_wave(peaks)
+            self.trim_tab.bar.set_wave(peaks, self.media.top.get(path, 1.0))
+            self._gain_preview()
 
     # ── keys ──────────────────────────────────────────────────
     def _shortcuts(self):

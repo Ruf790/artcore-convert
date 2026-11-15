@@ -15,8 +15,10 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMainWin
 from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
 from . import encoders as E
 from . import job as J
+from . import filters as F
 from . import probe as P
 from . import logs
+from .filter_ui import NEEDS_PARAMS, FilterDialog, short_name
 from .i18n import t
 from .runner import Runner
 from .ui_main import MainUI
@@ -40,6 +42,7 @@ class Bridge(QObject):
     encoders = Signal(object)             # Available
     update = Signal(object, str)
     gpu = Signal(dict)
+    crop = Signal(int, object)            # uid, (l, t, r, b) | None — the automatic crop
 
 
 class Worker:
@@ -129,6 +132,8 @@ class MainWindow(MainUI, QMainWindow):
         self.bridge.encoders.connect(self._on_encoders)
         self.bridge.update.connect(self._on_update_result)
         self.bridge.gpu.connect(self._on_gpu)
+        self.bridge.crop.connect(self._on_crop)
+        self._crop_busy: set[int] = set()        # tasks whose black bars are being looked for
         self.worker = Worker(self.bridge)
         self.runner = Runner(self)
         self.runner.progress.connect(self._on_progress)
@@ -467,12 +472,15 @@ class MainWindow(MainUI, QMainWindow):
         if j.info is None:
             return
         try:
-            args = J.build_args(j, ff.ffmpeg() or "ffmpeg", J.out_name(j, self.cfg), self.av,
-                                bool(self.cfg.get("hw_decode", True)))
+            hw = bool(self.cfg.get("hw_decode", True))
+            out = J.out_name(j, self.cfg)
+            cmds = J.pre_passes(j, ff.ffmpeg() or "ffmpeg", out, self.av, hw) + \
+                [J.build_args(j, ff.ffmpeg() or "ffmpeg", out, self.av, hw)]
         except (RuntimeError, OSError) as e:
             self._toast(t(str(e)))
             return
-        QApplication.clipboard().setText(" ".join(f'"{a}"' if " " in a else a for a in args))
+        QApplication.clipboard().setText(" && ".join(" ".join(f'"{a}"' if (" " in a or ";" in a or "'" in a) else a
+                                                             for a in args) for args in cmds))
         self._toast(t("cmd_copied"))
 
     def _open_result(self, j: J.Job | None):
@@ -499,6 +507,10 @@ class MainWindow(MainUI, QMainWindow):
             self._show_info(None)
         self._fill_tracks()
         self._edit_tabs()
+        for j in self.selected_jobs()[:1]:
+            self._want_crop(j)
+        self._update_frame_overlay()
+        self._gain_preview()
         self._show_out_path()
         self._update_buttons()
     def _one_job(self) -> tuple:
@@ -565,7 +577,12 @@ class MainWindow(MainUI, QMainWindow):
                               ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale"),
                               ("video", "quality"), ("video", "bitrate"), ("video", "size_mb"), ("video", "speed")):
             self._load_settings()
-        if key in ("container", "subs", "lang", "tracks", "codec", "channels", "normalize", "kbps", "mode"):
+        if key in ("deint", "fps", "bits"):
+            self._load_settings()
+        if section == "audio" and key == "gain":
+            self._gain_preview()
+        if key in ("container", "subs", "lang", "tracks", "codec", "channels", "normalize", "kbps", "mode",
+                   "gain", "rate", "abits"):
             if key == "container":
                 self._edit_tabs()
             self._fill_tracks()
@@ -573,6 +590,232 @@ class MainWindow(MainUI, QMainWindow):
             j = self.selected_jobs()
             self._show_info(j[0] if j else None)
             self._show_out_path()
+
+    # ── 1.3: the filter rows ──────────────────────────────────
+    def _setf(self, name: str, key: str, value):
+        """A filter setting changed (the 1.0 keys video.deint / fps / bits go through _set)."""
+        if self._loading:
+            return
+        if key.startswith("video."):
+            self._set("video", key[6:], value)
+            self._filters_changed()
+            return
+        jobs = self.selected_jobs(editable=True)
+        targets = [j.settings for j in jobs]
+        if not jobs and not self.selected_jobs():
+            if not self.cfg.get("defaults"):
+                self.cfg["defaults"] = J.merged(self.new_settings())
+            targets = [self.cfg["defaults"]]
+        for st in targets:
+            fl = st.setdefault("filters", F.defaults())
+            fl.setdefault(name, dict(F.FILTER_DEFAULTS[name]))[key] = value
+        for j in jobs:
+            if j.status in ("done", "error", "stop", "skip") and j is not self.current and j.info is not None \
+                    and not j.info.error:
+                j.status, j.error, j.progress = "wait", "", 0.0
+            self._refresh(j)
+        if jobs:
+            self._queue_changed()
+        else:
+            config.save(self.cfg)
+        self._filters_changed()
+
+    def _filters_changed(self):
+        for j in self.selected_jobs():
+            self._want_crop(j)
+        self._load_settings()
+        self._update_frame_overlay()
+        js = self.selected_jobs()
+        self._show_info(js[0] if js else None)
+
+    def _filter_toggled(self, name: str, on: bool):
+        st = self._shown_settings()
+        if name == "interlace":
+            if on:
+                self._set("video", "deint", "auto")
+            else:
+                self._set("video", "deint", "off")
+                self._setf(name, "ivtc", False)
+            self._filters_changed()
+            return
+        if name == "hdr":
+            self._setf(name, "mode", "auto" if on else "off")
+            return
+        if name == "fps":
+            if not on:
+                self._set("video", "fps", 0)
+                for k in ("interp", "dedup"):
+                    self._setf(name, k, False)
+                self._setf(name, "mode", "auto")
+            else:
+                self._filters_changed()
+                self._filter_gear(name)
+            return
+        if name == "pixfmt":
+            self._setf(name, "on", bool(on))
+            if on:
+                self._filter_gear(name)
+            return
+        self._setf(name, "on", bool(on))
+        f = F.fset(st, name)
+        if on and name == "delogo" and not int(f.get("w", 0) or 0):
+            self._filter_gear(name)
+            self._filter_action(name, "draw")
+        elif on and name == "overlay" and not f.get("path"):
+            self._filter_gear(name)
+        elif on and name in NEEDS_PARAMS and not F.is_on(self._first_job() or _Shim(st), name):
+            self._filter_gear(name)
+
+    def _filters_on(self, j: J.Job) -> list[str]:
+        """The names of the video filters that will run on j (the Info tab)."""
+        v = j.settings.get("video", {})
+        if v.get("mode", "encode") != "encode" or j.info is None or j.info.video is None:
+            return []
+        enc = self.av.resolve(v.get("encoder", "auto_hevc")) if self.av_ready else E.BY_ID.get(v.get("encoder", ""))
+        bits = J.out_bits(j, enc)
+        out = []
+        for name in F.VIDEO_ROWS:
+            if F.is_on(j, name, enc, bits):
+                out.append(short_name(name))
+        return out
+
+    def _first_job(self):
+        js = self.selected_jobs()
+        return js[0] if js and js[0].info is not None and not js[0].info.error else None
+
+    def _filter_gear(self, name: str):
+        d = self.f_dialogs.get(name)
+        if d is None:
+            d = FilterDialog(name, self)
+            d.edited.connect(self._setf)
+            d.action.connect(self._filter_action)
+            d.finished.connect(lambda _r, n=name: self._dialog_closed(n))
+            self.f_dialogs[name] = d
+        self._fill_filter_dialog(name)
+        d.show()
+        d.raise_()
+        d.activateWindow()
+
+    def _dialog_closed(self, name: str):
+        if name == "delogo":
+            self.frame_ov.stop_draw()
+            self._update_frame_overlay()
+
+    def _fill_filter_dialog(self, name: str):
+        d = self.f_dialogs.get(name)
+        if d is None:
+            return
+        st = self._shown_settings()
+        j = self._first_job()
+        v = st.get("video", {})
+        enc = self.av.resolve(v.get("encoder", "auto_hevc")) if self.av_ready else E.BY_ID.get(v.get("encoder", ""))
+        note, en = "", {}
+        f = F.fset(st, name)
+        if name == "crop":
+            manual = f.get("mode", "auto") == "manual"
+            en = {k: manual for k in ("l", "t", "r", "b")}
+            en["detect"] = j is not None and j.info.video is not None
+            if j is not None and j.crop_found is not None and j.info.video is not None:
+                l, tt, r, b = j.crop_found or (0, 0, 0, 0)
+                vs = j.info.video
+                note = t("f_crop_found", l, tt, r, b, vs.width - l - r, vs.height - tt - b) if any((l, tt, r, b)) \
+                    else t("f_crop_nothing")
+            elif j is not None and j.uid in self._crop_busy:
+                note = t("f_detecting")
+            if not manual and j is not None and j.crop_found:              # auto: the numbers it found
+                import copy
+                st = copy.deepcopy(st)
+                st.setdefault("filters", F.defaults())["crop"].update(zip(("l", "t", "r", "b"), j.crop_found))
+        elif name == "hdr" and f.get("engine") == "libplacebo":
+            note = t("f_note_libplacebo")
+        elif name == "deshake" and f.get("method") == "vidstab":
+            note = t("f_note_vidstab")
+        elif name == "fps" and f.get("interp"):
+            note = t("f_note_interp")
+        elif name == "pixfmt" and enc is not None:
+            can = F.CHROMAS.get(enc.id, ("420",))
+            if len(can) < 3:
+                note = t("f_note_chroma", E.FAMILY_LABEL.get(enc.family, enc.ffname) + f" ({enc.ffname})",
+                         " / ".join({"420": "4:2:0", "422": "4:2:2", "444": "4:4:4"}[c] for c in can))
+        d.load(st, note, en)
+
+    def _filter_action(self, name: str, act: str):
+        j = self._first_job()
+        if act == "detect" and j is not None:
+            j.crop_found = None
+            self._want_crop(j, force=True)
+            self._fill_filter_dialog(name)
+        elif act == "draw":
+            if j is None or j.info.video is None:
+                return
+            self.show_side("streams")
+            self._update_frame_overlay()
+            self.frame_ov.start_draw()
+        elif act == "reset" and name == "color":
+            for k, val in F.FILTER_DEFAULTS["color"].items():
+                if k != "on":
+                    self._setf(name, k, val)
+
+    def _delogo_drawn(self, x: int, y: int, w: int, h: int):
+        for k, val in (("x", x), ("y", y), ("w", w), ("h", h)):
+            self._setf("delogo", k, val)
+        self._setf("delogo", "on", True)
+
+    def _update_frame_overlay(self):
+        """The crop frame and the logo rectangle of the selected task over its picture."""
+        j = self._first_job()
+        if j is None or j.info.video is None or self.trim_tab.job is not j:
+            self.frame_ov.set_state((0, 0, 1.0), None, None)
+            return
+        vs = j.info.video
+        sar = J._ratio(vs.sar) if vs.sar and vs.sar not in ("0:1", "1:1") else 1.0
+        crop = F.crop_values(j) if F.is_on(j, "crop") else None
+        lg = F.fset(j.settings, "delogo")
+        logo = tuple(int(lg.get(k, 0) or 0) for k in ("x", "y", "w", "h")) if lg.get("on") else None
+        self.frame_ov.set_state((vs.width, vs.height, sar), crop, logo)
+
+    def _gain_preview(self):
+        """The Volume of the first audio track, shown on the loudness curve."""
+        j = self._first_job()
+        db = 0.0
+        if j is not None and j.info.of("audio"):
+            db = float(j.acfg(j.info.of("audio")[0]).get("gain", 0) or 0)
+        self.trim_tab.bar.set_gain(db)
+
+    # the automatic crop: cropdetect in a thread, once per file
+    def _want_crop(self, j: J.Job, force: bool = False) -> bool:
+        """True while the bars of j are still being looked for."""
+        f = F.fset(j.settings, "crop")
+        if not (f.get("on") and f.get("mode", "auto") == "auto") or j.info is None or j.info.error \
+                or j.info.video is None:
+            return False
+        if j.crop_found is not None and not force:
+            return False
+        if j.uid in self._crop_busy:
+            return True
+        self._crop_busy.add(j.uid)
+        exe, src, dur, w, h, uid = ff.ffmpeg(), j.src, j.info.duration, j.info.video.width, j.info.video.height, j.uid
+
+        def work():
+            res = F.detect_crop(exe, src, dur, w, h) if exe else None
+            self.bridge.crop.emit(uid, res)
+        threading.Thread(target=work, daemon=True).start()
+        return True
+
+    def _on_crop(self, uid: int, res):
+        self._crop_busy.discard(uid)
+        j = next((x for x in self.jobs if x.uid == uid), None)
+        if j is None:
+            return
+        j.crop_found = list(res) if res else []
+        self._refresh(j)
+        self._queue_changed()
+        if j in self.selected_jobs():
+            self._load_settings()
+            self._update_frame_overlay()
+            self._show_info(j)
+        if self.running:
+            QTimer.singleShot(0, self._next)
 
     def _load_settings(self):
         st = self._shown_settings()
@@ -585,7 +828,6 @@ class MainWindow(MainUI, QMainWindow):
             mode = v.get("mode", "encode")
             sel(self.v_cont, st.get("container", "mkv"))
             sel(self.v_enc, "copy" if mode == "copy" else v.get("encoder", "auto_hevc"))
-            sel(self.v_bits, str(v.get("bits", "auto")))
             enc = self.av.resolve(v.get("encoder", "auto_hevc")) if self.av_ready else \
                 E.BY_ID.get(v.get("encoder", "")) or E.BY_ID["x265"]
             enc = enc or E.BY_ID.get(v.get("encoder", ""), E.BY_ID["x265"])
@@ -630,24 +872,19 @@ class MainWindow(MainUI, QMainWindow):
             self.v_hh.setValue(int(v.get("height", 0) or 0))
             sel(self.v_fit, v.get("fit", "fit"))
             self.v_up.setChecked(bool(v.get("upscale")))
-            sel(self.v_fps, int(v.get("fps", 0) or 0))
-            sel(self.v_deint, v.get("deint", "auto"))
             self.v_on.setChecked(mode != "none" and not cont.audio_only)
             self.v_on.setEnabled(not cont.audio_only and cont.id != "gif")
             enc_on = mode == "encode" and not cont.audio_only
             self.v_body.setEnabled(not cont.audio_only and mode != "none")
             self.v_enc.setEnabled(not cont.audio_only and mode != "none")
-            for wdg in (self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_res, self.v_w,
-                        self.v_hh, self.v_fit, self.v_up, self.v_fps, self.v_deint, self.v_rc, self.v_val,
-                        self.v_speed_box):
+            for wdg in (self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_res, self.v_w,
+                        self.v_hh, self.v_fit, self.v_up, self.v_rc, self.v_val, self.v_speed_box):
                 wdg.setEnabled(enc_on)
             if enc_on and not enc.rc:
                 for wdg in (self.rc_b, self.rc_s, self.v_br, self.v_size, self.v_rc):
                     wdg.setEnabled(False)
                 self.v_q.setEnabled(enc.id != "gif")
                 self.v_val.setEnabled(enc.id != "gif")
-            if enc_on and len(enc.bits) == 1:
-                self.v_bits.setEnabled(False)
             if enc_on and (enc.id in ("prores", "gif", "mpeg4", "mpeg2")):
                 self.v_speed_box.setEnabled(False)
             if not enc_on:
@@ -684,6 +921,15 @@ class MainWindow(MainUI, QMainWindow):
             sel(self.a_codec, a.get("codec", "auto"))
             sel(self.a_kbps, int(a.get("kbps", 0) or 0))
             sel(self.a_ch, a.get("channels", "keep"))
+            self.a_gain.setValue(float(a.get("gain", 0) or 0))
+            sel(self.a_rate, int(a.get("rate", 0) or 0))
+            sel(self.a_abits, int(a.get("abits", 0) or 0))
+            fj = jobs[0] if len(jobs) >= 1 and jobs[0].info is not None and not jobs[0].info.error else None
+            self.f_rows.show_state(st, fj, enc if enc_on else None, J.out_bits(fj, enc) if fj and enc_on else 8,
+                                   enc_on)
+            self.f_head.setEnabled(enc_on)
+            for name in list(self.f_dialogs):
+                self._fill_filter_dialog(name)
             sel(self.a_tracks, a.get("tracks", "all"))
             self.a_norm.setChecked(bool(a.get("normalize")))
             sel(self.s_mode, st.get("subs", "all"))
@@ -853,6 +1099,9 @@ class MainWindow(MainUI, QMainWindow):
                                     ("i_chap_edited", j.chapters is not None)) if on]
         if edits:
             rows.append(f"<span style='color:{style.MUTED}'>✎ " + ", ".join(edits) + "</span>")
+        fl = self._filters_on(j)
+        if fl:
+            rows.append(f"<b>{t('f_section')}</b>: " + _esc(", ".join(fl)))
         mut = style.MUTED
 
         def track(s, line):
@@ -983,10 +1232,14 @@ class MainWindow(MainUI, QMainWindow):
                 return                                    # _on_probed calls us again
             self._queue_done()
             return
+        if self._want_crop(j):
+            self.st_name.setText(f"{j.name}: {t('f_detecting')}")
+            return                                        # _on_crop calls us again
         out = J.out_name(j, self.cfg)
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
             args = J.build_args(j, ff.ffmpeg() or "ffmpeg", out, self.av, bool(self.cfg.get("hw_decode", True)))
+            pre = J.pre_passes(j, ff.ffmpeg() or "ffmpeg", out, self.av, bool(self.cfg.get("hw_decode", True)))
         except (RuntimeError, OSError) as e:
             j.status, j.error = "error", t(str(e)) if str(e) in BUILD_ERRORS else str(e)
             self._refresh(j)
@@ -1004,7 +1257,7 @@ class MainWindow(MainUI, QMainWindow):
         self._last_stat = {}
         self._run_log = []
         self._run_started = time.time()
-        self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"))
+        self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre)
         self._update_buttons()
         self._queue_changed()
 
@@ -1044,9 +1297,9 @@ class MainWindow(MainUI, QMainWindow):
         j = self.current
         self.current = None
         if j is not None:
-            for kind in ("pieces", "chapters"):                 # the small lists of Trim / Chapters
+            for kind, ext in J.WORK_KINDS:                       # the small files of Trim / Chapters / vid.stab
                 try:
-                    os.remove(J.work_file(j, kind))
+                    os.remove(J.work_file(j, kind, None, ext))
                 except OSError:
                     pass
             j.elapsed = self.runner.elapsed()
@@ -1400,6 +1653,13 @@ class MainWindow(MainUI, QMainWindow):
             updater.run_installer(installer)
         super().closeEvent(e)
         QApplication.instance().quit()
+
+
+class _Shim:
+    """Settings without a task, where a filter function wants a job."""
+
+    def __init__(self, st: dict):
+        self.settings, self.info, self.crop_found = st, None, None
 
 
 def _esc(s: str) -> str:
