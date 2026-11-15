@@ -30,8 +30,10 @@ import re
 import tempfile
 from dataclasses import dataclass, field
 
+from . import advanced as ADV
 from . import encoders as E
 from . import filters as F
+from . import formats as FM
 from .probe import MediaInfo, Stream
 
 DEFAULT_SETTINGS = {
@@ -45,6 +47,9 @@ DEFAULT_SETTINGS = {
     "meta": True,
     "filters": F.defaults(),     # 1.3: the filter rows of the Streams tab (filters.py)
     "split": {"mode": "off", "size_mb": 700, "minutes": 20},     # 1.4: the result in parts
+    "fmt": {},           # 1.5: the preset of the format (formats.py; {} = the plain container)
+    "mux": dict(FM.MUX_DEFAULT),     # 1.5: the container options (Format options)
+    "venc": {},          # 1.5: the advanced settings of every encoder {encoder id: {…}} (advanced.py)
 }
 
 PRESETS = {      # built-in; quality 0 = the encoder's own default
@@ -76,6 +81,13 @@ def merged(*parts: dict) -> dict:
         for k, v in (p or {}).items():
             if k == "filters":
                 F.merge(out["filters"], v if isinstance(v, dict) else {})
+            elif k == "fmt":                                   # 1.5: replaced whole, made sane
+                out["fmt"] = FM.clean(v) if isinstance(v, dict) and v else {}
+            elif k == "venc":
+                if isinstance(v, dict):
+                    for eid, d in v.items():
+                        if isinstance(d, dict):
+                            out["venc"][str(eid)] = dict(d)
             elif isinstance(v, dict) and isinstance(out.get(k), dict):
                 out[k].update(v)
             elif k in out:
@@ -84,9 +96,28 @@ def merged(*parts: dict) -> dict:
 
 
 def preset_settings(name: str, user: dict | None = None) -> dict:
+    """A built-in preset, a device preset (1.5) or one of the user's (an old one opens too: what it lacks is
+    taken from DEFAULT_SETTINGS)."""
     if user and name in user:
-        return merged(user[name])
+        return merged(user[name] if isinstance(user[name], dict) else {})
+    if name in FM.DEVICE:
+        return merged(FM.DEVICE[name])
     return merged(PRESETS.get(name, {}))
+
+
+def preset_group(name: str, user: dict | None = None) -> str:
+    if user and name in user:
+        return "own"
+    return FM.DEVICE_GROUP.get(name, "general")
+
+
+def all_presets(user: dict | None = None) -> list[tuple[str, str]]:
+    """[(group, key)] in the order of the list: general, the devices by group, the user's own."""
+    out = [("general", k) for k in PRESETS]
+    for g in FM.GROUPS:
+        out += [(g, k) for gg, k, _st in FM.DEVICES if gg == g]
+    out += [("own", k) for k in sorted(user or {})]
+    return out
 
 
 _ids = itertools.count(1)
@@ -176,6 +207,12 @@ class Job:
                 out[k] = t[k]
         if ext_no(s) is not None:
             out["delay"] = 0                                # its delay moves the input (ext_delay), no filter
+        cap = int(FM.of(self.settings).get("a_maxch", 0) or 0)          # 1.5: the format's most channels
+        if cap:
+            want = F.layout_channels(out.get("channels", "keep"), s.channels or 2, 8)
+            if want > cap:
+                out["channels"] = max((k for k, n in F.LAYOUT_CH.items() if n <= cap), key=F.LAYOUT_CH.get,
+                                      default="stereo")
         return out
 
     def smeta(self, s: Stream) -> dict:
@@ -337,6 +374,16 @@ def segments(job: Job) -> list[tuple[float, float]]:
             keep.append([pos, dur if dur > 0 else pos + 1e9])
         joined = keep
     out = [(round(a, 3), round(b, 3)) for a, b in joined if b - a > 0.04]
+    most = float(FM.of(job.settings).get("dur", 0) or 0)           # 1.5: the format's longest result
+    if most > 0 and dur > 0:
+        pcs2 = out or [(0.0, round(dur, 3))]
+        held, left = [], most
+        for a, b in pcs2:
+            if left <= 0.04:
+                break
+            held.append((a, round(min(b, a + left), 3)))
+            left -= held[-1][1] - a
+        out = held
     if len(out) == 1 and dur > 0 and out[0][0] <= 0.001 and out[0][1] >= dur - 0.001:
         return []                                                # the whole file after all
     return out
@@ -476,12 +523,22 @@ def fit_container(st: dict) -> dict:
     """After the container changed: an encoder / audio codec it can't hold is swapped for one it can."""
     c = E.container(st.get("container", "mkv"))
     v, a = st.setdefault("video", {}), st.setdefault("audio", {})
+    f = FM.of(st)
+    if f and f.get("container") and f["container"] != c.id:           # 1.5: another container: not this format
+        st["fmt"] = f = {}
     if c.id == "gif":
         v["mode"] = "encode"
-    if not c.audio_only and v.get("mode") != "copy" and not c.takes_video(enc_family(v.get("encoder", "auto_hevc"))):
+    fam = enc_family(v.get("encoder", "auto_hevc"))
+    if not c.audio_only and v.get("mode") != "copy" and not c.takes_video(fam):
         v["encoder"], v["quality"] = c.v_default, 0
+        fam = enc_family(v["encoder"])
+    if f and not c.audio_only and v.get("mode") != "copy" and not FM.takes_video(st, fam):
+        first = next((x for x in f.get("vcodecs") or [] if c.takes_video(x)), "")
+        if first:
+            v["encoder"], v["quality"] = FM.encoder_for(first), 0
     codec = a.get("codec", "auto")
-    if codec not in ("auto", "copy") and not c.takes_audio(E.A_CODEC.get(codec, codec)):
+    if codec not in ("auto", "copy") and not (c.takes_audio(E.A_CODEC.get(codec, codec)) and
+                                               FM.takes_audio(st, codec)):
         a["codec"], a["kbps"] = "auto", 0
     return st
 
@@ -519,6 +576,8 @@ def plan(job: Job) -> dict:
                 w.append("w_copy_container")
         elif not c.takes_video(enc_family(vcfg.get("encoder", "auto_hevc"))):
             w.append("w_codec_container")
+        elif not FM.takes_video(st, enc_family(vcfg.get("encoder", "auto_hevc"))):
+            w.append("w_fmt_codec")
     elif v and c.audio_only:
         w.append("w_audio_only")
     joined = multi_encode(job)
@@ -547,6 +606,10 @@ def plan(job: Job) -> dict:
         audios = audios[:1]
     if c.audio is not None and not c.audio:                       # GIF: no sound
         audios = []
+    adef = FM.audio_default(st, c)                                # 1.5: the format's first codec
+
+    def takes(name: str) -> bool:
+        return c.takes_audio(name) and FM.takes_audio(st, name)
     for s in info.of("audio"):
         if c.audio is not None and not c.audio:
             break
@@ -560,22 +623,22 @@ def plan(job: Job) -> dict:
         tc = job.acfg(s)
         changes = F.audio_on(tc)
         if codec == "auto":
-            codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
-        if codec == "copy" and not c.takes_audio(s.codec):
-            codec = c.a_default
+            codec = "copy" if takes(s.codec) and not changes else adef
+        if codec == "copy" and not takes(s.codec):
+            codec = adef
             w.append("w_audio_reencoded")
-        elif codec != "copy" and not c.takes_audio(E.A_CODEC.get(codec, codec)):
-            codec = c.a_default
+        elif codec != "copy" and not takes(E.A_CODEC.get(codec, codec)):
+            codec = adef
             w.append("w_audio_reencoded")
         if codec == "copy" and changes:                           # a filter can't work on copied sound
             same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
-            codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
+            codec = same if same and takes(s.codec) else (adef or "aac")
             if codec == same:
                 out["same_rate"].add(s.index)
             w.append("w_afilter_copy")
         if codec == "copy" and recut:
             same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
-            codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
+            codec = same if same and takes(s.codec) else (adef or "aac")
             if codec == same:
                 out["same_rate"].add(s.index)
             w.append("w_trim_audio")
@@ -592,17 +655,21 @@ def plan(job: Job) -> dict:
         tc = job.acfg(s)
         changes = F.audio_on(tc) or bool(segs)
         if codec == "auto":
-            codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
-        if codec != "copy" and not c.takes_audio(E.A_CODEC.get(codec, codec)):
-            codec = c.a_default
+            codec = "copy" if takes(s.codec) and not changes else adef
+        if codec != "copy" and not takes(E.A_CODEC.get(codec, codec)):
+            codec = adef
             w.append("w_audio_reencoded")
-        if codec == "copy" and (changes or not c.takes_audio(s.codec)):
+        if codec == "copy" and (changes or not takes(s.codec)):
             same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
-            codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
+            codec = same if same and takes(s.codec) else (adef or "aac")
             if codec == same:
                 out["same_rate"].add(("ext", n))
             w.append("w_ext_reencoded" if segs else "w_audio_reencoded")
         out["audio"].append((s, codec))
+    most = int(FM.of(st).get("max_audio", 0) or 0)                 # 1.5: the format's most sound tracks
+    if most and len(out["audio"]) > most:
+        out["audio"] = out["audio"][:most]
+        w.append("w_fmt_audio_n")
     subs = info.of("subtitle")
     if lang:
         subs = [s for s in subs if (s.lang or "").lower() == lang]
@@ -655,10 +722,13 @@ def out_bits(job: Job, enc: E.VEnc | None) -> int:
         return 8
     if len(enc.bits) == 1:
         return enc.bits[0]
+    cap = FM.caps(job.settings, enc.family)[0]                  # 1.5: the profile of the format (Main: 8 bit)
     if want == "auto":
         src = job.info.video.bits if job.info and job.info.video else 8
-        return 10 if (src > 8 or enc.family in ("hevc", "av1")) and 10 in enc.bits else 8
-    return 10 if want == "10" and 10 in enc.bits else 8
+        b = 10 if (src > 8 or enc.family in ("hevc", "av1")) and 10 in enc.bits else 8
+    else:
+        b = 10 if want == "10" and 10 in enc.bits else 8
+    return min(b, cap) if cap >= 8 else b
 
 
 OVERLAY = "\x00overlay"          # where the picture is laid on (the chain is cut there into two)
@@ -721,6 +791,13 @@ def target_box(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
         h = 480
     if h and not w:
         w = _even(h * 16 / 9)
+    f = FM.of(job.settings)                                       # 1.5: the frame of the format
+    fw, fh = int(f.get("width", 0) or 0), int(f.get("height", 0) or 0)
+    if fw and fh and not (enc is not None and enc.id == "gif"):
+        if not (w and h):
+            return fw, fh
+        if f.get("size_limit"):
+            return min(w, fw), min(h, fh)
     return (w, h) if w and h else (0, 0)
 
 
@@ -1170,7 +1247,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                                                                          a.channels, 8), job.acfg(a)) or
                                        (a.bitrate // 1000 if cd == "copy" else 0)
                                        for a, cd in plan(job)["audio"])
-            args += ["-c:v", enc.ffname] + E.video_args(enc, vv, bits, dur) + E.thread_args(enc, threads)
+            vargs = encoder_args(job, enc, E.video_args(enc, vv, bits, dur), bits, vv["chroma"])     # 1.5
+            args += ["-c:v", enc.ffname] + vargs + E.thread_args(enc, threads)
             if enc.id == "x265":
                 i = args.index("-x265-params") + 1
                 if threads > 0:
@@ -1268,16 +1346,32 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         args += ["-sn"]
     args += meta_args(job, p, joined, meta_on)
     args += ["-dn", "-max_muxing_queue_size", "4096"]
-    if cont in ("mp4", "mov", "m4a"):
-        args += ["-movflags", "+faststart"]
-    if cont == "m2ts":
-        args += ["-mpegts_m2ts_mode", "1"]
+    args += FM.mux_args(st, cont)                                 # 1.5: the container options
     if cont == "mp3":
         args += ["-id3v2_version", "3"]
     args += ["-f", c.fmt, out_path]
     if want_preview:
         args += _preview_out(preview)
     return args
+
+
+def out_fps(job: Job) -> float:
+    v = job.settings.get("video", {})
+    f = float(v.get("fps", 0) or 0)
+    if f:
+        return f
+    src = job.info.video if job.info else None
+    return float(src.fps) if src is not None and src.fps else 25.0
+
+
+def encoder_args(job: Job, enc: E.VEnc, base: list[str], bits: int, chroma: str) -> list[str]:
+    """1.5: the encoder's own arguments with the advanced settings laid over them, then the preset of the
+    format (its profile, level, keyframes and VBV win: they are what the device needs)."""
+    caps = ADV.caps(enc)
+    a, p = ADV.args(enc, ADV.of(job.settings, enc), caps)
+    out = FM.put(base, a, p)
+    a, p = FM.video_args(enc, job.settings, bits, chroma, out_fps(job), caps)
+    return FM.put(out, a, p)
 
 
 def _preview_out(path: str) -> list[str]:
@@ -1438,7 +1532,7 @@ def out_name(job: Job, cfg: dict, taken=()) -> str:
     """Where the result goes: next to the source or into the chosen folder, name + suffix, never over the
     source; an existing file gets « (2)» unless overwrite is on. taken: results of tasks running now (1.4)."""
     taken = {os.path.normcase(os.path.abspath(x)) for x in taken}
-    ext = "." + E.container(job.settings.get("container", "mkv")).ext
+    ext = "." + out_ext(job.settings)
     if job.dest:                                         # chosen in «Save as…» (overwrite was asked there)
         path = os.path.splitext(job.dest)[0] + ext
         if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(job.src)):
@@ -1459,6 +1553,15 @@ def out_name(job: Job, cfg: dict, taken=()) -> str:
         path = f"{base} ({n}){ext}"
         n += 1
     return path
+
+
+def out_ext(st: dict) -> str:
+    """The extension of the result: the container's, or the one of the preset of the format (1.5)."""
+    c = E.container(st.get("container", "mkv"))
+    f = FM.of(st)
+    if f.get("ext") and (not f.get("container") or f["container"] == c.id):
+        return f["ext"]
+    return c.ext
 
 
 def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
@@ -1505,7 +1608,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
         bits.append(E.A_BY_ID[a["codec"]].label.split(" (")[0])
     elif c.audio_only and a.get("codec") == "copy":
         bits.append(tr("a_copy_short"))
-    bits.append(c.id.upper())
+    f = FM.of(st)
+    bits.append(f["name"] if f.get("name") else c.id.upper())          # 1.5: the preset of the format
     sp = st.get("split") or {}
     if sp.get("mode") == "size" and sp.get("size_mb"):
         bits.append(tr("split_short_size", sp["size_mb"]))

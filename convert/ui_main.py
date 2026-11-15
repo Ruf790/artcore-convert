@@ -339,9 +339,12 @@ class MainUI:
         self.preset_del_menu = m.addMenu(style.icon("fa6s.trash-can"), t("preset_delete"))
         self.preset_del_menu.aboutToShow.connect(self._fill_preset_del)
         A(m, "", t("preset_default_now"), self._make_default)
+        A(m, "fa6s.sliders", t("fp_title") + "…", self.format_preset_dialog)
+        A(m, "fa6s.screwdriver-wrench", t("adv_button") + "…", self.advanced_dialog)
         m.addSeparator()
         A(m, "fa6s.microchip", t("encoders_here") + "…", self.encoders_dialog)
         A(m, "fa6s.gauge-high", t("bench") + "…", self.bench_dialog)
+        A(m, "fa6s.scale-balanced", t("cmp_title") + "…", self.compare_dialog)
         m = mb.addMenu(t("m_help"))
         A(m, "fa6s.circle-info", t("about"), self.about)
         return mb
@@ -765,7 +768,12 @@ class MainUI:
             self.v_speed_box.addItem(t("speed_n", x), x)
         self.v_speed_box.currentIndexChanged.connect(lambda: self._set("video", "speed", self.v_speed_box.currentData()))
         g.addWidget(self.v_enc, r, 1)
-        g.addWidget(ctl_button("fa6s.gear", t("video_settings"), 15, lambda: self.codec_dialog.exec()), r, 2)
+        gears = QHBoxLayout()
+        gears.setSpacing(0)
+        gears.addWidget(ctl_button("fa6s.gear", t("video_settings"), 15, lambda: self.codec_dialog.exec()))
+        self.b_adv = ctl_button("fa6s.screwdriver-wrench", t("adv_button"), 14, lambda: self.advanced_dialog())
+        gears.addWidget(self.b_adv)                                  # 1.5: the encoder's advanced settings
+        g.addLayout(gears, r, 2)
         crow.addWidget(self.v_rc, 1)
         crow.addWidget(self.v_val, 1)
         crow.addWidget(self.v_speed_box, 1)
@@ -773,6 +781,12 @@ class MainUI:
         self.v_enc_hint = _hint()
         self.v_enc_hint.setMinimumHeight(34)
         g.addWidget(self.v_enc_hint, r + 2, 0, 1, 3)
+        self.v_adv = _hint()                                         # 1.5: «⚙ tune film · ref 4»
+        self.v_adv.setVisible(False)
+        g.addWidget(self.v_adv, r + 3, 0, 1, 3)
+        self.v_fmt = _hint()                                         # 1.5: the preset of the format in use
+        self.v_fmt.setVisible(False)
+        g.addWidget(self.v_fmt, r + 4, 0, 1, 3)
         g.setColumnStretch(1, 1)
         lay.addWidget(self.v_body)
         # 1.3: the video filters (☑ · name · value · ⚙)
@@ -1317,6 +1331,17 @@ class MainUI:
         lay.addWidget(QLabel(f"<b>{t('video')}</b>: {fam}<br><b>{t('grp_audio')}</b>: {aud}<br>"
                              f"<b>{t('subtitles')}</b>: {t('fmt_subs_' + c.subs)}<br>"
                              f"<b>{t('tab_chapters')}</b>: {t('yes') if c.chapters else t('no')}"))
+        fmt = J.FM.of(st)                                              # 1.5: the preset of the format
+        frow = QHBoxLayout()
+        frow.addWidget(QLabel(f"<b>{t('fp_title')}</b>: " + (fmt.get("name") or t("fp_none_short"))))
+        frow.addStretch(1)
+        fb = text_button("fa6s.sliders", t("fp_choose") + "…", lambda: (d.accept(), self.format_preset_dialog()))
+        frow.addWidget(fb)
+        lay.addLayout(frow)
+        from .preset_ui import mux_group                              # 1.5: the container options
+        mg = mux_group(st, lambda k, val: self._set("mux", k, val))
+        if mg is not None:
+            lay.addWidget(mg)
         meta = QCheckBox(t("keep_meta"))
         meta.setChecked(bool(st.get("meta", True)))
         meta.toggled.connect(lambda on: self._set(None, "meta", bool(on)))

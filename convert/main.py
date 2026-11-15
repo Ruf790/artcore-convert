@@ -227,6 +227,7 @@ def selftest() -> int:
         if kinds != ["mpeg4", "gif", "-", "prores"]:
             raise RuntimeError(f"AVI / GIF / MP3 / MOV: {kinds}")
         selftest_14(win, app, src, wide, tmp, lines)
+        selftest_15(win, app, src, wide, tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -301,6 +302,103 @@ def selftest_14(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
     if not res["ok"]:
         raise RuntimeError("speed test: " + res["error"])
     win.set_cpu_limit(100)
+
+
+def selftest_15(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
+    """1.5 in the built exe: every option the advanced encoder settings and the presets of the format can write
+    is in this ffmpeg (no GPU needed to check NVENC / AMF / QSV), the container options exist in its muxers;
+    device presets (Blu-ray, DVD PAL, Discord) through the real queue with a preset of the format and container
+    options, profiles / levels checked by ffprobe; the comparison of two presets."""
+    import json
+    import subprocess
+    import time
+    from . import advanced as ADV
+    from . import compare as C
+    from . import encoders as E, ff, probe
+    from . import formats as FM
+    from . import job as J
+    problems = []
+    for e in E.VIDEO:
+        caps = ADV.caps(e)
+        if not caps:
+            continue
+        offered = ADV.offered(e, caps)
+        for f in offered:
+            if f.opt and f.opt not in caps:
+                problems.append(f"{e.ffname}: -{f.opt}")
+        st = J.merged({"fmt": {"name": "X", "profile": {e.family: (FM.PROFILES.get(e.family) or ("",))[0]},
+                               "level": {e.family: (FM.LEVELS.get(e.family) or ("",))[-1]}, "gop_max": 50,
+                               "gop_closed": True, "vbv_buf": 1000, "vbv_max": 2000}})
+        _a, p = FM.video_args(e, st, 8, "420", 25.0, caps)
+        problems += [f"{e.ffname}: {k}" for k in p if k.lstrip("-") not in caps]
+        lines.append(f"  1.5 {e.ffname}: advanced {', '.join(f.key for f in offered) or '—'}")
+    if problems:
+        raise RuntimeError("1.5 options: " + "; ".join(problems))
+    for muxer, opts in (("matroska", ("reserve_index_space", "cues_to_front", "cluster_size_limit",
+                                       "cluster_time_limit", "write_crc32", "default_mode")),
+                        ("mp4", ("movflags",)), ("mpegts", ("muxrate", "pcr_period", "mpegts_m2ts_mode")),
+                        ("dvd", ("muxrate",))):
+        h = ff.run([ff.ffmpeg(), "-hide_banner", "-h", f"muxer={muxer}"], 20).stdout
+        lacking = [o for o in opts if f"-{o} " not in h]
+        if lacking:
+            raise RuntimeError(f"1.5: the {muxer} muxer lacks {lacking}")
+    lines.append("1.5: advanced / format options and container options: ok")
+    a = J.Job(src=wide, settings=J.preset_settings("bluray"))
+    a.settings["video"].update(encoder="x264", speed=1)
+    a.settings["mux"] = {"ts_muxrate": 0}
+    b = J.Job(src=src, settings=J.preset_settings("dvd_pal"))
+    c = J.Job(src=wide, settings=J.preset_settings("discord10"))
+    c.settings["video"].update(encoder="x264", speed=1)
+    c.trim = [[0.2, 1.8]]
+    d = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"encoder": "x265", "speed": 1},
+                                          "venc": {"x265": {"ref": 2, "params": "no-sao=1"}},
+                                          "mux": {"mkv_cues_front": True, "mkv_crc32": False}}))
+    FM.apply(d.settings, {"name": "HEVC Main@4.1 GOP 10", "container": "mkv", "vcodecs": ["hevc"],
+                          "profile": {"hevc": "main"}, "level": {"hevc": "4.1"}, "gop_max": 10, "gop_closed": True})
+    jobs = (a, b, c, d)
+    win.cfg.update(parallel=2, metrics=[])
+    for j in jobs:
+        win._append(j)
+    win._queue_changed()
+    t0 = time.monotonic()
+    while any(j.status == "probe" for j in win.jobs) and time.monotonic() - t0 < 30:
+        app.processEvents()
+        time.sleep(0.02)
+    win.start_queue()
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 300 and any(j.status not in ("done", "error") for j in jobs):
+        app.processEvents()
+        time.sleep(0.02)
+    got = []
+    for j in jobs:
+        lines.append(f"1.5 {j.status}: {j.out} {j.error}")
+        if j.status != "done":
+            raise RuntimeError(f"1.5 conversion failed: {j.error}")
+        r = subprocess.run([ff.ffprobe(), "-v", "error", "-show_streams", "-show_format", "-of", "json", j.out],
+                           capture_output=True, text=True, timeout=60)
+        pj = json.loads(r.stdout)
+        v = next(s for s in pj["streams"] if s["codec_type"] == "video")
+        got.append((v["codec_name"], v.get("profile"), int(v.get("level", 0)), v["width"], v["height"],
+                    pj["format"]["format_name"]))
+        lines.append(f"  {got[-1]}")
+    want = [("h264", "High", 41, 1920, 1080, "mpegts"), ("mpeg2video", "Main", 8, 720, 576, "mpeg"),
+            ("h264", "High", None, 1280, 720, "mov,mp4,m4a,3gp,3g2,mj2"), ("hevc", "Main", 123, 640, 360, "matroska,webm")]
+    for g, w_ in zip(got, want):
+        if tuple(x for x, y in zip(g, w_) if y is not None) != tuple(y for y in w_ if y is not None):
+            raise RuntimeError(f"1.5 devices / format: {got}")
+    if os.path.getsize(c.out) > 10 * 1000 * 1000 or abs(probe.probe(c.out).duration - 1.6) > 0.25:
+        raise RuntimeError("1.5 Discord: the size / length is wrong")
+    data = open(d.out, "rb").read()
+    if not 0 < data.find(b"\x1c\x53\xbb\x6b") < data.find(b"\x1f\x43\xb6\x75") or b"ref=2" not in data:
+        raise RuntimeError("1.5: the Cues are not in front / the advanced x265 settings are missing")
+    info = probe.probe(src)
+    res = [C.run_one(k, k, J.preset_settings(k) | {"video": J.preset_settings(k)["video"] | {"encoder": "x264"}},
+                     src, info, 0.0, 1.5, win.av, C.work_dir(), 1, n=i) for i, k in enumerate(("telegram", "android"))]
+    lines.append("  compare: " + "; ".join(f"{r['key']} {r['size']} B {r.get('psnr', 0):.1f} dB "
+                                           f"VMAF {r.get('vmaf', '—')}" for r in res))
+    if not all(r["ok"] and r.get("psnr") for r in res):
+        raise RuntimeError("1.5 compare: " + "; ".join(r["error"] for r in res))
+    win.cfg.update(parallel=1)
 
 
 def main() -> int:

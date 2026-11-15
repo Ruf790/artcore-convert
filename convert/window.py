@@ -14,6 +14,7 @@ from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMainWin
 
 from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
 from . import encoders as E
+from . import formats as FM
 from . import job as J
 from . import filters as F
 from . import probe as P
@@ -300,16 +301,37 @@ class MainWindow(MainUI, QMainWindow):
             self.m_val["vmaf"].setText(t("m_no_vmaf_short"))
 
     # ── presets ───────────────────────────────────────────────
+    def preset_entries(self) -> list[tuple[str, str, dict]]:
+        """1.5: every preset in the order of the list, with a «#group» entry before each group:
+        [(key, label, settings)] (the comparison window takes the same list)."""
+        out, last = [], None
+        for g, key in J.all_presets(self.user_presets):
+            if g != last:
+                out.append(("#" + g, t("pg_" + g), {}))
+                last = g
+            label = ("★ " + key) if g == "own" else t("p_" + key)
+            out.append((key, label, J.preset_settings(key, self.user_presets)))
+        return out
+
     def _fill_presets(self):
+        """The preset list in groups (1.5): general, Apple, Android, TVs, consoles, the web, discs, own."""
         self.preset_box.blockSignals(True)
         self.preset_box.clear()
-        for key in J.PRESETS:
-            self.preset_box.addItem(t("p_" + key), key)
-        if self.user_presets:
-            self.preset_box.insertSeparator(self.preset_box.count())
-            for name in sorted(self.user_presets):
-                self.preset_box.addItem("★ " + name, name)
+        self.preset_box.setMaxVisibleItems(32)
+        model = self.preset_box.model()
+        for key, label, _st in self.preset_entries():
+            if key.startswith("#"):
+                self.preset_box.addItem(label, None)
+                it = model.item(self.preset_box.count() - 1)
+                it.setEnabled(False)
+                f = it.font()
+                f.setBold(True)
+                it.setFont(f)
+            else:
+                self.preset_box.addItem("   " + label, key)
         i = self.preset_box.findData(self.cfg.get("preset", "hevc_hw"))
+        if i < 0:
+            i = self.preset_box.findData("hevc_hw")
         self.preset_box.setCurrentIndex(max(0, i))
         self.preset_box.blockSignals(False)
 
@@ -333,14 +355,100 @@ class MainWindow(MainUI, QMainWindow):
 
     def _preset_menu(self):
         m = QMenu(self)
+        m.addAction(style.icon("fa6s.sliders"), t("fp_title") + "…", self.format_preset_dialog)
+        m.addAction(style.icon("fa6s.scale-balanced"), t("cmp_title") + "…", self.compare_dialog)
+        m.addSeparator()
         m.addAction(style.icon("fa6s.floppy-disk"), t("preset_save"), self.save_preset)
         if self.user_presets:
+            rm = m.addMenu(style.icon("fa6s.pen"), t("preset_rename"))
             dm = m.addMenu(style.icon("fa6s.trash-can"), t("preset_delete"))
             for name in sorted(self.user_presets):
+                rm.addAction(name, lambda n=name: self.rename_preset(n))
                 dm.addAction(name, lambda n=name: self.delete_preset(n))
         m.addSeparator()
         m.addAction(t("preset_default_now"), self._make_default)
         m.exec(self.b_preset_menu.mapToGlobal(self.b_preset_menu.rect().bottomLeft()))
+
+    def rename_preset(self, name: str, new: str = ""):
+        if name not in self.user_presets:
+            return
+        if not new:
+            new, ok = QInputDialog.getText(self, APP_TITLE, t("preset_name"), text=name)
+            new = (new or "").strip() if ok else ""
+        if not new or new == name or new in self.user_presets:
+            return
+        self.user_presets[new] = self.user_presets.pop(name)
+        config.write("presets.json", self.user_presets)
+        if self.cfg.get("preset") == name:
+            self.cfg["preset"] = new
+        for j in self.jobs:
+            if j.preset == name:
+                j.preset = new
+        self._fill_presets()
+
+    # ── 1.5: the preset of the format, the advanced encoder settings, the comparison ──
+    def format_preset_dialog(self):
+        from .preset_ui import FormatDialog
+        st = self._shown_settings()
+        d = FormatDialog(self, FM.of(st), st.get("container", "mkv"))
+        d.applied.connect(self.apply_format)
+        self._fmt_dlg = d
+        d.exec()
+
+    def apply_format(self, f: dict | None):
+        """Put a preset of the format into the selected tasks (or the settings of new files)."""
+        jobs = self.selected_jobs(editable=True)
+        targets = [j.settings for j in jobs]
+        if not jobs and not self.selected_jobs():
+            if not self.cfg.get("defaults"):
+                self.cfg["defaults"] = J.merged(self.new_settings())
+            targets = [self.cfg["defaults"]]
+        for st in targets:
+            FM.apply(st, f)
+        for j in jobs:
+            if j.status in ("done", "error", "stop", "skip") and not self._busy(j) and j.info is not None \
+                    and not j.info.error:
+                j.status, j.error, j.progress = "wait", "", 0.0
+            self._refresh(j)
+        if jobs:
+            self._queue_changed()
+        else:
+            config.save(self.cfg)
+        self._load_settings()
+        self._edit_tabs()
+        self._fill_tracks()
+        js = self.selected_jobs()
+        self._show_info(js[0] if js else None)
+        self._show_out_path()
+
+    def _adv_encoder(self) -> E.VEnc | None:
+        v = self._shown_settings().get("video", {})
+        if v.get("mode", "encode") != "encode":
+            return None
+        eid = v.get("encoder", "auto_hevc")
+        return self.av.resolve(eid) if self.av_ready else E.BY_ID.get(eid)
+
+    def advanced_dialog(self):
+        from .preset_ui import AdvancedDialog
+        e = self._adv_encoder()
+        if e is None:
+            self._toast(t("adv_no_encoder"))
+            return
+        st = self._shown_settings()
+        d = AdvancedDialog(self, e, (st.get("venc") or {}).get(e.id, {}), str(st.get("video", {}).get("bits", "auto")))
+        d.changed.connect(lambda eid, vals: self._set("venc", eid, vals))
+        d.bits.connect(lambda b: self._set("video", "bits", b))
+        self._adv_dlg = d
+        d.exec()
+
+    def compare_dialog(self):
+        from .preset_ui import CompareDialog
+        sel = self.selected_jobs()
+        j = sel[0] if sel and sel[0].info is not None and not sel[0].info.error else None
+        key = self.preset_box.currentData() or self.cfg.get("preset", "hevc_hw")
+        d = CompareDialog(self, self.av, self.preset_entries(), j, self._threads(), key)
+        self._cmp = d
+        d.exec()
 
     def save_preset(self):
         name, ok = QInputDialog.getText(self, APP_TITLE, t("preset_name"))
@@ -944,7 +1052,7 @@ class MainWindow(MainUI, QMainWindow):
                               ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale"),
                               ("video", "quality"), ("video", "bitrate"), ("video", "size_mb"), ("video", "speed")):
             self._load_settings()
-        if key in ("deint", "fps", "bits"):
+        if key in ("deint", "fps", "bits") or section in ("venc", "mux"):
             self._load_settings()
         if section == "audio" and key == "gain":
             self._gain_preview()
@@ -1269,10 +1377,20 @@ class MainWindow(MainUI, QMainWindow):
                 item = amodel.item(i)
                 if item is not None and cid not in ("auto", "copy"):
                     fits = cont.takes_audio(E.A_CODEC.get(cid, cid))
-                    item.setEnabled(fits)
-                    item.setToolTip("" if fits else t("not_in_container", cont.id.upper()))
+                    in_fmt = FM.takes_audio(st, cid)
+                    item.setEnabled(fits and in_fmt)
+                    item.setToolTip("" if fits and in_fmt else t("not_in_container", cont.id.upper()) if not fits
+                                    else t("not_in_format", FM.of(st).get("name", "")))
             self._speed_label()
             self._enc_hint(enc if enc_on else None, v, cont)
+            from . import advanced as ADV                                  # 1.5: what is set in ⚙ Advanced
+            adv = ADV.summary(enc, (st.get("venc") or {}).get(enc.id, {})) if enc_on else ""
+            self.v_adv.setText(("⚙ " + adv) if adv else "")
+            self.v_adv.setVisible(bool(adv))
+            self.b_adv.setEnabled(enc_on)
+            f = FM.of(st)
+            self.v_fmt.setText(t("fp_in_use", f["name"]) if f.get("name") else "")
+            self.v_fmt.setVisible(bool(f.get("name")))
             jobs = self.selected_jobs()
             jr = jobs[0] if jobs and jobs[0].info is not None and jobs[0].info.video is not None else None
             if jr is not None:
@@ -1366,7 +1484,9 @@ class MainWindow(MainUI, QMainWindow):
 
     def _fill_encoders(self):
         cur = self.v_enc.currentData()
-        cont = E.container(self._shown_settings().get("container", "mkv"))
+        st = self._shown_settings()
+        cont = E.container(st.get("container", "mkv"))
+        fmt = FM.of(st)
         self.v_enc.blockSignals(True)
         self.v_enc.clear()
         self.v_enc.setMaxVisibleItems(24)
@@ -1384,6 +1504,8 @@ class MainWindow(MainUI, QMainWindow):
             self.v_enc.addItem(name, "auto_" + fam)
             if not cont.takes_video(fam):
                 off(t("not_in_container", cont.id.upper()))
+            elif not FM.takes_video(st, fam):
+                off(t("not_in_format", fmt.get("name", "")))
         self.v_enc.insertSeparator(self.v_enc.count())
         last = ""
         for e in E.VIDEO:
@@ -1395,6 +1517,8 @@ class MainWindow(MainUI, QMainWindow):
                 off(t("enc_missing") + (": " + self.av.errors[e.id] if e.id in self.av.errors else ""))
             elif not cont.takes_video(e.family):
                 off(t("not_in_container", cont.id.upper()))
+            elif not FM.takes_video(st, e.family):
+                off(t("not_in_format", fmt.get("name", "")))
         i = self.v_enc.findData(cur)
         self.v_enc.setCurrentIndex(max(0, i))
         self.v_enc.blockSignals(False)
@@ -1569,7 +1693,7 @@ class MainWindow(MainUI, QMainWindow):
         j = jobs[0]
         c = E.container(j.settings.get("container", "mkv"))
         path, _ = QFileDialog.getSaveFileName(self, t("save_as"), J.out_name(j, self.cfg),
-                                              f"{c.label} (*.{c.ext});;{t('all_files')} (*)")
+                                              f"{c.label} (*.{J.out_ext(j.settings)});;{t('all_files')} (*)")
         if not path:
             return
         j.dest = path
