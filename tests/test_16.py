@@ -232,7 +232,7 @@ def test_xlog_of_a_run(qapp, films, data_dir):
                  "cabac = 1", "x264 info: profile High", "x264 info: options: cabac=1", "x264 info: kb/s:",
                  "I frames: ", "N frames: ", "Last position: ", "FFMPEG OUTPUT", "Quality metrics: PSNR", "ENCODING COMPLETED! ", "Encoding time: ", "Maximum memory usage: ",
                  "Encoded data size: ", "Container data size: ", "Total file size: ", "Encoded file: " + j.out):
-        assert part in text, part
+        assert part in text, part + "\n" + "\n".join(x for x in text.splitlines() if "264" in x)[:4000]
     assert "Decoder thread received EOF" not in text and "Terminating demuxer thread" not in text
     assert "Decoder thread received EOF" not in w.log.toPlainText()
     w.close()

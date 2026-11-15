@@ -193,7 +193,7 @@ _RE_ENC_FF = re.compile(r"^\[(libx264|libx265|libsvtav1|libvpx-vp9|libvpx|libxvi
                         r"(?:h264|hevc|av1)_(?:nvenc|amf|qsv)) @ 0x[0-9a-f]+\]\s?(.*)$")
 _RE_ENC_OWN = re.compile(r"^(x26[45]|Svt)\s?\[(info|warning|warn|error|debug)\]:\s?(.*)$", re.I)
 _RE_X265_DONE = re.compile(r"^encoded \d+ frames in [\d.]+s")
-_RE_OPT_LINE = re.compile(r"^(x26[45]) - core (\S+ \S+ \S+).*? - options: (.*)$")
+_RE_OPT_LINE = re.compile(r"^(?:.*?\bcore\s+(\S+(?:\s+r\S+)?(?:\s+[0-9a-f]{6,}M?)?))?.*?\boptions:\s*(.*)$")
 _RE_KBPS = re.compile(r"^kb/s:\s*([\d.]+)")
 _RE_MAP = re.compile(r"^\s*Stream #(\d+):(\d+)(?: \([^)]*\))? -> (?:#0:(\d+)\b.*|(.+))$")
 _RE_MAP_OUT = re.compile(r"^\s*.+ -> Stream #0:(\d+)")
@@ -234,10 +234,11 @@ def encoder_lines(lines: list[str]) -> list[str]:
         if not name or not body or set(body) <= set("-"):
             continue
         prefix = f"{name} {level}: "
-        o = _RE_OPT_LINE.match(body)
-        if o:
-            out.append(prefix + "core " + o.group(2))
-            out += _wrap(prefix + "options:", o.group(3).strip())
+        o = _RE_OPT_LINE.match(body) if "options:" in body else None
+        if o and o.group(2).strip():
+            if o.group(1):
+                out.append(prefix + "core " + o.group(1))
+            out += _wrap(prefix + "options:", o.group(2).strip())
             continue
         out.append(prefix + re.sub(r"\s*\t+\s*", "  ", body))
     return out
