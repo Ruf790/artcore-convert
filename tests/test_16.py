@@ -195,12 +195,15 @@ def test_xlog_pieces():
         "[libx264 @ 0x4] frame I:1     Avg QP:12.82  size: 14733",
         "frame=  150 fps=112 q=-1.0 size=     907kB time=00:00:05.99 bitrate=1240.7kbits/s speed=4.49x",
     ]
-    st = "\n".join(xlog.stats(lines))
-    assert "Completed video stream at index: 0: Encoded frames: 150, Written packets: 150 (602060 bytes)" in st
-    assert "Completed audio stream at index: 1: Copied, Written packets: 173" in st
-    assert "index: 0: Encoded frames: 6" not in st                     # the preview frame is not the result
-    assert "Input audio stream #0:1: Read packets: 206 (86100 bytes), Decoded frames: 204 (313344 samples)" in st
-    assert "I frames: 1, avg QP = 12.82, avg size = 14733 bytes" in st and "Last position: frame= 150" in st
+    lines.insert(0, "  Stream #0:1 -> #0:1 (copy)")
+    st = "\n".join(xlog.stats(lines, 6.0))                         # 1.7.1: blocks per stream
+    assert "Completed video stream at index: 0\n" + xlog.LINE + "\nEncoded: 150 frames\nWritten: 150 packets (602060 bytes)" in st
+    assert "Completed audio stream at index: 1\n" + xlog.LINE + "\nRead: 206 packets (86100 bytes) from #0:1\n" \
+           "Decoded: 204 frames\nEncoded: copied\nWritten: 173 packets (72306 bytes)" in st
+    assert "Encoded: 6 frames" not in st                                  # the preview frame is not the result
+    assert "Last position: 5.990s" in st and "Average video 0 bitrate: 803kbps" in st
+    fs = xlog.frame_stats(lines)
+    assert fs == ["I frames: 1 frames, size = 14733 / 14733, avg QP = 12.82", "N frames: 1 frames, size = 14733 / 14733"]
     assert xlog.sizes(lines)["video"] == 588.0
     assert xlog.NOISE.search("[vist#0:0/h264 @ 0x5] Decoder thread received EOF packet")
     assert not xlog.NOISE.search("[libx264 @ 0x4] frame I:1     Avg QP:12.82  size: 14733")
@@ -226,9 +229,42 @@ def test_xlog_of_a_run(qapp, films, data_dir):
                  "Codec:       H.264 > LIBX264 600 kbps 2-pass", "Audio general:", "Stream #ext1: AC-3 2ch 44.1kHz > AC-3",
                  "PASS 1 OF 2 (ANALYSIS) STARTED", "PASS 2 OF 2 (ENCODING) STARTED", "QUALITY METRICS STARTED",
                  "Encoding in progress...", "Completed video stream at index: 0", "Encoder settings (written into the stream):",
-                 "cabac = 1", "Quality metrics: PSNR", "ENCODING COMPLETED! ", "Encoding time: ", "Maximum memory usage: ",
-                 "Encoded data size: ", "Container data size: ", "Total file size: ", "Encoded file path: " + j.out):
+                 "cabac = 1", "x264 info: profile High", "x264 info: options: cabac=1", "x264 info: kb/s:",
+                 "I frames: ", "N frames: ", "Last position: ", "FFMPEG OUTPUT", "Quality metrics: PSNR", "ENCODING COMPLETED! ", "Encoding time: ", "Maximum memory usage: ",
+                 "Encoded data size: ", "Container data size: ", "Total file size: ", "Encoded file: " + j.out):
         assert part in text, part
     assert "Decoder thread received EOF" not in text and "Terminating demuxer thread" not in text
     assert "Decoder thread received EOF" not in w.log.toPlainText()
     w.close()
+
+
+def test_encoder_lines_as_the_encoder_says_them():
+    """1.7.1: «[libx264 @ 0x…] …» → «x264 info: …», the options cut into lines, x265 / SVT the same way."""
+    from convert import xlog
+    opts = " ".join(f"opt{i}={i}" for i in range(40))
+    lines = ["[libx264 @ 0x55aa] using SAR=1/1",
+             "[libx264 @ 0x55aa] profile High, level 4.1, 4:2:0, 8-bit",
+             f"[libx264 @ 0x55aa] 264 - core 164 r3108 31e19f9 - H.264/MPEG-4 AVC codec - Copyleft - options: {opts}"
+             .replace("264 - core", "x264 - core", 1),
+             "[libx264 @ 0x55aa] frame I:1020  Avg QP:16.47  size: 74117",
+             "[libx264 @ 0x55aa] kb/s:2297.54",
+             "[out#0/matroska @ 0x1] Output file #0 (/x/y.mkv):",
+             "x265 [info]: HEVC encoder version 3.5+1",
+             "x265 [warning]: something",
+             "encoded 49 frames in 0.60s (81.66 fps), 1363.51 kb/s, Avg QP:34.79",
+             "Svt[info]: SVT [config]: preset / tune\t\t\t: 12 / PSNR",
+             "Svt[info]: -------------------------------------------",
+             "[hevc_nvenc @ 0x77] Using CUDA"]
+    el = xlog.encoder_lines(lines)
+    assert el[:3] == ["x264 info: using SAR=1/1", "x264 info: profile High, level 4.1, 4:2:0, 8-bit",
+                      "x264 info: core 164 r3108 31e19f9"]
+    opt_lines = el[3:el.index("x264 info: frame I:1020  Avg QP:16.47  size: 74117")]
+    assert opt_lines[0].startswith("x264 info: options: opt0=0") and len(opt_lines) > 1
+    assert all(len(x) <= xlog.WRAP + 10 for x in opt_lines)
+    assert " ".join(opt_lines).replace("x264 info: options: ", "").split() == opts.split()
+    assert "x264 info: kb/s:2297.54" in el and not any("out#0" in x for x in el)
+    assert "x265 info: HEVC encoder version 3.5+1" in el and "x265 warning: something" in el
+    assert "x265 info: encoded 49 frames in 0.60s (81.66 fps), 1363.51 kb/s, Avg QP:34.79" in el
+    assert "svt info: SVT [config]: preset / tune  : 12 / PSNR" in el and not any(x.startswith("svt info: ---") for x in el)
+    assert "nvenc info: Using CUDA" in el
+    assert xlog.frame_stats(lines)[-1] == "N frames: 1020 frames, size = 74117 / 75599340, bitrate = 2298kbps"

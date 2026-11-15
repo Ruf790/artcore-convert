@@ -186,37 +186,165 @@ def phases(lines: list[str], kinds: list[tuple[str, float]]) -> list[dict]:
     return out
 
 
-def stats(lines: list[str]) -> list[str]:
-    """What ffmpeg (-loglevel verbose) and the encoder said at the end, as statistics."""
+# 1.7.1: what the encoder itself said — «[libx264 @ 0x…] …», «x265 [info]: …», «Svt[info]: …» — as «x264 info: …»
+_ENC_NAMES = {"libx264": "x264", "libx265": "x265", "libsvtav1": "svt", "libvpx-vp9": "vp9", "libvpx": "vpx",
+              "libxvid": "xvid", "mpeg4": "mpeg4", "mpeg2video": "mpeg2", "prores_ks": "prores", "libaom-av1": "aom"}
+_RE_ENC_FF = re.compile(r"^\[(libx264|libx265|libsvtav1|libvpx-vp9|libvpx|libxvid|mpeg4|mpeg2video|prores_ks|libaom-av1|"
+                        r"(?:h264|hevc|av1)_(?:nvenc|amf|qsv)) @ 0x[0-9a-f]+\]\s?(.*)$")
+_RE_ENC_OWN = re.compile(r"^(x26[45]|Svt)\s?\[(info|warning|warn|error|debug)\]:\s?(.*)$", re.I)
+_RE_X265_DONE = re.compile(r"^encoded \d+ frames in [\d.]+s")
+_RE_OPT_LINE = re.compile(r"^(x26[45]) - core (\S+ \S+ \S+).*? - options: (.*)$")
+_RE_KBPS = re.compile(r"^kb/s:\s*([\d.]+)")
+_RE_MAP = re.compile(r"^\s*Stream #(\d+):(\d+)(?: \([^)]*\))? -> (?:#0:(\d+)\b.*|(.+))$")
+_RE_MAP_OUT = re.compile(r"^\s*.+ -> Stream #0:(\d+)")
+_RE_TIME = re.compile(r"time=\s*(-?\d+):(\d+):([\d.]+)")
+WRAP = 100
+
+
+def _wrap(prefix: str, text: str) -> list[str]:
+    """«x264 info: options: cabac=1 ref=9 …» cut into lines of about WRAP characters (the rest with no prefix)."""
+    words, out, cur = text.split(" "), [], prefix
+    for w in words:
+        if len(cur) + 1 + len(w) > WRAP and cur.strip() != prefix.strip():
+            out.append(cur)
+            cur = w
+        else:
+            cur = (cur + " " + w) if cur and not cur.endswith(": ") else cur + w
+    out.append(cur)
+    return out
+
+
+def encoder_lines(lines: list[str]) -> list[str]:
+    """The encoder's own lines of one ffmpeg run, as «x264 info: …» (no «[libx264 @ 0x…]»)."""
     out: list[str] = []
-    frames = []
     for ln in lines:
+        name, level, body = "", "info", ""
+        m = _RE_ENC_FF.match(ln)
+        if m:
+            ff_name, body = m.group(1), m.group(2).strip()
+            name = _ENC_NAMES.get(ff_name) or ("nvenc" if "nvenc" in ff_name else "amf" if "amf" in ff_name else "qsv")
+        else:
+            m = _RE_ENC_OWN.match(ln)
+            if m:
+                name = "svt" if m.group(1).lower() == "svt" else m.group(1).lower()
+                level = {"warn": "warning"}.get(m.group(2).lower(), m.group(2).lower())
+                body = m.group(3).strip()
+            elif _RE_X265_DONE.match(ln.strip()):
+                name, body = "x265", ln.strip()
+        if not name or not body or set(body) <= set("-"):
+            continue
+        prefix = f"{name} {level}: "
+        o = _RE_OPT_LINE.match(body)
+        if o:
+            out.append(prefix + "core " + o.group(2))
+            out += _wrap(prefix + "options:", o.group(3).strip())
+            continue
+        out.append(prefix + re.sub(r"\s*\t+\s*", "  ", body))
+    return out
+
+
+def frame_stats(lines: list[str]) -> list[str]:
+    """«I frames: 1020 frames, size = 74117 / 75599340, avg QP = 16.47» … and «N frames: … bitrate = …kbps»."""
+    out, n_all, bytes_all, kbps = [], 0, 0, ""
+    for ln in lines:
+        if not (_RE_ENC_FF.match(ln) or _RE_ENC_OWN.match(ln)):
+            continue
         m = _RE_FRAMES.search(ln)
-        if m and ("libx26" in ln or "x26" in ln.lower()):
-            kbps = f", bitrate = {m.group(4)} kbps" if m.group(4) else ""
-            size = f", avg size = {m.group(5)} bytes" if m.group(5) else ""
-            frames.append(f"{m.group(1).upper()} frames: {m.group(2)}, avg QP = {m.group(3)}{size}{kbps}")
-    if frames:
-        out.append("Frame statistics:")
-        out += [" " + f for f in frames]
+        if m:
+            kind, n, qp = m.group(1).upper(), int(m.group(2)), m.group(3)
+            if m.group(5):
+                size = int(m.group(5))
+                out.append(f"{kind} frames: {n} frames, size = {size} / {size * n}, avg QP = {qp}")
+                bytes_all += size * n
+            else:
+                out.append(f"{kind} frames: {n} frames, avg QP = {qp}" + (f", bitrate = {m.group(4)}kbps" if m.group(4) else ""))
+            n_all += n
+        body = ln.split("]", 1)[-1].strip()
+        k = _RE_KBPS.match(body)
+        if k:
+            kbps = k.group(1)
+    if not out:
+        return []
+    if not bytes_all:                                       # x265 gives no sizes: the muxed bytes of the video
+        v = next((m for m in (_RE_OUT.search(x) for x in lines) if m and m.group(2) == "video"), None)
+        bytes_all = int(v.group(6)) if v else 0
+    tail = f"N frames: {n_all} frames"
+    if bytes_all and n_all:
+        tail += f", size = {bytes_all // n_all} / {bytes_all}"
+    if kbps:
+        tail += f", bitrate = {float(kbps):.0f}kbps"
+    return out + [tail]
+
+
+def _mapping(lines: list[str]) -> dict[int, str]:
+    """output stream → «#0:1» of the input it came from (straight, or through the filters, in order by kind)."""
+    direct, via_filter, outs_filter = {}, [], []
+    in_kind = {}
     for ln in lines:
         m = _RE_IN.search(ln)
-        if not m:
+        if m:
+            in_kind[(int(m.group(1)), int(m.group(2)))] = m.group(3)
+    for ln in lines:
+        m = _RE_MAP.match(ln)
+        if m:
+            src = (int(m.group(1)), int(m.group(2)))
+            if m.group(3) is not None:
+                direct[int(m.group(3))] = src
+            else:
+                via_filter.append(src)
             continue
-        d, e, smp = _RE_DEC.search(ln), _RE_ERRS.search(ln), _RE_SAMPLES.search(ln)
-        dec = f", Decoded frames: {d.group(1)}" if d else ""
-        dec += f" ({smp.group(1)} samples)" if smp else ""
-        errs = f", Decode errors: {e.group(1)}" if e and e.group(1) != "0" else ""
-        out.append(f"Input {m.group(3)} stream #{m.group(1)}:{m.group(2)}: Read packets: {m.group(4)} "
-                   f"({m.group(5)} bytes){dec}{errs}")
+        m = _RE_MAP_OUT.match(ln)
+        if m and "Stream #" not in ln.split("->")[0]:
+            outs_filter.append(int(m.group(1)))
+    out = {k: f"#{a}:{b}" for k, (a, b) in direct.items()}
+    # through the filters: the first unused input of the same kind
+    kinds_out = {int(m.group(1)): m.group(2) for m in (_RE_OUT.search(x) for x in lines) if m}
+    used = set()
+    for k in outs_filter:
+        want = kinds_out.get(k)
+        src = next((s for s in via_filter if s not in used and in_kind.get(s) == want), None)
+        if src is not None:
+            used.add(src)
+            out[k] = f"#{src[0]}:{src[1]}"
+    return {k: v for k, v in out.items() if v}
+
+
+def stats(lines: list[str], duration: float = 0.0) -> list[str]:
+    """Per stream of the result: where it came from, read / decoded / encoded / written; the last position;
+    the average bit rates. Blocks separated by ----- lines."""
+    out: list[str] = []
+    reads = {}
+    for ln in lines:
+        m = _RE_IN.search(ln)
+        if m:
+            d, e = _RE_DEC.search(ln), _RE_ERRS.search(ln)
+            reads[f"#{m.group(1)}:{m.group(2)}"] = (m.group(4), m.group(5), d.group(1) if d else "",
+                                                    e.group(1) if e else "0")
+    src_of = _mapping(lines)
+    rates = []
     for m in (x for x in (_RE_OUT.search(ln) for ln in lines) if x):
-        enc = f"Encoded frames: {m.group(3)}, " if m.group(3) else "Copied, "
-        out.append(f"Completed {m.group(2)} stream at index: {m.group(1)}: {enc}Written packets: {m.group(5)} "
-                   f"({m.group(6)} bytes)")
+        k, kind = int(m.group(1)), m.group(2)
+        block = [f"Completed {kind} stream at index: {k}", LINE]
+        src = src_of.get(k)
+        if src and src in reads:
+            r, rb, dec, errs = reads[src]
+            block.append(f"Read: {r} packets ({rb} bytes) from {src}")
+            if dec:
+                block.append(f"Decoded: {dec} frames" + (f", {errs} decode errors" if errs != "0" else ""))
+        block.append(f"Encoded: {m.group(3)} frames" if m.group(3) else "Encoded: copied")
+        block.append(f"Written: {m.group(5)} packets ({m.group(6)} bytes)")
+        out += block + [LINE]
+        if duration > 0:
+            rates.append(f"Average {kind} {k} bitrate: {int(m.group(6)) * 8 / duration / 1000:.0f}kbps")
     last = [ln for ln in lines if _RE_PROGRESS.match(ln.strip())]
     if last:
-        out.append("Last position: " + re.sub(r"\s+", " ", last[-1].strip()))
-    return out
+        t = _RE_TIME.search(last[-1])
+        if t:
+            sec = int(t.group(1)) * 3600 + int(t.group(2)) * 60 + float(t.group(3))
+            out += [f"Last position: {sec:.3f}s", LINE]
+    if rates:
+        out += rates + [LINE]
+    return out[:-1] if out and out[-1] == LINE else out
 
 
 def sizes(lines: list[str]) -> dict:
@@ -353,6 +481,12 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
                     L += ["  " + o for o in opts[:60]]
             except ValueError:
                 pass
+            if j.status == "done":                          # 1.7.1: what the encoder wrote into the stream
+                eo = encoder_options(j.out) if j.out and os.path.isfile(j.out) else []
+                if eo:
+                    L.append(LINE)
+                    L.append("Encoder settings (written into the stream):")
+                    L += [" " + o for o in eo]
         L.append(LINE)
     if pl["audio"]:
         L.append("Audio general:")
@@ -404,31 +538,31 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
             title = f"PASS {k1} OF {n_pass1 + 1} (ANALYSIS)"
         elif p["kind"] == "main" and n_pass1:
             title = f"PASS {n_pass1 + 1} OF {n_pass1 + 1} (ENCODING)"
+        p["title"] = title
         L.append(title + (f" STARTED {stamp(p['started'])}" if p["started"] else ""))
-        if p["cmd"]:
-            L.append("Command: " + p["cmd"])
         L.append("Encoding in progress...")
-        L += [ln for ln in p["lines"] if ln.strip() and not NOISE.search(ln)]
         L.append(LINE)
-    # ── the statistics of the main run
-    if main is not None:
-        sx = stats(main["lines"])
-        if sx:
-            L.append("Statistics:")
-            L += [" " + x for x in sx]
+        el = encoder_lines(p["lines"])                     # 1.7.1: «x264 info: …», as the encoder said it
+        if el:
+            L += el
             L.append(LINE)
-    if j.status == "done":
-        opts = encoder_options(j.out) if j.out and os.path.isfile(j.out) else []
-        if opts:
-            L.append("Encoder settings (written into the stream):")
-            L += [" " + o for o in opts]
+        fs = frame_stats(p["lines"])
+        if fs:
+            L += fs
             L.append(LINE)
+        if p["kind"] == "main":
+            od0 = J.out_duration(j) if j.info is not None and not j.info.error else 0
+            sx = stats(p["lines"], od0)
+            if sx:
+                L += sx
+                L.append(LINE)
     if j.metrics:
         L.append("Quality metrics: " + ", ".join(f"{k.upper()} {v:.4g}" for k, v in j.metrics.items()))
         L.append(LINE)
     # ── the end
     word = {"done": "COMPLETED!", "stop": "STOPPED!", "error": "FAILED!"}.get(j.status, j.status.upper() + "!")
     L.append(f"ENCODING {word} {stamp(ended)}")
+    L.append(LINE)
     if j.status == "error" and j.error:
         L.append(f"Error: {j.error}")
     took = max(0.0, ended - started)
@@ -456,10 +590,26 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
         L.append(f"Total file size: {size_text(total)}")
         if od:
             L.append(f"Average bitrate: {total * 8 / od / 1000:.0f} kbps")
+        L.append(LINE)
         if len(files) > 1:
             L.append(f"Encoded files ({len(files)}):")
             L += [" " + f for f in files]
         else:
-            L.append(f"Encoded file path: {files[0]}")
+            L.append(f"Encoded file: {files[0]}")
     L.append(LINE)
+    # 1.7.1: the rest of what ffmpeg printed, run by run, after the summary
+    raw_any = False
+    for p in runs:
+        raw = [ln for ln in p["lines"] if ln.strip() and not NOISE.search(ln) and not _RE_ENC_FF.match(ln)
+               and not _RE_ENC_OWN.match(ln) and not _RE_X265_DONE.match(ln.strip())]
+        if not raw and not p["cmd"]:
+            continue
+        if not raw_any:
+            L += ["", "FFMPEG OUTPUT", LINE]
+            raw_any = True
+        L.append(p.get("title", p["kind"].upper()))
+        if p["cmd"]:
+            L.append("Command: " + p["cmd"])
+        L += raw
+        L.append(LINE)
     return "\n".join(L) + "\n"
