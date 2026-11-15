@@ -210,3 +210,43 @@ def test_speed_test_dialog(qapp, films, data_dir):
     assert all(d.items[r["id"]].text(1) for r in d.results) and d.items["x264"].text(4) == "✓"
     d.reject()
     w.close()
+
+
+def test_plus_button_and_menus_open_the_file_dialog(qapp, media, data_dir, tmp_path, monkeypatch):
+    """1.5.1: the real «+» button and the task menu items (not the methods called directly) add an external
+    track / join files — their clicked(bool) used to arrive as «files» = False and nothing happened."""
+    from PySide6.QtWidgets import QMenu
+    ac3 = str(tmp_path / "film.rus.ac3")
+    mk("-f", "lavfi", "-i", "sine=f=900:d=3", "-ac", "2", "-c:a", "ac3", ac3)
+    asked = []
+
+    def pick(*a, **k):
+        asked.append(a[1] if len(a) > 1 else "")
+        return [ac3], ""
+    monkeypatch.setattr("convert.window.QFileDialog.getOpenFileNames", pick)
+    w = _win(qapp)
+    j, = _add(qapp, w, [os.path.join(media, "Movie (2017).mkv")])
+    _select(qapp, w, [j])
+    w.show_side("streams")
+    pump(qapp, 0.2)
+    w.b_ext.click()                                          # the «+» of «External tracks»
+    assert pump(qapp, 10, lambda: j.ext and j.infos.get(ac3) is not None)
+    assert len(asked) == 1 and j.ext[0]["path"] == ac3 and j.ext[0]["lang"] == "rus"
+    assert any(getattr(s, "ext", None) == 0 for s, _c in J.plan(j)["audio"])
+    # the task's context menu: «add an external track» and «add files to join»
+    menus = []
+
+    class Menu(QMenu):                                       # shown menus are only collected here
+        def exec(self, *a, **k):
+            menus.append(self)
+    monkeypatch.setattr("convert.window.QMenu", Menu)
+    w._queue_menu(w.view.visualItemRect(w.items[j.uid]).center())
+    acts = {a.text().rstrip("…"): a for a in menus[-1].actions()}
+    from convert.i18n import t
+    acts[t("ext_add")].trigger()
+    assert len(asked) == 2 and len(j.ext) == 2
+    monkeypatch.setattr("convert.window.QFileDialog.getOpenFileNames",
+                        lambda *a, **k: (asked.append("join") or [os.path.join(media, "dts.mkv")], ""))
+    acts[t("join_add")].trigger()
+    assert asked[-1] == "join" and j.joins
+    w.close()

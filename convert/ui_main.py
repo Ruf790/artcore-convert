@@ -847,7 +847,7 @@ class MainUI:
         self.tracks_lay.setContentsMargins(0, 0, 0, 0)
         self.tracks_lay.setSpacing(0)
         lay.addWidget(self.tracks_box)
-        self.b_ext = ctl_button("fa6s.plus", t("ext_add"), 14, self.add_external_dialog)
+        self.b_ext = ctl_button("fa6s.plus", t("ext_add"), 14, lambda: self.add_external_dialog())
         self.ext_head = self._section(t("ext_tracks"), self.b_ext)
         lay.addWidget(self.ext_head)
         self.ext_box = QWidget()
