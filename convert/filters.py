@@ -415,8 +415,16 @@ def fps_filters(job, enc=None) -> list[str]:
     if fps and f.get("interp") and not gif:
         out.append(f"minterpolate=fps={fps:g}:mi_mode=mci:mc_mode=aobmc:me_mode=bidir:vsbmc=1")
     elif fps and src is not None and (f.get("mode") == "cfr" or not src.fps or fps < src.fps - 0.01):
-        out.append(f"fps={fps:g}")
+        out.append(f"fps={ntsc(fps)}")
     return out
+
+
+def ntsc(fps: float) -> str:
+    """29.97 → 30000/1001 (and 23.976, 59.94 …): the exact NTSC rate, not 2997/100."""
+    n = round(fps * 1.001)
+    if n and abs(fps - n * 1000 / 1001) < 0.006 and abs(fps - n) > 0.01:
+        return f"{n * 1000}/1001"
+    return f"{fps:g}"
 
 
 def fps_args(job) -> list[str]:
@@ -458,6 +466,8 @@ def chroma(job, enc) -> str:
     if enc is None:
         return "420"
     can = CHROMAS.get(enc.id, ("420",))
+    from . import formats as FM
+    want = FM.hold_chroma(want, FM.caps(job.settings, enc.family)[1])        # 1.5: the profile of the format
     if enc.id == "prores":
         return want if want in can else "422"
     return want if want in can else "420"

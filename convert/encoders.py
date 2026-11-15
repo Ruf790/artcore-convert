@@ -75,6 +75,7 @@ class Available:
         self.reasons: dict[str, str] = {}           # encoder id → why_* key (no_amd, driver_old, …)
         self.svt_2pass = False                      # 1.4: this ffmpeg's libsvtav1 takes -pass 1 / 2
         self.filters: set[str] = set()              # 1.4: the ffmpeg filters of this build (libvmaf …)
+        self.h264_10 = False                        # 1.5: NVENC writes 10 bit H.264 here (RTX 50, FFmpeg 7.1+)
 
     def two_pass(self, e: "VEnc | None") -> bool:
         """1.4: the encoder has a first pass of its own here (x264, x265, VP9, MPEG-4 / 2, SVT-AV1 where the
@@ -195,6 +196,27 @@ def _svt_2pass() -> bool:
         shutil.rmtree(d, ignore_errors=True)
 
 
+def _try_h264_10() -> bool:
+    """1.5: does NVENC write High 10 H.264 here (an RTX 50 card and a new enough ffmpeg)? Five frames tell."""
+    exe = ff.ffmpeg()
+    try:
+        r = ff.run([exe, "-hide_banner", "-v", "error", "-f", "lavfi", "-i", "color=c=black:s=1280x720:r=30:d=0.2",
+                    "-frames:v", "5", "-an", "-c:v", "h264_nvenc", "-pix_fmt", "p010le", "-profile:v", "high10",
+                    "-f", "null", "-"], 30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def enable_h264_10(on: bool = True) -> None:
+    """NVENC H.264 gets 10 bit among its depths (after the test above said the card has it)."""
+    old = BY_ID["nvenc_h264"]
+    new = VEnc(old.id, old.ffname, old.family, old.vendor, old.label, (8, 10) if on else (8,), old.q_default,
+               old.q_range, old.hw, old.rc)
+    VIDEO[VIDEO.index(old)] = new
+    BY_ID[new.id] = new
+
+
 def ffmpeg_filters() -> set[str]:
     exe = ff.ffmpeg()
     if not exe:
@@ -234,6 +256,12 @@ def detect(cache: dict | None = None) -> Available:
     for e in VIDEO:
         av.ok.setdefault(e.id, False)
     av.filters = ffmpeg_filters()
+    if av.ok.get("nvenc_h264"):
+        if isinstance(cached, dict) and "_h264_10" in cached:
+            av.h264_10 = bool(cached["_h264_10"])
+        else:
+            av.h264_10 = _try_h264_10()
+    enable_h264_10(av.h264_10)
     if av.ok.get("svtav1"):
         if isinstance(cached, dict) and "_svt2pass" in cached:
             av.svt_2pass = bool(cached["_svt2pass"])
@@ -248,6 +276,7 @@ def cache_entry(av: Available) -> dict:
         return {}
     d = {e.id: [av.ok.get(e.id, False), av.reasons.get(e.id, ""), av.errors.get(e.id, "")] for e in VIDEO if e.hw}
     d["_svt2pass"] = bool(av.svt_2pass)
+    d["_h264_10"] = bool(av.h264_10)
     return {ver: d}
 
 
@@ -348,7 +377,7 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
     if bits >= 10 and 10 in e.bits and e.family == "hevc":
         out += ["-profile:v", "main10"]
     elif e.family == "h264":
-        out += ["-profile:v", "high"]
+        out += ["-profile:v", "high10" if bits >= 10 and 10 in e.bits else "high"]
     return out
 
 
@@ -453,6 +482,8 @@ CONTAINERS = [
               _fs({"aac", "ac3", "eac3", "mp2", "mp3", "opus", "dts", "truehd"}), "aac", "none", chapters=False),
     Container("m2ts", "M2TS (Blu-ray)", "mpegts", _fs({"h264", "hevc", "mpeg2video"}),
               _fs({"ac3", "eac3", "dts", "truehd", "aac", "mp2"}), "ac3", "none", chapters=False),
+    Container("mpg", "MPG (MPEG-PS / DVD)", "dvd", _fs({"mpeg2video"}), _fs({"ac3", "mp2"}), "ac3", "none", "mpeg2",
+              chapters=False),                                       # 1.5: DVD-Video streams (VOB)
     Container("gif", "GIF", "gif", _fs({"gif"}), _fs(), "", "none", "gif", chapters=False),
     # audio only
     Container("mka", "MKA (Matroska Audio)", "matroska", _fs(), None, "aac", "none"),
