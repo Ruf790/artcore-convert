@@ -16,12 +16,17 @@ Settings are a plain dict (JSON in the queue / presets):
 Per-file choices of the Streams tab are in Job.tracks: {stream index: {"keep": bool, "codec": "" | id}}.
 Per-file edits (1.1): Job.trim — pieces [[start, end], …] in seconds of the source (Job.trim_cut: the pieces are
 thrown out instead of kept); Job.meta — {"tags": {key: value} | None, "streams": {index: {lang, title, default,
-forced}}}; Job.chapters — None = as in the source, otherwise [[start, title], …] of the result."""
+forced}}}; Job.chapters — None = as in the source, otherwise [[start, title], …] of the result.
+1.4: video.passes 1 | 2 (two passes for bit rate / size), split {mode: off | size | time, size_mb, minutes};
+Job.joins — more files joined after src into one result (the trim pieces then lie on the joined timeline);
+Job.ext — external tracks [{path, kind: audio | subtitle, delay (ms), lang, title, codec, kbps, default}]."""
 from __future__ import annotations
 
 import copy
+import glob
 import itertools
 import os
+import re
 import tempfile
 from dataclasses import dataclass, field
 
@@ -33,12 +38,13 @@ DEFAULT_SETTINGS = {
     "container": "mkv",
     "video": {"mode": "encode", "encoder": "auto_hevc", "rc": "quality", "quality": 0, "bitrate": 8000,
               "size_mb": 4000, "speed": 5, "bits": "auto", "width": 0, "height": 0, "fit": "fit", "upscale": False,
-              "fps": 0, "deint": "auto"},
+              "fps": 0, "deint": "auto", "passes": 1},
     "audio": {"codec": "auto", "kbps": 0, "channels": "keep", "normalize": False, "tracks": "all"},
     "subs": "all",
     "lang": "",          # «Select streams»: only the audio / subtitles of this language ("" = any)
     "meta": True,
     "filters": F.defaults(),     # 1.3: the filter rows of the Streams tab (filters.py)
+    "split": {"mode": "off", "size_mb": 700, "minutes": 20},     # 1.4: the result in parts
 }
 
 PRESETS = {      # built-in; quality 0 = the encoder's own default
@@ -108,13 +114,21 @@ class Job:
     dest: str = ""                                  # «Save as…»: the result's path (the extension follows the format)
     log_path: str = ""                              # the log of the last run
     crop_found: list | None = None                  # 1.3: [l, t, r, b] the automatic crop found ([] = none)
+    joins: list = field(default_factory=list)       # 1.4: files joined after src (paths)
+    ext: list = field(default_factory=list)         # 1.4: external tracks (dicts, see the module text)
+    metrics: dict = field(default_factory=dict)     # 1.4: {"psnr": dB, "ssim": 0..1, "vmaf": 0..100}
+    parts: list = field(default_factory=list)       # 1.4: the files of a split result
+    infos: dict = field(default_factory=dict, repr=False)   # path → MediaInfo of joined / external files
 
     def to_dict(self) -> dict:
         return {"src": self.src, "settings": self.settings, "preset": self.preset, "tracks": self.tracks,
                 "status": self.status if self.status in ("done", "error", "stop", "skip") else "wait",
                 "out": self.out if self.status == "done" else "", "error": self.error,
                 "trim": self.trim, "trim_cut": self.trim_cut, "meta": self.meta, "chapters": self.chapters,
-                "dest": self.dest, "log": self.log_path, "crop_found": self.crop_found}
+                "dest": self.dest, "log": self.log_path, "crop_found": self.crop_found,
+                "joins": list(self.joins), "ext": [dict(e) for e in self.ext],
+                "metrics": dict(self.metrics) if self.status == "done" else {},
+                "parts": list(self.parts) if self.status == "done" else []}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Job":
@@ -130,6 +144,10 @@ class Job:
         ch = d.get("chapters")
         j.chapters = [[float(c[0]), str(c[1])] for c in ch if isinstance(c, (list, tuple)) and len(c) >= 2] \
             if isinstance(ch, list) else None
+        j.joins = [str(x) for x in (d.get("joins") or []) if isinstance(x, str) and x]
+        j.ext = [clean_ext(e) for e in (d.get("ext") or []) if isinstance(e, dict) and e.get("path")]
+        j.metrics = {k: float(v) for k, v in (d.get("metrics") or {}).items() if isinstance(v, (int, float))}
+        j.parts = [str(x) for x in (d.get("parts") or []) if isinstance(x, str)]
         j.status = d.get("status", "wait")
         j.out = d.get("out", "")
         j.error = d.get("error", "")
@@ -142,6 +160,11 @@ class Job:
         return os.path.basename(self.src)
 
     def track(self, s: Stream) -> dict:
+        n = ext_no(s)
+        if n is not None:                                   # 1.4: an external track keeps its own settings
+            e = self.ext[n] if n < len(self.ext) else {}
+            return {"keep": True, "codec": e.get("codec", "")} | {k: e[k] for k in ("kbps", "channels", "normalize",
+                                                                                   "gain") if k in e}
         return self.tracks.get(str(s.index), {})
 
     def acfg(self, s: Stream) -> dict:
@@ -151,16 +174,89 @@ class Job:
         for k in ("kbps", "channels", "normalize") + F.AUDIO_FILTER_KEYS:
             if k in t:
                 out[k] = t[k]
+        if ext_no(s) is not None:
+            out["delay"] = 0                                # its delay moves the input (ext_delay), no filter
         return out
 
     def smeta(self, s: Stream) -> dict:
         """The user's edits of a stream's language / title / default / forced (Metadata tab)."""
+        n = ext_no(s)
+        if n is not None:
+            e = self.ext[n] if n < len(self.ext) else {}
+            m = {k: e[k] for k in ("lang", "title") if e.get(k)}
+            if e.get("default"):
+                m["default"] = True
+            return m
         return (self.meta.get("streams") or {}).get(str(s.index), {})
 
     @property
     def edited(self) -> bool:
         return bool(self.trim or self.chapters is not None or self.meta.get("tags") is not None
                     or any(self.meta.get("streams") or {}))
+
+
+EXT_KEYS = {"path": "", "kind": "audio", "delay": 0, "lang": "", "title": "", "codec": "", "kbps": 0,
+            "default": False}
+EXT_AUDIO = (".ac3", ".eac3", ".dts", ".aac", ".m4a", ".mka", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".thd",
+             ".mp2", ".wv", ".ape")
+EXT_SUBS = (".srt", ".ass", ".ssa", ".sup", ".vtt", ".sub", ".idx", ".mks")
+
+
+def clean_ext(e: dict) -> dict:
+    out = {k: type(v)(e.get(k, v)) if e.get(k) is not None else v for k, v in EXT_KEYS.items()}
+    out["kind"] = "subtitle" if out["kind"] == "subtitle" else "audio"
+    return out
+
+
+def ext_kind(path: str) -> str:
+    return "subtitle" if path.lower().endswith(EXT_SUBS) else "audio"
+
+
+def ext_no(s: Stream) -> int | None:
+    """The number of the external track this stream came from (None: a stream of the source)."""
+    return getattr(s, "ext", None)
+
+
+# ── 1.4: the other files of a task (joined ones, external tracks) ─────────
+def file_info(job: Job, path: str) -> MediaInfo | None:
+    return job.infos.get(path)
+
+
+def load_files(job: Job) -> None:
+    """ffprobe the joined / external files not looked at yet (the window does it in its worker first)."""
+    from . import probe as P
+    for path in list(job.joins) + [e["path"] for e in job.ext]:
+        if path not in job.infos:
+            job.infos[path] = P.probe(path)
+
+
+def sources(job: Job) -> list[tuple[str, MediaInfo | None]]:
+    """The files of the joined timeline: src, then the joined ones."""
+    return [(job.src, job.info)] + [(p, file_info(job, p)) for p in job.joins]
+
+
+def _dur(info: MediaInfo | None) -> float:
+    return info.duration if info is not None and not info.error else 0.0
+
+
+def src_duration(job: Job) -> float:
+    """The length of the timeline the trim works on: the source, or every joined file one after another."""
+    return sum(_dur(i) for _p, i in sources(job)) if job.info is not None else 0.0
+
+
+def ext_streams(job: Job) -> list[tuple[int, Stream]]:
+    """[(its number in job.ext, the stream)] — the first stream of the chosen kind in every external file."""
+    out = []
+    for n, e in enumerate(job.ext):
+        info = file_info(job, e["path"])
+        if info is None or info.error:
+            continue
+        ss = info.of(e.get("kind", "audio"))
+        if ss:
+            s = copy.copy(ss[0])
+            s.ext = n
+            out.append((n, s))
+    return out
 
 
 # ── time codes ───────────────────────────────────────────────
@@ -196,8 +292,8 @@ def parse_tc(text: str) -> float | None:
 # ── trim: pieces of the source ───────────────────────────────
 def segments(job: Job) -> list[tuple[float, float]]:
     """The parts of the source that go out, in order: [] = the whole file. Overlapping pieces are joined;
-    with trim_cut the pieces are what is thrown away."""
-    dur = job.info.duration if job.info else 0.0
+    with trim_cut the pieces are what is thrown away. 1.4: the times are of the joined timeline (src_duration)."""
+    dur = src_duration(job)
     pcs = sorted((max(0.0, float(a)), float(b)) for a, b in job.trim if float(b) > float(a))
     if dur > 0:
         pcs = [(a, min(b, dur)) for a, b in pcs if a < dur]
@@ -222,10 +318,46 @@ def segments(job: Job) -> list[tuple[float, float]]:
     return out
 
 
-def out_duration(job: Job) -> float:
+def pieces(job: Job) -> list[tuple[int, float, float]]:
+    """1.4: what is read from which file: [(file number in sources(), start, end)] in the file's own time.
+    [] = the whole src (no trim, nothing joined)."""
     segs = segments(job)
-    if segs:
-        return sum(b - a for a, b in segs)
+    if not job.joins:
+        return [(0, a, b) for a, b in segs]
+    files = sources(job)
+    if not segs:
+        segs = [(0.0, src_duration(job))]
+    out, base = [], []
+    pos = 0.0
+    for _p, info in files:
+        base.append(pos)
+        pos += _dur(info)
+    for a, b in segs:
+        for k, (_p, info) in enumerate(files):
+            lo, hi = base[k], base[k] + _dur(info)
+            x, y = max(a, lo), min(b, hi)
+            if y - x > 0.04:
+                out.append((k, round(x - lo, 3), round(y - lo, 3)))
+    return out
+
+
+def match_stream(job: Job, k: int, s: Stream) -> Stream | None:
+    """The stream of file k that stands for the source's stream s (the same kind, the same place among them)."""
+    if k == 0 or ext_no(s) is not None:
+        return s
+    info = sources(job)[k][1]
+    if info is None or info.error or job.info is None:
+        return None
+    mine = [x.index for x in job.info.of(s.kind)]
+    other = info.of(s.kind)
+    i = mine.index(s.index) if s.index in mine else -1
+    return other[i] if 0 <= i < len(other) else None
+
+
+def out_duration(job: Job) -> float:
+    pcs = pieces(job)
+    if pcs:
+        return sum(b - a for _k, a, b in pcs)
     return job.info.duration if job.info else 0.0
 
 
@@ -251,6 +383,14 @@ def out_chapters(job: Job) -> list[tuple[float, float, str]] | None:
     segs = segments(job)
     if job.chapters is not None:
         starts = sorted((max(0.0, float(a)), str(t)) for a, t in job.chapters)
+    elif job.joins and job.info and job.settings.get("meta", True):        # 1.4: a chapter per joined file
+        starts, pos, last = [], 0.0, None
+        files = sources(job)
+        for k, a, b in pieces(job):
+            if k != last:
+                starts.append((pos, os.path.splitext(os.path.basename(files[k][0]))[0]))
+                last = k
+            pos += b - a
     elif segs and job.info and job.info.chapter_list and job.settings.get("meta", True):
         starts = []
         for a, _b, title in job.info.chapter_list:
@@ -323,10 +463,18 @@ def fit_container(st: dict) -> dict:
 
 
 def multi_encode(job: Job) -> bool:
-    """Several pieces with the video encoded: they are joined by the concat filter."""
+    """Several pieces (trim pieces, joined files) put together by the concat filter: always when the video is
+    encoded; with joined files also when only sound goes out (other files: other codecs, decoded)."""
+    if job.info is None:
+        return False
+    pcs = pieces(job)
+    if len(pcs) <= 1:
+        return False
     c = E.container(job.settings.get("container", "mkv"))
-    return len(segments(job)) > 1 and job.settings.get("video", {}).get("mode", "encode") == "encode" and \
-        not c.audio_only and job.info is not None and job.info.video is not None
+    mode = job.settings.get("video", {}).get("mode", "encode")
+    if job.info.video is not None and not c.audio_only and mode == "encode":
+        return True
+    return bool(job.joins) and (c.audio_only or mode == "none" or job.info.video is None)
 
 
 def plan(job: Job) -> dict:
@@ -351,8 +499,20 @@ def plan(job: Job) -> dict:
         w.append("w_audio_only")
     joined = multi_encode(job)
     # cut and the picture encoded: copied sound would start before the picture (ffmpeg copies from the
-    # keyframe the seek lands on) — it is encoded again, into its own codec where we have one
-    recut = bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy"
+    # keyframe the seek lands on) — it is encoded again, into its own codec where we have one. 1.4: the
+    # concat filter decodes the sound too (joined files)
+    recut = (bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy") or joined
+    if job.joins:
+        files = sources(job)
+        if any(i is None or i.error for _p, i in files[1:]):
+            w.append("w_join_missing")
+        if out["video"] and vcfg.get("mode") == "copy":
+            v0 = out["video"][0]
+            for _p, i in files[1:]:
+                vk = i.video if i is not None and not i.error else None
+                if vk is not None and (vk.codec, vk.width, vk.height) != (v0.codec, v0.width, v0.height):
+                    w.append("w_join_copy")
+                    break
     out["same_rate"] = set()
     a_cfg = st.get("audio", {})
     lang = (st.get("lang") or "").lower()
@@ -396,6 +556,29 @@ def plan(job: Job) -> dict:
                 out["same_rate"].add(s.index)
             w.append("w_trim_audio")
         out["audio"].append((s, codec))
+    # 1.4: external sound — after the source's own tracks; cut / joined: trimmed by filters, so encoded
+    segs = segments(job)
+    for n, s in ext_streams(job):
+        if job.ext[n].get("kind") != "audio" or (c.audio is not None and not c.audio):
+            continue
+        if c.one_audio and out["audio"]:
+            w.append("w_one_audio")
+            break
+        codec = job.ext[n].get("codec") or a_cfg.get("codec", "auto")
+        tc = job.acfg(s)
+        changes = F.audio_on(tc) or bool(segs)
+        if codec == "auto":
+            codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
+        if codec != "copy" and not c.takes_audio(E.A_CODEC.get(codec, codec)):
+            codec = c.a_default
+            w.append("w_audio_reencoded")
+        if codec == "copy" and (changes or not c.takes_audio(s.codec)):
+            same = next((k for k, cn in E.A_CODEC.items() if cn == s.codec), "")
+            codec = same if same and c.takes_audio(s.codec) else (c.a_default or "aac")
+            if codec == same:
+                out["same_rate"].add(("ext", n))
+            w.append("w_ext_reencoded" if segs else "w_audio_reencoded")
+        out["audio"].append((s, codec))
     subs = info.of("subtitle")
     if lang:
         subs = [s for s in subs if (s.lang or "").lower() == lang]
@@ -413,6 +596,22 @@ def plan(job: Job) -> dict:
                 w.append("w_subs_dropped")
             continue
         if joined:
+            w.append("w_trim_subs")
+            continue
+        if c.subs == "any":
+            out["subs"].append((s, "copy"))
+        elif s.codec in E.TEXT_SUBS:
+            out["subs"].append((s, "copy" if s.codec == c.subs else c.subs))
+        else:
+            w.append("w_bitmap_subs")
+    for n, s in ext_streams(job):                                  # 1.4: external subtitles
+        if job.ext[n].get("kind") != "subtitle":
+            continue
+        if c.subs == "none":
+            if not c.audio_only:
+                w.append("w_subs_dropped")
+            continue
+        if len(segs) > 1:
             w.append("w_trim_subs")
             continue
         if c.subs == "any":
@@ -567,12 +766,15 @@ def audio_kbps(codec: str, channels: int, cfg: dict) -> int:
     return a.kbps[1] if channels > 2 else a.kbps[0]
 
 
-def _concat_list(path: str, src: str, segs) -> None:
-    q = src.replace("\\", "/").replace("'", "'\\''")
+def _concat_list(path: str, files: list[str], pcs) -> None:
+    """The concat demuxer's list: every piece as a file entry (in / out points where it is cut)."""
     with open(path, "w", encoding="utf-8") as f:
         f.write("ffconcat version 1.0\n")
-        for a, b in segs:
-            f.write(f"file '{q}'\ninpoint {a:.3f}\noutpoint {b:.3f}\n")
+        for k, a, b in pcs:
+            q = files[k].replace("\\", "/").replace("'", "'\\''")
+            f.write(f"file '{q}'\n")
+            if a is not None:
+                f.write(f"inpoint {a:.3f}\noutpoint {b:.3f}\n")
 
 
 def work_file(job: Job, kind: str, work_dir: str | None = None, ext: str = "txt") -> str:
@@ -581,15 +783,150 @@ def work_file(job: Job, kind: str, work_dir: str | None = None, ext: str = "txt"
     return os.path.join(d, f"job{job.uid}_{os.getpid()}_{kind}.{ext}")
 
 
-WORK_KINDS = (("pieces", "txt"), ("chapters", "txt"), ("vidstab", "trf"))
+WORK_KINDS = (("pieces", "txt"), ("chapters", "txt"), ("vidstab", "trf"), ("frame", "png"))
+
+
+def pass_prefix(job: Job, work_dir: str | None = None) -> str:
+    """Where the first pass writes its statistics (x264 adds «-0.log», x265 «.x265.log»)."""
+    return os.path.splitext(work_file(job, "2pass", work_dir, "log"))[0]
+
+
+def cleanup(job: Job, work_dir: str | None = None) -> None:
+    """The small files of a run: the trim list, chapters, vid.stab motion, the 2-pass statistics, the frame."""
+    for kind, ext in WORK_KINDS:
+        try:
+            os.remove(work_file(job, kind, work_dir, ext))
+        except OSError:
+            pass
+    for f in glob.glob(glob.escape(pass_prefix(job, work_dir)) + "*"):
+        try:
+            os.remove(f)
+        except OSError:
+            pass
+
+
+def resolve(job: Job, av: E.Available) -> E.VEnc | None:
+    v = job.settings.get("video", {})
+    if v.get("mode", "encode") != "encode" or job.info is None or job.info.video is None or \
+            E.container(job.settings.get("container", "mkv")).audio_only:
+        return None
+    return av.resolve(v.get("encoder", "auto_hevc"))
+
+
+def two_pass(job: Job, enc: E.VEnc | None, av: E.Available) -> bool:
+    """1.4: a first pass runs before the encode (bit rate / file size, an encoder that has one)."""
+    v = job.settings.get("video", {})
+    return enc is not None and enc.rc and int(v.get("passes", 1) or 1) == 2 and \
+        v.get("rc", "quality") in ("bitrate", "size") and v.get("mode", "encode") == "encode" and av.two_pass(enc)
 
 
 def pre_passes(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode: bool = True,
-               work_dir: str | None = None) -> list[list[str]]:
-    """The commands that run before the conversion: the analysis pass of vidstab (writes the motion file)."""
-    if not needs_vidstab(job):
+               work_dir: str | None = None, threads: int = 0, preview: str = "") -> list[list[str]]:
+    """The commands that run before the conversion: the analysis pass of vid.stab (writes the motion file),
+    1.4: the first pass of the two-pass encode (writes its statistics)."""
+    out = []
+    if needs_vidstab(job):
+        out.append(build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, mode="vidstab", threads=threads))
+    load_files(job)
+    if two_pass(job, resolve(job, av), av):
+        out.append(build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, mode="pass1", threads=threads,
+                              preview=preview))
+    return out
+
+
+METRICS = ("psnr", "ssim", "vmaf")
+
+
+def can_metrics(job: Job, av: E.Available) -> bool:
+    enc = resolve(job, av)
+    return enc is not None and enc.id != "gif"
+
+
+def post_passes(job: Job, ffmpeg: str, out_path: str, av: E.Available, metrics=(), work_dir: str | None = None,
+                threads: int = 0) -> list[list[str]]:
+    """1.4: what runs on the finished file — the quality metrics against the filtered source."""
+    want = [m for m in METRICS if m in (metrics or ()) and (m != "vmaf" or "libvmaf" in av.filters)]
+    if not want or not can_metrics(job, av):
         return []
-    return [build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, analysis=True)]
+    return [build_args(job, ffmpeg, out_path, av, False, work_dir, mode="metrics", threads=threads, metrics=want)]
+
+
+_RE_PSNR = re.compile(r"PSNR .*average:\s*([0-9.]+|inf)")
+_RE_SSIM = re.compile(r"SSIM .*All:\s*([0-9.]+)")
+_RE_VMAF = re.compile(r"VMAF score[:=]\s*([0-9.]+)")
+
+
+def parse_metrics(lines) -> dict:
+    """The summary lines of psnr / ssim / libvmaf in ffmpeg's log → {"psnr": 41.2, "ssim": 0.987, "vmaf": 95.1}."""
+    out = {}
+    for ln in lines:
+        for key, rx in (("psnr", _RE_PSNR), ("ssim", _RE_SSIM), ("vmaf", _RE_VMAF)):
+            m = rx.search(ln)
+            if m:
+                out[key] = 100.0 if m.group(1) == "inf" else float(m.group(1))
+    return out
+
+
+def _sar(s: Stream) -> str:
+    return "1" if not s.sar or s.sar in ("0:1", "1:1") else s.sar.replace(":", "/")
+
+
+def _fps_str(f: float) -> str:
+    n = round(f * 1.001)
+    return f"{n * 1000}/1001" if n and abs(f - n * 1000 / 1001) < 0.002 and abs(f - n) > 0.01 else f"{f:.6g}"
+
+
+def _layout(s: Stream) -> str:
+    return s.layout or f"{s.channels or 2}c"
+
+
+def _concat_graph(job: Job, p: dict, pcs, graph: list[str]) -> tuple[str | None, list[str]]:
+    """The concat filter over the inputs 0 … n-1 (one per piece): every piece made like the first file
+    (frame size, pixel aspect, frame rate; sample rate, channels; silence / black where a joined file lacks a
+    track). Returns the video label (or None) and the labels of the source's sound tracks."""
+    v0 = p["video"][0] if p["video"] else None
+    auds = [s for s, _c in p["audio"] if ext_no(s) is None]
+    files = sources(job)
+    ins = ""
+    if v0 is not None:
+        W, H, sar0, fps0 = v0.width, v0.height, _sar(v0), v0.fps or 25.0
+        vids = [match_stream(job, k, v0) for k, _a, _b in pcs]
+        mixed = any(x is None or (x.width, x.height, _sar(x)) != (W, H, sar0) for x in vids)
+    for i, (k, a, b) in enumerate(pcs):
+        if v0 is not None:
+            sv = vids[i]
+            if sv is None:                                         # a file with no picture: black
+                graph.append(f"color=c=black:s={W}x{H}:r={_fps_str(fps0)}:d={b - a:.3f},setsar={sar0}[cv{i}]")
+                ins += f"[cv{i}]"
+            else:
+                ch = []
+                if (sv.width, sv.height) != (W, H) or _sar(sv) != sar0:
+                    ch += [f"scale={W}:{H}:force_original_aspect_ratio=decrease", f"pad={W}:{H}:(ow-iw)/2:(oh-ih)/2"]
+                if mixed:
+                    ch.append(f"setsar={sar0}")
+                if k != 0 and sv.fps and abs(sv.fps - fps0) > 0.01:
+                    ch.append(f"fps={_fps_str(fps0)}")
+                if ch:
+                    graph.append(f"[{i}:{sv.index}]{','.join(ch)}[cv{i}]")
+                    ins += f"[cv{i}]"
+                else:
+                    ins += f"[{i}:{sv.index}]"
+        for n, s in enumerate(auds):
+            sa = match_stream(job, k, s)
+            rate = s.rate or 48000
+            if sa is None:                                         # a file without this track: silence
+                graph.append(f"anullsrc=channel_layout={_layout(s)}:sample_rate={rate},atrim=duration={b - a:.3f}"
+                             f"[cs{i}_{n}]")
+                ins += f"[cs{i}_{n}]"
+            elif k != 0 and ((sa.rate or rate) != rate or sa.channels != s.channels):
+                graph.append(f"[{i}:{sa.index}]aresample={rate},aformat=sample_rates={rate}:"
+                             f"channel_layouts={_layout(s)}[ca{i}_{n}]")
+                ins += f"[ca{i}_{n}]"
+            else:
+                ins += f"[{i}:{sa.index}]"
+    outs = ("[vj]" if v0 is not None else "") + "".join(f"[aj{n}]" for n in range(len(auds)))
+    graph.append(f"{ins}concat=n={len(pcs)}:v={1 if v0 is not None else 0}:a={len(auds)}{outs}")
+    return ("[vj]" if v0 is not None else None), [f"[aj{n}]" for n in range(len(auds))]
 
 
 def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, detect: bool) -> list[str]:
@@ -606,11 +943,63 @@ def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, de
     return out
 
 
+def ext_delay(job: Job, s: Stream) -> float:
+    n = ext_no(s)
+    return float(job.ext[n].get("delay", 0) or 0) / 1000 if n is not None and n < len(job.ext) else 0.0
+
+
+def _ext_input(job: Job, s: Stream, segs) -> list[str]:
+    """The input options of an external track: its delay moves it (or, cut / joined, its filters do)."""
+    d = ext_delay(job, s)
+    path = job.ext[ext_no(s)]["path"]
+    if s.kind == "subtitle" and segs:                               # one piece (more: the subtitles are dropped)
+        a = segs[0][0]
+        opt = []
+        if a - d > 0.0005:
+            opt += ["-ss", f"{a - d:.3f}"]
+        if d - a > 0.0005:
+            opt += ["-itsoffset", f"{d - a:.3f}"]
+        return opt + ["-i", path]
+    if segs:                                                        # sound: aligned and cut in the graph
+        return ["-i", path]
+    if d > 0:
+        return ["-itsoffset", f"{d:.3f}", "-i", path]
+    if d < 0:
+        return ["-ss", f"{-d:.3f}", "-i", path]
+    return ["-i", path]
+
+
+def _ext_audio_graph(job: Job, s: Stream, inp: int, segs, n: int, af: list[str], graph: list[str]) -> str:
+    """An external sound track on the cut / joined timeline: delayed, cut into the pieces, put together."""
+    d = ext_delay(job, s)
+    head = f"[{inp}:{s.index}]"
+    align = f"adelay=delays={int(round(d * 1000))}:all=1" if d > 0 else \
+        f"atrim=start={-d:.3f},asetpts=PTS-STARTPTS" if d < 0 else "anull"
+    tail = ("," + ",".join(af)) if af else ""
+    if len(segs) == 1:
+        a, b = segs[0]
+        graph.append(f"{head}{align},atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS{tail}[ao{n}]")
+        return f"[ao{n}]"
+    m = len(segs)
+    graph.append(f"{head}{align},asplit={m}" + "".join(f"[e{n}_{i}]" for i in range(m)))
+    for i, (a, b) in enumerate(segs):
+        graph.append(f"[e{n}_{i}]atrim=start={a:.3f}:end={b:.3f},asetpts=PTS-STARTPTS[e{n}t{i}]")
+    graph.append("".join(f"[e{n}t{i}]" for i in range(m)) + f"concat=n={m}:v=0:a=1{tail}[ao{n}]")
+    return f"[ao{n}]"
+
+
 def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode: bool = True,
-               work_dir: str | None = None, analysis: bool = False) -> list[str]:
+               work_dir: str | None = None, analysis: bool = False, *, mode: str = "main", threads: int = 0,
+               preview: str = "", metrics=()) -> list[str]:
     """The whole ffmpeg command line. Progress goes to stdout (-progress pipe:1), the log to stderr.
     Trim with several pieces and our own chapters need small text files: they go to work_dir (temp).
-    analysis: the first pass of the two-pass stabilisation (video only, into nothing)."""
+    mode: main — the conversion (the second pass of a two-pass encode); vidstab — the analysis pass of the
+    two-pass stabilisation (analysis=True, 1.3); pass1 — the first pass (statistics); metrics — PSNR / SSIM /
+    VMAF of out_path against the filtered source. threads: the CPU limit (0 = all of it). preview: a PNG the
+    frame being encoded is written to (once a second of the film)."""
+    if analysis:
+        mode = "vidstab"
+    load_files(job)
     st = job.settings
     v = st.get("video", {})
     cont = st.get("container", "mkv")
@@ -631,38 +1020,62 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         job.enc_used = "copy" if p["video"] else ""
     if not p["video"] and not p["audio"]:
         raise RuntimeError("nothing_out")
-    if analysis:
+    side = mode != "main"
+    if side and (enc is None):
+        raise RuntimeError("nothing_out")
+    pass_n = 1 if mode == "pass1" else 2 if mode == "main" and two_pass(job, enc, av) else 0
+    if side:
         p = dict(p, audio=[], subs=[])
     segs = segments(job)
+    pcs = pieces(job)
+    files = sources(job)
     joined = multi_encode(job)
-    meta_on = st.get("meta", True) and not analysis
+    meta_on = st.get("meta", True) and not side
     transforms = work_file(job, "vidstab", work_dir, "trf") if needs_vidstab(job) else ""
     hw = ["-hwaccel", "auto"] if enc is not None and enc.hw and hw_decode else []
+    dec = ["-threads", str(threads)] if threads > 0 else []
     args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:1"]
-    # inputs: 0 = the source (or the concat list); meta_in = where the file's tags / chapters come from
-    if not segs:
-        args += hw + ["-i", job.src]
+    if threads > 0:
+        args += ["-filter_threads", str(threads), "-filter_complex_threads", str(threads)]
+    # inputs: 0 = the source (or the concat list); meta_in = where the file's tags / chapters come from;
+    # base = the file input 0 reads (a single piece can lie in a joined file)
+    base = 0
+    if not pcs:
+        args += hw + dec + ["-i", job.src]
         n_in, meta_in = 1, 0
-    elif len(segs) == 1:
-        a, b = segs[0]
-        args += hw + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", job.src]
+    elif len(pcs) == 1:
+        base, a, b = pcs[0]
+        args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", files[base][0]]
         n_in, meta_in = 1, 0
     elif joined:
-        for a, b in segs:
-            args += hw + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", job.src]
-        n_in, meta_in = len(segs), 0
+        for k, a, b in pcs:
+            args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", files[k][0]]
+        n_in, meta_in = len(pcs), 0
     else:                                                         # copied video / sound only: concat demuxer
         lst = work_file(job, "pieces", work_dir)
-        _concat_list(lst, job.src, segs)
+        full = [(k, None if (a <= 0.001 and b >= _dur(files[k][1]) - 0.001) else a, b) for k, a, b in pcs]
+        _concat_list(lst, [f for f, _i in files], full)
         args += ["-f", "concat", "-safe", "0", "-i", lst, "-i", job.src]
         n_in, meta_in = 2, 1
+        base = pcs[0][0]
     ov_in = None                                                  # the picture of the Overlay row
-    if enc is not None and enc.id != "gif" and F.is_on(job, "overlay") and not analysis:
+    if enc is not None and enc.id != "gif" and F.is_on(job, "overlay") and mode != "vidstab":
         args += ["-i", F.fset(st, "overlay")["path"]]
         ov_in = n_in
         n_in += 1
+    ext_in: dict[int, int] = {}                                   # 1.4: external track → its input
+    for s, _how in p["audio"] + p["subs"]:
+        if ext_no(s) is not None:
+            args += _ext_input(job, s, segs)
+            ext_in[ext_no(s)] = n_in
+            n_in += 1
+    dist_in = None
+    if mode == "metrics":
+        args += ["-i", out_path]
+        dist_in = n_in
+        n_in += 1
     chapters = out_chapters(job)
-    if analysis:
+    if side:
         args += ["-map_metadata", "-1", "-map_chapters", "-1"]
     elif chapters is not None and c.chapters:
         mf = work_file(job, "chapters", work_dir)
@@ -675,15 +1088,50 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     else:
         args += ["-map_metadata", str(meta_in) if meta_on else "-1",
                  "-map_chapters", str(meta_in) if meta_on and c.chapters and chapters is None else "-1"]
-    graph = []
-    in_graph = joined or ov_in is not None                       # the video goes through -filter_complex
+    graph: list[str] = []
+    a_labels: list[str] = []
+    want_preview = bool(preview) and enc is not None and enc.id != "gif" and mode in ("main", "pass1")
+    in_graph = joined or ov_in is not None or want_preview or mode == "metrics"
+    vsrc = vmap = ""
+    if joined:
+        vlab, a_labels = _concat_graph(job, p, pcs, graph)
+        vsrc = vlab or ""
+    elif p["video"]:
+        sv = match_stream(job, base, p["video"][0]) or p["video"][0]
+        vsrc, vmap = f"[0:{sv.index}]", f"0:{sv.index}"
     # video
     for s in p["video"]:
-        if not in_graph:
-            args += ["-map", f"0:{s.index}"]
         if copy_v:
-            args += ["-c:v", "copy"]
+            args += ["-map", vmap, "-c:v", "copy"]
         else:
+            if in_graph:
+                graph += _graph_video(job, enc, vsrc, ov_in, transforms, mode == "vidstab")
+                vmap = "[vout]"
+            else:
+                vf = video_chain(job, enc, transforms, mode == "vidstab")
+                if vf:
+                    args += ["-vf", ",".join(vf)]
+            if want_preview:                                      # the frame on the Status tab
+                graph[-1] = graph[-1][:-len("[vout]")] + "[vfull]"
+                graph.append("[vfull]split[vout][vpv];[vpv]fps=1,scale=320:-2:flags=bilinear,format=rgb24[vprev]")
+            args += ["-map", vmap]
+            if mode == "vidstab":
+                break
+            if mode == "metrics":
+                bits = out_bits(job, enc)
+                fmt = "yuv420p10le" if bits > 8 else "yuv420p"
+                graph[-1] = graph[-1][:-len("[vout]")] + "[vref]"
+                k = len(metrics)
+                same = f"settb=1/1000,setpts=N*1000,format={fmt}"         # frame by frame, not by time stamps
+                graph.append(f"[vref]{same},split={k}" + "".join(f"[r{i}]" for i in range(k)))
+                cur = f"[{dist_in}:v:0]{same}[d0]"
+                graph.append(cur)
+                for i, m in enumerate(metrics):
+                    name = {"psnr": "psnr", "ssim": "ssim",
+                            "vmaf": f"libvmaf=n_threads={max(1, threads or os.cpu_count() or 4)}"}[m]
+                    graph.append(f"[d{i}][r{i}]{name}[d{i + 1}]")
+                args[args.index(vmap)] = f"[d{k}]"
+                break
             bits = out_bits(job, enc)
             dur = out_duration(job)
             a_total = sum(audio_kbps(cd, F.layout_channels(job.acfg(a).get("channels", "keep"), a.channels, 8),
@@ -694,14 +1142,22 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
             vv["chroma"] = F.chroma(job, enc)
             if not vv.get("quality"):
                 vv["quality"] = enc.q_default
-            if not in_graph:
-                vf = video_chain(job, enc, transforms, analysis)
-                if vf:
-                    args += ["-vf", ",".join(vf)]
-            if analysis:
-                args += ["-an", "-sn", "-dn", "-f", "null", "-"]
-                return _with_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
-            args += ["-c:v", enc.ffname] + E.video_args(enc, vv, bits, dur)
+            if mode == "pass1" and not a_total:                    # the second pass counts the sound in
+                vv["audio_kbps"] = sum(audio_kbps(cd, F.layout_channels(job.acfg(a).get("channels", "keep"),
+                                                                         a.channels, 8), job.acfg(a)) or
+                                       (a.bitrate // 1000 if cd == "copy" else 0)
+                                       for a, cd in plan(job)["audio"])
+            args += ["-c:v", enc.ffname] + E.video_args(enc, vv, bits, dur) + E.thread_args(enc, threads)
+            if enc.id == "x265":
+                i = args.index("-x265-params") + 1
+                if threads > 0:
+                    args[i] += f":pools={threads}"
+                if pass_n:
+                    args[i] += f":pass={pass_n}:stats={E.x265_path(pass_prefix(job, work_dir) + '.x265.log')}"
+            if pass_n:
+                args += E.pass_args(enc, pass_n, pass_prefix(job, work_dir))
+            if mode == "pass1":
+                break
             args += F.fps_args(job)
             if F.hdr_keeps(job, enc, bits) and not F.tonemap_on(job, enc, bits):      # keep HDR
                 cl = s.color
@@ -722,17 +1178,34 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
             args += ["-tag:v", "XVID"]
         if cont == "gif":
             args += ["-loop", "0"]
-    _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
+    if side:
+        if graph:
+            fi = args.index("-map_metadata")
+            args[fi:fi] = ["-filter_complex", ";".join(graph)]
+        args += ["-an", "-sn", "-dn", "-f", "null", "-"]
+        if want_preview:
+            args += _preview_out(preview)
+        return args
     # audio
     for n, (s, codec) in enumerate(p["audio"]):
         a_cfg = job.acfg(s)
         af = F.audio_filters(a_cfg, codec, s.rate) if codec != "copy" else []
-        if joined:
+        en = ext_no(s)
+        if en is not None and segs:
+            args += ["-map", _ext_audio_graph(job, s, ext_in[en], segs, n, af, graph)]
+            af = []
+        elif en is not None:
+            args += ["-map", f"{ext_in[en]}:{s.index}"]
+        elif joined:
+            lab = a_labels[n]
             if af:
-                graph.append(f"[aj{n}]{','.join(af)}[ao{n}]")
-            args += ["-map", f"[ao{n}]" if af else f"[aj{n}]"]
+                graph.append(f"{lab}{','.join(af)}[ao{n}]")
+                lab = f"[ao{n}]"
+            args += ["-map", lab]
+            af = []
         else:
-            args += ["-map", f"0:{s.index}"]
+            sa = match_stream(job, base, s) or s
+            args += ["-map", f"0:{sa.index}"]
         if codec == "copy":
             args += [f"-c:a:{n}", "copy"]
             continue
@@ -743,20 +1216,26 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         if ch != s.channels or (codec == "opus" and ch > 2):          # opus wants the plain 5.1 / 7.1 layout
             args += [f"-ac:a:{n}", str(ch)]
         k = audio_kbps(codec, ch, a_cfg)
-        if k and s.index in p.get("same_rate", ()) and s.bitrate and not a_cfg.get("kbps"):
+        key = ("ext", en) if en is not None else s.index
+        if k and key in p.get("same_rate", ()) and s.bitrate and not a_cfg.get("kbps"):
             k = max(64, min(1536, int(round(s.bitrate / 1000 / 32)) * 32))     # as the source had it
         if k:
             args += [f"-b:a:{n}", f"{k}k"]
         if codec == "opus" and ch > 2:
             args += [f"-mapping_family:a:{n}", "1"]
-        if af and not joined:
+        if af:
             args += [f"-filter:a:{n}", ",".join(af)]
     if graph:
         fi = args.index("-map_metadata")
         args[fi:fi] = ["-filter_complex", ";".join(graph)]
     # subtitles
     for n, (s, how) in enumerate(p["subs"]):
-        args += ["-map", f"0:{s.index}", f"-c:s:{n}", how]
+        en = ext_no(s)
+        if en is not None:
+            args += ["-map", f"{ext_in[en]}:{s.index}", f"-c:s:{n}", how]
+            continue
+        ss = match_stream(job, base, s) or s
+        args += ["-map", f"0:{ss.index}", f"-c:s:{n}", how]
     if not p["subs"]:
         args += ["-sn"]
     args += meta_args(job, p, joined, meta_on)
@@ -768,38 +1247,107 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     if cont == "mp3":
         args += ["-id3v2_version", "3"]
     args += ["-f", c.fmt, out_path]
+    if want_preview:
+        args += _preview_out(preview)
     return args
 
 
-def _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph):
-    """The concat of the pieces and / or the overlay: the video's part of -filter_complex, mapped as [vout]."""
-    if not p["video"] or (not joined and ov_in is None):
-        return
-    s0 = p["video"][0]
-    if joined:
-        ins = "".join(f"[{i}:{s0.index}]" + "".join(f"[{i}:{a.index}]" for a, _ in p["audio"])
-                      for i in range(len(segs)))
-        outs = "[vj]" + "".join(f"[aj{k}]" for k in range(len(p["audio"])))
-        graph.append(f"{ins}concat=n={len(segs)}:v=1:a={len(p['audio'])}{outs}")
-        src = "[vj]"
+def _preview_out(path: str) -> list[str]:
+    """The second output: the frame being encoded, one PNG written over and over."""
+    return ["-map", "[vprev]", "-c:v", "png", "-update", "1", "-f", "image2", path]
+
+
+# ── 1.4: the result in parts ─────────────────────────────────
+def split_on(job: Job) -> bool:
+    sp = job.settings.get("split") or {}
+    mode = sp.get("mode", "off")
+    return job.settings.get("container", "mkv") != "gif" and (
+        (mode == "size" and float(sp.get("size_mb", 0) or 0) > 0) or
+        (mode == "time" and float(sp.get("minutes", 0) or 0) > 0))
+
+
+def split_pattern(out: str) -> str:
+    stem, ext = os.path.splitext(out)
+    return stem.replace("%", "%%") + "_%02d" + ext
+
+
+def split_parts(out: str) -> list[str]:
+    stem, ext = os.path.splitext(out)
+    rx = re.compile(re.escape(os.path.basename(stem)) + r"_\d{2,}" + re.escape(ext) + "$")
+    d = os.path.dirname(out) or "."
+    try:
+        names = sorted(f for f in os.listdir(d) if rx.match(f))
+    except OSError:
+        return []
+    return [os.path.join(d, f) for f in names]
+
+
+def split_args(job: Job, ffmpeg: str, src: str, times: list[float] | None = None) -> list[str]:
+    """The finished file cut (copied, at keyframes) into parts: by time every N minutes, or at the given
+    times (by size: size_times finds them). The parts are <name>_01.ext, <name>_02.ext …"""
+    c = E.container(job.settings.get("container", "mkv"))
+    sp = job.settings.get("split") or {}
+    args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:1",
+            "-i", src, "-map", "0", "-c", "copy", "-map_metadata", "0", "-f", "segment", "-segment_format", c.fmt,
+            "-segment_start_number", "1", "-reset_timestamps", "1"]
+    if times is not None:
+        args += ["-segment_times", ",".join(f"{max(0.0, x - 0.0005):.3f}" for x in times) or "1e9"]
     else:
-        src = f"[0:{s0.index}]"
-    graph += _graph_video(job, enc, src, ov_in, transforms, analysis)
-    if analysis:
-        return
-    vi = args.index("-c:v")
-    args[vi:vi] = ["-map", "[vout]"]
+        args += ["-segment_time", f"{float(sp.get('minutes', 20)) * 60:g}"]
+    if c.fmt in ("mp4", "mov"):
+        args += ["-segment_format_options", "movflags=+faststart"]
+    return args + [split_pattern(src)]
 
 
-def _with_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph):
-    """The analysis pass: the graph goes in, [vout] is the one output."""
-    if joined:
-        _video_graph(args, job, enc, segs, joined, p, ov_in, transforms, analysis, graph)
-        fi = args.index("-map_metadata")
-        args[fi:fi] = ["-filter_complex", ";".join(graph)]
-        ai = args.index("-an")
-        args[ai:ai] = ["-map", "[vout]"]
-    return args
+def cut_times(packets: list[tuple[float, int, bool]], limit: int) -> list[float]:
+    """Where to cut for parts of at most `limit` bytes: packets [(time, size, a keyframe of the video)] in time
+    order → the keyframe times to cut at (2 % and 64 KiB of every part are left for the container)."""
+    room = max(1, int(limit * 0.98) - 65536)
+    cuts: list[float] = []
+    start, total, last = 0, 0, None                 # bytes at the last cut, bytes so far, (time, bytes) of a key
+    for t, size, key in packets:
+        if key:
+            if total - start > room and last is not None and last[1] > start:
+                cuts.append(last[0])
+                start = last[1]
+            if total - start > room and total > start:           # one GOP bigger than a part
+                cuts.append(t)
+                start = total
+            last = (t, total)
+        total += size
+    if total - start > room and last is not None and last[1] > start:
+        cuts.append(last[0])
+    return [x for x in cuts if x > 0]
+
+
+def size_times(ffprobe: str, path: str, size_mb: float) -> list[float]:
+    """ffprobe the packets of the finished file and pick the keyframes to cut it at for size_mb parts."""
+    from . import ff
+    r = ff.run([ffprobe, "-v", "error", "-show_entries", "stream=index,codec_type", "-of", "csv=p=0", path], 60)
+    kinds = {}
+    for ln in r.stdout.splitlines():
+        bits = ln.strip().split(",")
+        if len(bits) >= 2 and bits[0].isdigit():
+            kinds[int(bits[0])] = bits[1]
+    has_v = "video" in kinds.values()
+    r = ff.run([ffprobe, "-v", "error", "-show_entries", "packet=stream_index,pts_time,dts_time,size,flags",
+                "-of", "csv=p=0", path], 3600)
+    pk = []
+    for ln in r.stdout.splitlines():
+        b = ln.strip().split(",")
+        if len(b) < 5:
+            continue
+        try:
+            idx = int(b[0])
+            t = float(b[1]) if b[1] not in ("", "N/A") else float(b[2])
+            size = int(b[3])
+        except ValueError:
+            continue
+        video = kinds.get(idx) == "video"
+        key = "K" in b[4] and (video or not has_v)
+        pk.append((t, size, key))
+    pk.sort(key=lambda x: x[0])
+    return cut_times(pk, int(float(size_mb) * 1024 * 1024))
 
 
 def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
@@ -891,6 +1439,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
                 bits.append(f"{v.get('bitrate')} kbit/s")
             else:
                 bits.append(f"{v.get('size_mb')} MB")
+            if rc in ("bitrate", "size") and int(v.get("passes", 1) or 1) == 2 and (e is None or e.rc):
+                bits[-1] += " · " + tr("two_pass_short")
         if res_label(v):
             bits.append(res_label(v))
     a = st.get("audio", {})
@@ -899,4 +1449,9 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
     elif c.audio_only and a.get("codec") == "copy":
         bits.append(tr("a_copy_short"))
     bits.append(c.id.upper())
+    sp = st.get("split") or {}
+    if sp.get("mode") == "size" and sp.get("size_mb"):
+        bits.append(tr("split_short_size", sp["size_mb"]))
+    elif sp.get("mode") == "time" and sp.get("minutes"):
+        bits.append(tr("split_short_time", sp["minutes"]))
     return " · ".join(bits)
