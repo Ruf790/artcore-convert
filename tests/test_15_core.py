@@ -140,11 +140,12 @@ def test_gop_in_frames_and_seconds_closed(clip, tmp_path, av):
 def test_vbv_caps_the_bit_rate(clip, tmp_path, av):
     j = job(src(clip), video={"encoder": "x264", "rc": "bitrate", "bitrate": 6000, "speed": 1}, subs="none",
             fmt=fmt(name="V", vbv_buf=1500, vbv_max=1000))
+    j.tracks = {"1": {"keep": False}, "2": {"keep": False}}            # the picture alone
     pj, args = encode(j, str(tmp_path / "v.mkv"), av)
     assert args[args.index("-maxrate") + 1] == "1000k" and args[args.index("-bufsize") + 1] == "1500k"
     assert args[args.index("-b:v") + 1] == "1000k"
     kbps = int(pj["format"]["size"]) * 8 / float(pj["format"]["duration"]) / 1000
-    assert kbps < 1000 + 200 + 400                                   # video ≤ 1000 + the two sound tracks
+    assert not astreams(pj) and kbps < 1000 * 1.1                    # held to the format's highest rate
 
 
 # ── the extension, codecs, sound limits, the frame, the length ─
