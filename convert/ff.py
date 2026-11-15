@@ -39,6 +39,13 @@ def ffprobe() -> str:
     return find("ffprobe")
 
 
+def inp(path: str) -> list[str]:
+    """-i path; a joined task's preview list (.ffconcat, 1.4) is read by the concat demuxer."""
+    if path.lower().endswith(".ffconcat"):
+        return ["-f", "concat", "-safe", "0", "-i", path]
+    return ["-i", path]
+
+
 def run(args: list[str], timeout: float = 60, binary: bool = False):
     """Run ffmpeg / ffprobe and wait: CompletedProcess (stdout as text unless binary)."""
     return subprocess.run(args, capture_output=True, timeout=timeout, text=not binary,

@@ -51,7 +51,9 @@ class TitleBars(QObject):
 def selftest() -> int:
     """CI: the built exe finds its ffmpeg / ffprobe and libmpv, checks the encoders, builds the window and
     converts a short test clip through the real queue: x264 + AAC to MP4, x265 10 bit + copy to MKV, and (1.1)
-    a trimmed VP9 WebM with edited tags and chapters, Xvid AVI, GIF and MP3. Result in %TEMP%."""
+    a trimmed VP9 WebM with edited tags and chapters, Xvid AVI, GIF and MP3; (1.4) two tasks at the same time
+    with a CPU limit, a joined two-pass task with an external track split into parts, the quality metrics and the
+    current frame, the speed test. Result in %TEMP%."""
     import tempfile
     import time
     import traceback
@@ -90,6 +92,16 @@ def selftest() -> int:
                      + (f", lacking {lacking}" if lacking else ""))
         if lacking:
             raise RuntimeError(f"this ffmpeg build lacks the filters {lacking}")
+        need14 = ("concat", "anullsrc", "aformat", "asplit", "split", "psnr", "ssim", "setsar", "color", "settb")
+        lacking = [f for f in need14 if f not in names]
+        lines.append("1.4: filters " + ("ok" if not lacking else f"lacking {lacking}") +
+                     f"; libvmaf {'yes' if 'libvmaf' in names else 'no'}; SVT-AV1 two passes "
+                     f"{'yes' if av.svt_2pass else 'no'}")
+        if lacking:
+            raise RuntimeError(f"this ffmpeg build lacks the filters {lacking}")
+        mux = ff.run([ff.ffmpeg(), "-hide_banner", "-muxers"], 30).stdout
+        if " segment " not in mux or " image2 " not in mux:
+            raise RuntimeError("this ffmpeg build lacks the segment / image2 muxers")
         src = os.path.join(tmp, "clip.mkv")
         os.makedirs(tmp, exist_ok=True)
         r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
@@ -214,6 +226,7 @@ def selftest() -> int:
         kinds = [(probe.probe(j.out).video.codec if probe.probe(j.out).video else "-") for j in jobs_11[1:]]
         if kinds != ["mpeg4", "gif", "-", "prores"]:
             raise RuntimeError(f"AVI / GIF / MP3 / MOV: {kinds}")
+        selftest_14(win, app, src, wide, tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -222,6 +235,72 @@ def selftest() -> int:
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\nFAIL\n" + traceback.format_exc())
         return 1
+
+
+def selftest_14(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
+    """1.4 in the built exe: two places at once with a CPU limit, metrics, the current frame, a joined
+    two-pass task with an external sound split into parts; the speed test with x264."""
+    import time
+    from . import bench as B
+    from . import encoders as E, ff, probe
+    from . import job as J
+    ac3 = os.path.join(tmp, "clip.eng.ac3")
+    r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "sine=f=700:d=3", "-ac", "2",
+                "-c:a", "ac3", ac3], 60)
+    if r.returncode != 0:
+        raise RuntimeError("making the external track failed: " + r.stderr[-300:])
+    vmaf = "libvmaf" in win.av.filters
+    win.cfg.update(parallel=2, metrics=["psnr", "ssim"] + (["vmaf"] if vmaf else []), show_frame=True)
+    win.set_cpu_limit(50)
+    win.show_side("status")
+    a = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "speed": 6}}))
+    b = J.Job(src=wide, settings=J.merged({"container": "mp4", "video": {"encoder": "x265", "speed": 7}}))
+    c = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "rc": "bitrate",
+                                                                        "bitrate": 1500, "passes": 2},
+                                          "split": {"mode": "time", "minutes": 0.025}}))
+    c.joins = [wide]
+    c.ext = [J.clean_ext({"path": ac3, "kind": "audio", "lang": "eng", "delay": 300})]
+    for j in (a, b, c):
+        win._append(j)
+    win._queue_changed()
+    t0 = time.monotonic()
+    while any(j.status == "probe" for j in win.jobs) and time.monotonic() - t0 < 30:
+        app.processEvents()
+        time.sleep(0.02)
+    both = frame = False
+    win.start_queue()
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < 300 and any(j.status not in ("done", "error") for j in (a, b, c)):
+        app.processEvents()
+        both = both or len(win._busy_slots()) == 2
+        pm = win.fr_img.pixmap()
+        frame = frame or (pm is not None and not pm.isNull())
+        time.sleep(0.02)
+    for j in (a, b, c):
+        lines.append(f"1.4 {j.status}: {j.out} {j.error} {j.metrics} parts {len(j.parts)}")
+        if j.status != "done":
+            raise RuntimeError(f"1.4 conversion failed: {j.error}")
+    if not both:
+        raise RuntimeError("two tasks never ran at the same time")
+    if not frame:
+        raise RuntimeError("the current frame never showed on the Status tab")
+    for j in (a, b):
+        if not (20 < j.metrics.get("psnr", 0) < 101 and 0.8 < j.metrics.get("ssim", 0) <= 1) or \
+                (vmaf and not 0 < j.metrics.get("vmaf", -1) <= 100):
+            raise RuntimeError(f"quality metrics: {j.metrics}")
+    if len(c.parts) != 3:                                   # 4 s in parts of 1.5 s
+        raise RuntimeError(f"the joined task: {len(c.parts)} parts, not 3")
+    total = sum(probe.probe(p).duration for p in c.parts)
+    first = probe.probe(c.parts[0])
+    lines.append(f"  joined + split: {total:.2f} s in {len(c.parts)} parts; first: {probe.summary(first)}")
+    if abs(total - 4.0) > 0.4 or len(first.of("audio")) != 2 or first.of("audio")[1].lang != "eng" or \
+            (first.video.width, first.video.height) != (640, 360):
+        raise RuntimeError("the joined task came out wrong")
+    res = B.run_one(E.BY_ID["x264"], ff.ffmpeg(), ff.ffprobe(), src, 0.0, 1.0, threads=1)
+    lines.append(f"  speed test: x264 {res['fps']} fps, {res['size']} bytes")
+    if not res["ok"]:
+        raise RuntimeError("speed test: " + res["error"])
+    win.set_cpu_limit(100)
 
 
 def main() -> int:

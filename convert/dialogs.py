@@ -219,3 +219,119 @@ class UpdateDialog(QDialog):
             return
         self.path = path
         self.accept()
+
+
+class BenchDialog(QDialog):
+    """1.4, Tools → Speed test: a short piece through every encoder of this PC, one after another (a thread);
+    the table fills row by row: frames a second, speed against real time, the size it came out at."""
+    row = Signal(object)
+    done = Signal()
+
+    def __init__(self, parent, av: E.Available, src: str | None, duration: float, threads: int = 0,
+                 only: list[str] | None = None):
+        super().__init__(parent)
+        from . import bench as B
+        self.B = B
+        self.av, self.threads = av, threads
+        self.encs = [e for e in B.encoders(av) if not only or e.id in only]
+        self.src, self.start, self.length = B.piece(src, duration)
+        self.results: list[dict] = []
+        self._stop = False
+        self._thread = None
+        self.setWindowTitle(t("bench") + " — " + APP_TITLE)
+        self.resize(760, 520)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 16)
+        lay.addWidget(_head(t("bench")))
+        import os
+        what = (t("bench_from", os.path.basename(src), f"{self.length:g}") if self.src else
+                t("bench_test", f"{self.length:g}"))
+        lay.addWidget(_hint(what + " " + t("bench_hint")))
+        self.view = QTreeWidget()
+        self.view.setObjectName("playlist")
+        self.view.setColumnCount(5)
+        self.view.setHeaderLabels([t("encoder"), "fps", t("bench_speed"), t("st_size").rstrip(":"), t("enc_state")])
+        self.view.setRootIsDecorated(False)
+        h = self.view.header()
+        h.setSectionResizeMode(0, QHeaderView.Stretch)
+        for c in range(1, 5):
+            h.setSectionResizeMode(c, QHeaderView.ResizeToContents)
+        self.items = {}
+        for e in self.encs:
+            it = QTreeWidgetItem(self.view, [e.label, "", "", "", t("bench_wait")])
+            self.items[e.id] = it
+        lay.addWidget(self.view, 1)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, max(1, len(self.encs)))
+        lay.addWidget(self.bar)
+        row = QHBoxLayout()
+        self.go = QPushButton(t("bench_start"))
+        self.go.setObjectName("primary")
+        self.go.clicked.connect(self.start_test)
+        row.addWidget(self.go)
+        row.addStretch(1)
+        row.addWidget(_buttons(self, ok=False))
+        lay.addLayout(row)
+        self.row.connect(self._on_row)
+        self.done.connect(self._on_done)
+
+    def start_test(self):
+        import threading
+        if self._thread is not None:
+            return
+        self.go.setEnabled(False)
+        self._stop = False
+        self.results = []
+        self.bar.setValue(0)
+        exe, probe = ff.ffmpeg() or "ffmpeg", ff.ffprobe() or "ffprobe"
+
+        def work():
+            for e in self.encs:
+                if self._stop:
+                    break
+                self.row.emit({"id": e.id, "running": True})
+                self.row.emit(self.B.run_one(e, exe, probe, self.src, self.start, self.length, self.threads))
+            self.done.emit()
+        self._thread = threading.Thread(target=work, daemon=True)
+        self._thread.start()
+
+    def _on_row(self, r: dict):
+        it = self.items.get(r["id"])
+        if it is None:
+            return
+        if r.get("running"):
+            it.setText(4, t("bench_running"))
+            return
+        self.results.append(r)
+        self.bar.setValue(len(self.results))
+        if r["ok"]:
+            from . import probe as P
+            it.setText(1, f"{r['fps']:.1f}")
+            it.setText(2, f"{r['speed']:.2f}×")
+            it.setText(3, P.fmt_size(r["size"]))
+            it.setText(4, "✓")
+            from PySide6.QtGui import QColor
+            it.setForeground(4, QColor(style.OK))
+        else:
+            it.setText(4, "✗ " + (r.get("error") or "")[:120])
+            it.setToolTip(4, r.get("error") or "")
+        best = max((x["fps"] for x in self.results if x["ok"]), default=0)
+        for x in self.results:
+            if x["ok"]:
+                f = self.items[x["id"]].font(0)
+                f.setBold(x["fps"] == best)
+                for c in range(5):
+                    self.items[x["id"]].setFont(c, f)
+
+    def _on_done(self):
+        self._thread = None
+        self.go.setEnabled(True)
+        self.go.setText(t("bench_again"))
+
+    def wait(self, timeout: float = 600) -> None:
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def reject(self):
+        self._stop = True
+        super().reject()

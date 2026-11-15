@@ -62,7 +62,7 @@ class MediaWorker(QObject):
                         break
                     at = dur * (i + 0.5) / STRIP_N
                     try:
-                        r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.2f}", "-i", path, "-map", "0:v:0",
+                        r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.2f}", *ff.inp(path), "-map", "0:v:0",
                                     "-frames:v", "1", "-vf", "scale=-2:72", "-f", "image2pipe", "-c:v", "png", "-"],
                                    30, binary=True)
                         frames.append(r.stdout if r.returncode == 0 else b"")
@@ -79,7 +79,7 @@ class MediaWorker(QObject):
                       "astats=metadata=1:reset=1:measure_overall=Peak_level:measure_perchannel=none,"
                       "ametadata=print:key=lavfi.astats.Overall.Peak_level:file=-")
                 try:
-                    r = ff.run([exe, "-hide_banner", "-v", "error", "-i", path, "-map", "0:a:0", "-vn", "-sn", "-dn",
+                    r = ff.run([exe, "-hide_banner", "-v", "error", *ff.inp(path), "-map", "0:a:0", "-vn", "-sn", "-dn",
                                 "-af", af, "-f", "null", "-"], max(60.0, dur / 6))
                     for line in r.stdout.splitlines():
                         if "Peak_level=" in line:

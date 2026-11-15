@@ -1,7 +1,9 @@
 """Runs one ffmpeg at a time (QProcess): reads -progress from stdout, keeps the log from stderr, pauses by
 suspending the process, cancels by killing it and deleting the half-written file. The result is written to
 <name>.part and renamed when ffmpeg finishes cleanly. 1.3: analysis passes (the two-pass stabilisation) can
-run first; the progress bar is shared out between the passes."""
+run first; the progress bar is shared out between the passes. 1.4: passes after it (the quality metrics, on
+the finished file — their failure does not fail the task), the first pass of a two-pass encode, a CPU limit
+(the cores ffmpeg may use), and direct mode (no .part: the split writes many files of its own)."""
 from __future__ import annotations
 
 import os
@@ -39,20 +41,35 @@ class Runner(QObject):
         self._pre: list[list[str]] = []
         self.phase = 0
         self.phases = 1
+        self._post: list[list[str]] = []
+        self.post_failed = False
+        self.cores: list[int] | None = None          # 1.4: the CPUs ffmpeg may run on (None = all)
+        self.kinds: list[str] = []                   # the name of every pass (pre…, main, post…)
+        self.direct = False
 
     @property
     def running(self) -> bool:
         return self.proc is not None
 
     def start(self, args: list[str], out: str, duration: float, priority: str = "below",
-              pre: list[list[str]] | None = None):
-        """args end with the output path; it is replaced by <out>.part here. pre: commands run before it
-        (they write no file of the result)."""
+              pre: list[list[str]] | None = None, post: list[list[str]] | None = None,
+              cores: list[int] | None = None, direct: bool = False, kinds: list[str] | None = None):
+        """args hold the output path (its last place); it is replaced by <out>.part here (not when direct).
+        pre: commands run before it, post: after it, on the finished file (none writes a file of the result)."""
         self.out = out
-        self.part = out + ".part"
-        self._main = list(args[:-1]) + [self.part]
+        self.direct = direct
+        self.part = out if direct else out + ".part"
+        main = list(args)
+        if not direct:
+            i = len(main) - 1 - main[::-1].index(out) if out in main else len(main) - 1
+            main[i] = self.part
+        self._main = main
         self._pre = [list(a) for a in (pre or [])]
-        self.phases = len(self._pre) + 1
+        self._post = [list(a) for a in (post or [])]
+        self.post_failed = False
+        self.phases = len(self._pre) + 1 + len(self._post)
+        self.kinds = list(kinds or []) or (["pre"] * len(self._pre) + ["main"] + ["post"] * len(self._post))
+        self.cores = list(cores) if cores else None
         self.phase = 0
         self.duration = max(0.0, duration)
         self.paused = self.cancelled = False
@@ -61,6 +78,18 @@ class Runner(QObject):
         self.tail = []
         self.priority = priority
         self._launch(self._pre[0] if self._pre else self._main)
+
+    @property
+    def kind(self) -> str:
+        return self.kinds[self.phase] if self.phase < len(self.kinds) else "main"
+
+    def _cmd(self, phase: int) -> list[str]:
+        n = len(self._pre)
+        if phase < n:
+            return self._pre[phase]
+        if phase == n:
+            return self._main
+        return self._post[phase - n - 1]
 
     def _launch(self, args: list[str]):
         self._buf_out = self._buf_err = b""
@@ -75,11 +104,29 @@ class Runner(QObject):
         self.proc = p
         self.log.emit("$ " + " ".join(_q(a) for a in args))
         p.start()
+        if self.cores and p.waitForStarted(3000):
+            self._apply_cores()                                # the CPU limit from the first frame on
         QTimer.singleShot(300, self._apply_priority)
 
     def _apply_priority(self):
         if self.proc is not None and self.proc.processId():
             winint.set_priority(int(self.proc.processId()), self.priority)
+            self._apply_cores()
+
+    def _apply_cores(self):
+        if self.proc is None or not self.proc.processId():
+            return
+        try:
+            import psutil
+            pr = psutil.Process(int(self.proc.processId()))
+            pr.cpu_affinity(self.cores or list(range(psutil.cpu_count() or 1)))
+        except Exception:
+            pass
+
+    def set_cores(self, cores: list[int] | None):
+        """1.4: the CPU limit changed while it runs: the process moves to these cores at once."""
+        self.cores = list(cores) if cores else None
+        self._apply_cores()
 
     def set_priority(self, level: str):
         self.priority = level
@@ -171,17 +218,38 @@ class Runner(QObject):
         p.deleteLater()
         ok = code == 0 and not self.cancelled
         err = ""
-        if ok and self.phase < self.phases - 1:                # an analysis pass is done: the next one
+        n = len(self._pre)
+        if self.phase > n:                                     # a pass on the finished file
+            if self.cancelled:
+                self.finished.emit(True, "")                   # the file itself is done
+                return
+            if not ok:
+                self.post_failed = True
+                self.log.emit("⚠ " + (_error_line(self.tail) or f"ffmpeg exit code {code}"))
+            if self.phase < self.phases - 1:
+                self.phase += 1
+                self._launch(self._cmd(self.phase))
+                return
+            self.finished.emit(True, "")
+            return
+        if ok and self.phase < n:                              # an analysis / first pass is done: the next one
             self.phase += 1
-            self._launch(self._pre[self.phase] if self.phase < len(self._pre) else self._main)
+            self._launch(self._cmd(self.phase))
             return
         if ok:
-            try:
-                os.replace(self.part, self.out)
-            except OSError as e:
-                ok, err = False, str(e)
+            if not self.direct:
+                try:
+                    os.replace(self.part, self.out)
+                except OSError as e:
+                    ok, err = False, str(e)
+            if ok and self.phase < self.phases - 1:            # the metrics on the finished file
+                self.phase += 1
+                self.tail = []
+                self._launch(self._cmd(self.phase))
+                return
         else:
-            _remove(self.part)
+            if not self.direct:
+                _remove(self.part)
             if not self.cancelled:
                 err = _error_line(self.tail) or f"ffmpeg exit code {code}"
         self.finished.emit(ok, err)

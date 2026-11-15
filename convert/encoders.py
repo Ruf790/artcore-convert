@@ -57,6 +57,10 @@ AUTO_ORDER = ("nvidia", "amd", "intel", "cpu")
 VENDOR_LABEL = {"nvidia": "NVIDIA NVENC", "amd": "AMD AMF", "intel": "Intel Quick Sync", "cpu": "CPU"}
 
 
+TWO_PASS = ("x264", "x265", "vp9", "xvid", "mpeg4", "mpeg2", "svtav1")     # 1.4: encoders with -pass 1 / 2
+ONE_RUN_2PASS = ("nvidia",)                                                  # both passes inside one run
+
+
 def is_auto(enc_id: str) -> bool:
     return enc_id.startswith("auto_")
 
@@ -69,6 +73,17 @@ class Available:
         self.audio: set[str] = set()
         self.errors: dict[str, str] = {}            # encoder id → the telling ffmpeg line of its failed test
         self.reasons: dict[str, str] = {}           # encoder id → why_* key (no_amd, driver_old, …)
+        self.svt_2pass = False                      # 1.4: this ffmpeg's libsvtav1 takes -pass 1 / 2
+        self.filters: set[str] = set()              # 1.4: the ffmpeg filters of this build (libvmaf …)
+
+    def two_pass(self, e: "VEnc | None") -> bool:
+        """1.4: the encoder has a first pass of its own here (x264, x265, VP9, MPEG-4 / 2, SVT-AV1 where the
+        build has it); NVENC does both passes in one run (-multipass fullres) and needs none."""
+        if e is None:
+            return False
+        if e.id == "svtav1":
+            return self.svt_2pass
+        return e.id in TWO_PASS
 
     def works(self, enc_id: str) -> bool:
         if is_auto(enc_id):
@@ -161,6 +176,36 @@ def _try(e: VEnc) -> tuple[bool, str, str]:
         return False, "unknown", str(ex)
 
 
+def _svt_2pass() -> bool:
+    """Does this ffmpeg's libsvtav1 write first-pass statistics (FFmpeg 8.1+)? Three frames tell."""
+    import os
+    import tempfile
+    exe = ff.ffmpeg()
+    d = tempfile.mkdtemp(prefix="acsvt")
+    log = os.path.join(d, "p")
+    try:
+        r = ff.run([exe, "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=0.2",
+                    "-frames:v", "3", "-c:v", "libsvtav1", "-b:v", "200k", "-pass", "1", "-passlogfile", log,
+                    "-an", "-f", "null", "-"], 60)
+        return r.returncode == 0 and os.path.isfile(log + "-0.log") and os.path.getsize(log + "-0.log") > 0
+    except Exception:
+        return False
+    finally:
+        import shutil
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def ffmpeg_filters() -> set[str]:
+    exe = ff.ffmpeg()
+    if not exe:
+        return set()
+    try:
+        out = ff.run([exe, "-hide_banner", "-filters"], 20).stdout
+    except Exception:
+        return set()
+    return {ln.split()[1] for ln in out.splitlines() if len(ln.split()) > 2 and ln.startswith(" ")}
+
+
 def detect(cache: dict | None = None) -> Available:
     """CPU encoders: present in this ffmpeg. Hardware ones: actually encode (in parallel, ~1 s in all).
     `cache` = {ffmpeg version: {id: ok}} from the config; reused when the ffmpeg build is the same."""
@@ -188,13 +233,22 @@ def detect(cache: dict | None = None) -> Available:
                     av.reasons[e.id], av.errors[e.id] = key, line[:300]
     for e in VIDEO:
         av.ok.setdefault(e.id, False)
+    av.filters = ffmpeg_filters()
+    if av.ok.get("svtav1"):
+        if isinstance(cached, dict) and "_svt2pass" in cached:
+            av.svt_2pass = bool(cached["_svt2pass"])
+        else:
+            av.svt_2pass = _svt_2pass()
     return av
 
 
 def cache_entry(av: Available) -> dict:
     ver = ff.version()
-    return {ver: {e.id: [av.ok.get(e.id, False), av.reasons.get(e.id, ""), av.errors.get(e.id, "")]
-                  for e in VIDEO if e.hw}} if ver else {}
+    if not ver:
+        return {}
+    d = {e.id: [av.ok.get(e.id, False), av.reasons.get(e.id, ""), av.errors.get(e.id, "")] for e in VIDEO if e.hw}
+    d["_svt2pass"] = bool(av.svt_2pass)
+    return {ver: d}
 
 
 # ── arguments ────────────────────────────────────────────────
@@ -245,7 +299,9 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
         else:
             out += ["-rc", "vbr", "-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"]
         out += ["-spatial-aq", "1", "-rc-lookahead", "20"]
-        if sp >= 5:
+        if int(v.get("passes", 1) or 1) == 2 and rc != "quality" and kbps > 0:
+            out += ["-multipass", "fullres"]               # 1.4: two passes inside the one run
+        elif sp >= 5:
             out += ["-multipass", "qres"]
     elif e.vendor == "amd":
         out += ["-quality", AMF_QUALITY[sp]]
@@ -294,6 +350,25 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
     elif e.family == "h264":
         out += ["-profile:v", "high"]
     return out
+
+
+def thread_args(e: VEnc, n: int) -> list[str]:
+    """1.4, the CPU limit: the encoder's own thread count (x265: its thread pool, given in -x265-params)."""
+    if n <= 0 or e.hw or e.id in ("x265", "gif"):
+        return []
+    return ["-threads", str(n)]
+
+
+def pass_args(e: VEnc, n: int, prefix: str) -> list[str]:
+    """1.4: -pass 1 / 2 and where the statistics go (x265 writes them by its own -x265-params)."""
+    if e.id == "x265":
+        return []
+    return ["-pass", str(n), "-passlogfile", prefix]
+
+
+def x265_path(p: str) -> str:
+    """A path as a value inside -x265-params (C:\\a → C\\:/a; the «:» would split the list)."""
+    return p.replace("\\", "/").replace(":", "\\:")
 
 
 def target_kbps(size_mb: float, duration: float, audio_kbps: int) -> int:
@@ -404,7 +479,8 @@ TEXT_SUBS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 
 # ── self-check without the hardware ──────────────────────────
-GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params", "q:v", "bf"}
+GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params", "q:v", "bf",
+           "threads", "forced-idr"}
 
 
 def check_options(e: VEnc) -> list[str]:
@@ -429,10 +505,11 @@ def check_options(e: VEnc) -> list[str]:
             opts[cur].add(st.split()[0])                   # a named value of the option above
     pix = next((ln.split(":", 1)[1].split() for ln in lines if "Supported pixel formats" in ln), [])
     problems = []
-    for rc in ("quality", "bitrate"):
+    for rc, passes in (("quality", 1), ("bitrate", 1), ("bitrate", 2)):
         for speed in range(1, 8):
             for bits in e.bits:
-                a = video_args(e, {"rc": rc, "quality": e.q_default, "bitrate": 5000, "speed": speed}, bits, 60)
+                a = video_args(e, {"rc": rc, "quality": e.q_default, "bitrate": 5000, "speed": speed,
+                                   "passes": passes}, bits, 60)
                 for i in range(0, len(a) - 1, 2):
                     k, v = a[i].lstrip("-"), a[i + 1]
                     if k == "pix_fmt":

@@ -330,7 +330,7 @@ class FramePreview(QWidget):
             exe = ff.ffmpeg()
             if exe:
                 try:
-                    r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.3f}", "-i", path, "-map", "0:v:0",
+                    r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.3f}", *ff.inp(path), "-map", "0:v:0",
                                 "-frames:v", "1", "-vf", "scale=640:-2", "-f", "image2pipe", "-c:v", "png", "-"],
                                30, binary=True)
                     data = r.stdout if r.returncode == 0 else b""
