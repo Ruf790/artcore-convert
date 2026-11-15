@@ -27,6 +27,7 @@ class MediaWorker(QObject):
         self._busy = False
         self._lock = threading.Lock()
         self.cache: dict[str, tuple[list, list]] = {}
+        self.top: dict[str, float] = {}      # the loudest peak of a file (0..1 of full scale): the Volume preview
 
     def request(self, path: str, duration: float, has_video: bool, has_audio: bool):
         if path in self.cache:
@@ -90,10 +91,23 @@ class MediaWorker(QObject):
                                 peaks.append(0.0)
                     top = max(peaks) if peaks else 0.0
                     peaks = [p / top for p in peaks] if top > 0 else []
+                    self.top[path] = min(1.0, top)
                 except Exception:
                     peaks = []
             self.wave.emit(path, peaks)
             self.cache[path] = (frames, peaks)
+
+
+def _wave_path(vals: list[float], w: int, mid: float, amp: float) -> QPainterPath:
+    path = QPainterPath()
+    n = len(vals)
+    path.moveTo(0, mid)
+    for i, v in enumerate(vals):
+        path.lineTo(w * i / max(1, n - 1), mid - v * amp)
+    for i in range(n - 1, -1, -1):
+        path.lineTo(w * i / max(1, n - 1), mid + vals[i] * amp)
+    path.closeSubpath()
+    return path
 
 
 class Timeline(QWidget):
@@ -109,6 +123,8 @@ class Timeline(QWidget):
         self.mark_out: float | None = None
         self.frames: list[QPixmap] = []
         self.peaks: list[float] = []
+        self.top = 1.0                                  # the loudest peak, of full scale
+        self.gain_db = 0.0                              # 1.3: the Volume row, previewed on the curve
         self.setMinimumHeight(70)
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         self.setFixedHeight(128)
@@ -121,9 +137,23 @@ class Timeline(QWidget):
             self.frames.append(pm if data and pm.loadFromData(data) else QPixmap())
         self.update()
 
-    def set_wave(self, peaks: list):
+    def set_wave(self, peaks: list, top: float = 1.0):
         self.peaks = list(peaks)
+        self.top = max(0.0, min(1.0, top or 1.0))
         self.update()
+
+    def set_gain(self, db: float):
+        if abs(db - self.gain_db) > 1e-6:
+            self.gain_db = db
+            self.update()
+
+    def shown_peaks(self) -> tuple[list[float], list[bool]]:
+        """The curve as drawn: with a gain, in full-scale units moved by it; True where it would clip."""
+        if abs(self.gain_db) < 0.01:
+            return self.peaks, [False] * len(self.peaks)
+        k = self.top * 10 ** (self.gain_db / 20)
+        vals = [v * k for v in self.peaks]
+        return [min(1.0, v) for v in vals], [v > 1.0 for v in vals]
 
     def clear_media(self):
         self.frames, self.peaks = [], []
@@ -157,17 +187,25 @@ class Timeline(QWidget):
         if self.peaks:
             mid = wave.center().y()
             amp = wave.height() / 2 - 2
-            path = QPainterPath()
             n = len(self.peaks)
-            path.moveTo(0, mid)
-            for i, v in enumerate(self.peaks):
-                path.lineTo(w * i / max(1, n - 1), mid - v * amp)
-            for i in range(n - 1, -1, -1):
-                path.lineTo(w * i / max(1, n - 1), mid + self.peaks[i] * amp)
-            path.closeSubpath()
+            gained = abs(self.gain_db) >= 0.01
+            if gained:                                   # the source, faint, in the same full-scale units
+                p.setPen(Qt.NoPen)
+                p.setBrush(QColor(144, 97, 214, 70))
+                p.drawPath(_wave_path([v * self.top for v in self.peaks], w, mid, amp))
+            vals, clip = self.shown_peaks()
             p.setPen(Qt.NoPen)
             p.setBrush(QColor("#9061d6"))
-            p.drawPath(path)
+            p.drawPath(_wave_path(vals, w, mid, amp))
+            if gained:
+                p.setPen(QPen(QColor(style.WARN), 1, Qt.DashLine))
+                p.drawLine(0, int(mid - amp), w, int(mid - amp))
+                p.drawLine(0, int(mid + amp), w, int(mid + amp))
+                cw = w / max(1, n - 1)
+                for i, c in enumerate(clip):             # what the gain would clip
+                    if c:
+                        p.fillRect(QRectF(w * i / max(1, n - 1) - cw / 2, wave.top(), cw + 1, wave.height()),
+                                   QColor(255, 59, 48, 90))
         if self.dur > 0:
             # the cut-out parts dimmed, the pieces outlined
             if self.keep:

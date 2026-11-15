@@ -81,6 +81,15 @@ def selftest() -> int:
         lines.append(f"options of {len(E.VIDEO)} encoders checked: " + ("ok" if not problems else "; ".join(problems)))
         if problems:
             raise RuntimeError("encoder options: " + "; ".join(problems))
+        # 1.3: the filters the Streams tab uses are in this ffmpeg
+        from . import filters as F
+        have = ff.run([ff.ffmpeg(), "-hide_banner", "-filters"], 30).stdout
+        names = {ln.split()[1] for ln in have.splitlines() if len(ln.split()) > 2 and ln.startswith(" ")}
+        lacking = [f for f in F.needed_filters() if f not in names]
+        lines.append(f"filters: {len(F.needed_filters()) - len(lacking)} of {len(F.needed_filters())}"
+                     + (f", lacking {lacking}" if lacking else ""))
+        if lacking:
+            raise RuntimeError(f"this ffmpeg build lacks the filters {lacking}")
         src = os.path.join(tmp, "clip.mkv")
         os.makedirs(tmp, exist_ok=True)
         r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i",
@@ -135,6 +144,23 @@ def selftest() -> int:
             {"container": "gif"},
             {"container": "mp3"},
             {"container": "mov", "video": {"encoder": "prores", "quality": 1}})]
+        # 1.3: a 2.20 film in a 1080p frame — auto crop, rotation, colour, vid.stab (two passes), the sound
+        # delayed and louder, two pieces joined by the concat filter
+        wide = os.path.join(tmp, "wide.mkv")
+        r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=1920x872:r=25:d=2",
+                    "-f", "lavfi", "-i", "sine=f=440:d=2", "-vf", "pad=1920:1080:0:104:black", "-c:v", "libx264",
+                    "-preset", "ultrafast", "-c:a", "aac", wide], 60)
+        if r.returncode != 0:
+            raise RuntimeError("making the letterboxed clip failed: " + r.stderr[-300:])
+        j4 = J.Job(src=wide, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "height": 480},
+                                                "audio": {"codec": "aac", "gain": 3},
+                                                "filters": {"crop": {"on": True, "mode": "auto"},
+                                                            "rotate": {"on": True, "hflip": True},
+                                                            "color": {"on": True, "saturation": 1.2},
+                                                            "deshake": {"on": True, "method": "vidstab"}}}))
+        j4.trim = [[0.2, 0.9], [1.1, 1.8]]
+        j4.tracks = {"1": {"delay": 200}}
+        jobs_11.append(j4)
         for j in jobs_11:
             win._append(j)
         win._queue_changed()
@@ -177,6 +203,14 @@ def selftest() -> int:
             got["dur"] = want["dur"]
         if got != want:
             raise RuntimeError(f"the trimmed WebM: {got} != {want}")
+        r4 = probe.probe(j4.out)
+        lines.append(f"  filters: crop found {j4.crop_found}, result {r4.video.width}x{r4.video.height}, "
+                     f"{r4.duration:.2f} s")
+        if j4.crop_found != [0, 104, 0, 104] or (r4.video.width, r4.video.height) != (854, 388) \
+                or abs(r4.duration - 1.6) > 0.25:
+            raise RuntimeError(f"the filtered task: crop {j4.crop_found}, {r4.video.width}x{r4.video.height}, "
+                               f"{r4.duration:.2f} s")
+        jobs_11 = jobs_11[:-1]
         kinds = [(probe.probe(j.out).video.codec if probe.probe(j.out).video else "-") for j in jobs_11[1:]]
         if kinds != ["mpeg4", "gif", "-", "prores"]:
             raise RuntimeError(f"AVI / GIF / MP3 / MOV: {kinds}")

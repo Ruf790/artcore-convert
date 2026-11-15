@@ -1,6 +1,7 @@
 """Runs one ffmpeg at a time (QProcess): reads -progress from stdout, keeps the log from stderr, pauses by
 suspending the process, cancels by killing it and deleting the half-written file. The result is written to
-<name>.part and renamed when ffmpeg finishes cleanly."""
+<name>.part and renamed when ffmpeg finishes cleanly. 1.3: analysis passes (the two-pass stabilisation) can
+run first; the progress bar is shared out between the passes."""
 from __future__ import annotations
 
 import os
@@ -34,24 +35,36 @@ class Runner(QObject):
         self._stat: dict = {}
         self.tail: list[str] = []            # the last stderr lines: the error message when it fails
         self.priority = "below"
+        self._main: list[str] = []
+        self._pre: list[list[str]] = []
+        self.phase = 0
+        self.phases = 1
 
     @property
     def running(self) -> bool:
         return self.proc is not None
 
-    def start(self, args: list[str], out: str, duration: float, priority: str = "below"):
-        """args end with the output path; it is replaced by <out>.part here."""
+    def start(self, args: list[str], out: str, duration: float, priority: str = "below",
+              pre: list[list[str]] | None = None):
+        """args end with the output path; it is replaced by <out>.part here. pre: commands run before it
+        (they write no file of the result)."""
         self.out = out
         self.part = out + ".part"
-        args = list(args[:-1]) + [self.part]
+        self._main = list(args[:-1]) + [self.part]
+        self._pre = [list(a) for a in (pre or [])]
+        self.phases = len(self._pre) + 1
+        self.phase = 0
         self.duration = max(0.0, duration)
         self.paused = self.cancelled = False
         self.paused_for = 0.0
         self.started = time.monotonic()
-        self._buf_out = self._buf_err = b""
-        self._stat = {}
         self.tail = []
         self.priority = priority
+        self._launch(self._pre[0] if self._pre else self._main)
+
+    def _launch(self, args: list[str]):
+        self._buf_out = self._buf_err = b""
+        self._stat = {}
         p = QProcess(self)
         p.setProgram(args[0])
         p.setArguments(args[1:])
@@ -123,6 +136,8 @@ class Runner(QObject):
                 pass
         spd = _f(st.get("speed", "").rstrip("x"))
         frac = 1.0 if end else (min(0.999, t / self.duration) if self.duration > 0 else 0.0)
+        if self.phases > 1:                                    # this pass's share of the bar
+            frac = min(0.999, (self.phase + frac) / self.phases) if not (end and self.phase == self.phases - 1) else 1.0
         eta = (self.duration - t) / spd if spd > 0 and self.duration > t else 0.0
         self.progress.emit({"frac": frac, "out_time": t, "fps": _f(st.get("fps")), "speed": spd,
                             "bitrate": st.get("bitrate", "").strip(), "size": int(_f(st.get("total_size"))),
@@ -156,6 +171,10 @@ class Runner(QObject):
         p.deleteLater()
         ok = code == 0 and not self.cancelled
         err = ""
+        if ok and self.phase < self.phases - 1:                # an analysis pass is done: the next one
+            self.phase += 1
+            self._launch(self._pre[self.phase] if self.phase < len(self._pre) else self._main)
+            return
         if ok:
             try:
                 os.replace(self.part, self.out)
