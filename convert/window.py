@@ -285,7 +285,7 @@ class MainWindow(MainUI, QMainWindow):
         if pm.load(path) and not pm.isNull():
             self._frame_mtime = m
             w = max(160, self.fr_img.width() - 28)
-            self.fr_img.setPixmap(pm.scaledToWidth(min(w, 480), Qt.SmoothTransformation))
+            self.fr_img.setPixmap(pm.scaled(min(w, 400), 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
     def _show_metrics(self, j: J.Job | None):
         av_vmaf = "libvmaf" in self.av.filters
@@ -296,6 +296,8 @@ class MainWindow(MainUI, QMainWindow):
             v = m.get(k)
             lab.setText("—" if v is None else f"{v:.2f} dB" if k == "psnr" else f"{v:.4f}" if k == "ssim"
                         else f"{v:.2f}")
+        if self.av_ready and not av_vmaf:
+            self.m_val["vmaf"].setText(t("m_no_vmaf_short"))
 
     # ── presets ───────────────────────────────────────────────
     def _fill_presets(self):

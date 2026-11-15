@@ -83,7 +83,9 @@ def test_parallel_cpu_limit_frame_metrics(qapp, films, data_dir):
         assert abs(P.probe(j.out).duration - J.out_duration(j)) < 0.3
         assert "-threads" in open(j.log_path, encoding="utf-8").read()
     _select(qapp, w, [jobs[0]])
-    assert w.m_val["psnr"].text().endswith("dB") and w.m_val["vmaf"].text() == "—"
+    assert w.m_val["psnr"].text().endswith("dB")
+    if "libvmaf" not in w.av.filters:
+        assert not w.m_check["vmaf"].isEnabled() and w.m_val["vmaf"].text() != "—"
     assert "PSNR" in w.i_text.text()
     w.set_parallel(1)
     assert w.par_box.currentData() == 1

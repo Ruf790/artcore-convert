@@ -712,6 +712,7 @@ STRINGS = {
     "m_tip_vmaf":     ("VMAF, 0…100: оценка Netflix, как видит человек (93+ — не отличить)",
                        "VMAF, 0…100: Netflix's score of what a viewer sees (93+ looks the same)"),
     "m_no_vmaf":      ("В этой сборке ffmpeg нет libvmaf", "This ffmpeg build has no libvmaf"),
+    "m_no_vmaf_short": ("нет в сборке ffmpeg", "not in this ffmpeg"),
     "m_failed":       ("метрики качества посчитать не удалось (см. лог)", "the quality metrics failed (see the log)"),
     "cpu_limit_tip":  ("Сколько процессора может занять ffmpeg: потоки кодера и ядра, на которых он работает",
                        "How much of the processor ffmpeg may take: the encoder's threads and the cores it runs on"),

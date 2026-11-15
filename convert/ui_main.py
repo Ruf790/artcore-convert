@@ -864,10 +864,12 @@ class MainUI:
         while self.tracks_lay.count():
             it = self.tracks_lay.takeAt(0)
             if it.widget() is not None:
+                it.widget().hide()                       # gone at once, not when Qt gets round to deleting it
                 it.widget().deleteLater()
         while self.ext_lay.count():
             it = self.ext_lay.takeAt(0)
             if it.widget() is not None:
+                it.widget().hide()
                 it.widget().deleteLater()
         jobs = self.selected_jobs()
         one = len(jobs) == 1 and jobs[0].info is not None and not jobs[0].info.error
