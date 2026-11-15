@@ -78,6 +78,7 @@ def _video_widget_class():
             self.player = player
             self.ctx = None
             self._gpa = None
+            self.paints = 0                      # frames drawn (the self-test checks the picture moves)
             self.setFocusPolicy(Qt.NoFocus)
             self.setAttribute(Qt.WA_OpaquePaintEvent)
             self.frame.connect(self.update, Qt.QueuedConnection)
@@ -102,6 +103,7 @@ def _video_widget_class():
                 pass
 
         def paintGL(self):
+            self.paints += 1
             if self.ctx is None:
                 f = self.context().functions()
                 f.glClearColor(0, 0, 0, 1)
@@ -164,7 +166,9 @@ class MpvView(QWidget):
                                  input_default_bindings=False, input_vo_keyboard=False, config=False, terminal=False,
                                  ytdl=False, hr_seek="yes", volume=70, audio_display="no", osd_level=0,
                                  sub_auto="no", demuxer_max_bytes="150MiB", demuxer_max_back_bytes="150MiB", **extra)
-        for name in ("time-pos", "duration", "pause"):
+        self.seeking = False
+        self._steps = 0                          # frame steps asked while a seek still runs
+        for name in ("time-pos", "duration", "pause", "seeking"):
             self.player.observe_property(name, lambda n, v: self._bridge.prop.emit(n, v))
         self.ctx = None
         self._pending = ""
@@ -185,6 +189,12 @@ class MpvView(QWidget):
         elif name == "duration" and v is not None:
             self.dur = float(v)
             self.duration.emit(self.dur)
+        elif name == "seeking":
+            self.seeking = bool(v)
+            if not self.seeking and self._steps:
+                n, self._steps = self._steps, 0
+                for _ in range(abs(n)):
+                    self.step(1 if n > 0 else -1)
         elif name == "pause" and v is not None:
             self.is_paused = bool(v)
             self.paused.emit(self.is_paused)
@@ -216,6 +226,8 @@ class MpvView(QWidget):
     def seek(self, t: float, exact: bool = True):
         if not self.path or self.dead:
             return
+        self.seeking = True                      # until mpv says the seek is over (or 1.5 s, whichever first)
+        QTimer.singleShot(1500, lambda: self._on_prop("seeking", False) if self.seeking else None)
         try:
             self.player.command("seek", max(0.0, t), "absolute+exact" if exact else "absolute+keyframes")
         except Exception:
@@ -223,6 +235,9 @@ class MpvView(QWidget):
 
     def step(self, frames: int):
         if not self.path or self.dead:
+            return
+        if self.seeking:                         # a step during a seek is lost by mpv: do it right after
+            self._steps += frames
             return
         try:
             self.player.pause = True

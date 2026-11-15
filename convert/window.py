@@ -1,6 +1,5 @@
-"""The main window: the queue on the left; File / Video / Audio / Tracks / Status tabs on the right; output
-folder, priority and «when done» at the bottom. Settings tabs edit the selected tasks (or, with nothing
-selected, the settings of new ones)."""
+"""The main window (laid out after XviD4PSP 8 in ui_main.py): the tasks, their settings, running the queue.
+The settings widgets edit the selected tasks (or, with nothing selected, the settings of new ones)."""
 from __future__ import annotations
 
 import os
@@ -8,21 +7,19 @@ import shutil
 import threading
 import time
 
-from PySide6.QtCore import QByteArray, QObject, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QColor, QKeySequence, QPixmap, QShortcut
-from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QFileDialog,
-                               QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QInputDialog,
-                               QLabel, QMainWindow, QMenu, QMessageBox, QPlainTextEdit, QProgressBar, QRadioButton,
-                               QScrollArea, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget, QToolButton,
-                               QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, Signal
+from PySide6.QtGui import QColor, QPixmap
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMainWindow, QMenu, QMessageBox,
+                               QSystemTrayIcon, QTreeWidgetItem)
 
 from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
 from . import encoders as E
 from . import job as J
 from . import probe as P
-from .edit_tabs import ChaptersTab, MetaTab, TrimTab
+from . import logs
 from .i18n import t
 from .runner import Runner
+from .ui_main import MainUI
 
 COL_N, COL_FILE, COL_SRC, COL_PROFILE, COL_STATE = range(5)
 BUILD_ERRORS = ("no_encoder", "bad_copy", "bad_codec", "nothing_out")
@@ -34,26 +31,6 @@ def state_icon(status: str):
                    "skip": ("fa6s.forward", "MUTED")}.get(status, ("fa6s.clock", "MUTED"))
     return style.icon(name, getattr(style, color))
 EDITABLE = ("wait", "error", "stop", "skip", "done")
-
-
-def ctl_button(icon_name: str, tip: str, size: int = 18, slot=None, obj: str = "ctl") -> QToolButton:
-    b = QToolButton()
-    b.setObjectName(obj)
-    b.setIcon(style.icon(icon_name, "#ffffff" if obj == "primaryBtn" else style.ICON))
-    b.setIconSize(QSize(size, size))
-    b.setToolTip(tip)
-    b.setCursor(Qt.PointingHandCursor)
-    b.setFocusPolicy(Qt.NoFocus)
-    if slot:
-        b.clicked.connect(slot)
-    return b
-
-
-def text_button(icon_name: str, text: str, slot=None, obj: str = "ctlText") -> QToolButton:
-    b = ctl_button(icon_name, "", 15, slot, obj)
-    b.setText("  " + text)
-    b.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
-    return b
 
 
 class Bridge(QObject):
@@ -129,7 +106,7 @@ def gpu_stats() -> dict:
         return {}
 
 
-class MainWindow(QMainWindow):
+class MainWindow(MainUI, QMainWindow):
     UPDATE_EVERY = 24 * 3600
 
     def __init__(self, cfg: dict):
@@ -138,8 +115,8 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(APP_TITLE)
         self.setWindowIcon(style.app_icon())
         self.setAcceptDrops(True)
-        self.resize(1320, 820)
-        self.setMinimumSize(980, 620)
+        self.resize(1440, 860)
+        self.setMinimumSize(1100, 640)
         self.jobs: list[J.Job] = []
         self.items: dict[int, QTreeWidgetItem] = {}
         self.thumbs: dict[int, QPixmap] = {}
@@ -166,23 +143,10 @@ class MainWindow(QMainWindow):
         self._last_stat: dict = {}
         self._gpu: dict = {}
         self._gpu_busy = False
+        self._run_log: list[str] = []            # every ffmpeg line of the task being encoded (its log file)
+        self._run_started = 0.0
 
-        central = QWidget()
-        self.setCentralWidget(central)
-        v = QVBoxLayout(central)
-        v.setContentsMargins(0, 0, 0, 0)
-        v.setSpacing(0)
-        v.addWidget(self._build_toolbar())
-        self.split = QSplitter(Qt.Horizontal)
-        self.split.setChildrenCollapsible(False)
-        self.split.addWidget(self._build_queue())
-        self.split.addWidget(self._build_tabs())
-        self.split.setStretchFactor(0, 1)
-        self.split.setStretchFactor(1, 0)
-        self.split.setSizes([640, 700])
-        v.addWidget(self.split, 1)
-        v.addWidget(self._build_bottom())
-        self._shortcuts()
+        self._build_ui()
 
         self.sys_timer = QTimer(self)
         self.sys_timer.setInterval(1000)
@@ -195,469 +159,6 @@ class MainWindow(QMainWindow):
         self._select_changed()
         self._update_buttons()
         self.detect_encoders()
-
-    # ── building ──────────────────────────────────────────────
-    def _build_toolbar(self) -> QWidget:
-        w = QWidget()
-        w.setObjectName("transport")
-        w.setAttribute(Qt.WA_StyledBackground)
-        w.setStyleSheet(f"QWidget#transport {{ border-top: none; border-bottom: 1px solid {style.BORDER}; }}")
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(14, 8, 14, 8)
-        lay.setSpacing(4)
-        lay.addWidget(text_button("fa6s.file-circle-plus", t("add_files"), self.add_files_dialog))
-        lay.addWidget(text_button("fa6s.folder-plus", t("add_folder"), self.add_folder_dialog))
-        lay.addSpacing(6)
-        self.b_remove = ctl_button("fa6s.trash-can", t("remove") + " (Del)", 16, self.remove_selected)
-        self.b_up = ctl_button("fa6s.arrow-up", t("move_up") + " (Ctrl+↑)", 15, lambda: self.move_selected(-1))
-        self.b_down = ctl_button("fa6s.arrow-down", t("move_down") + " (Ctrl+↓)", 15, lambda: self.move_selected(1))
-        self.b_clean = ctl_button("fa6s.broom", t("clear_done"), 16, self.clear_done)
-        for b in (self.b_remove, self.b_up, self.b_down, self.b_clean):
-            lay.addWidget(b)
-        lay.addSpacing(18)
-        lab = QLabel(t("preset"))
-        lab.setObjectName("hint")
-        lay.addWidget(lab)
-        self.preset_box = QComboBox()
-        self.preset_box.setMinimumWidth(300)
-        self.preset_box.activated.connect(self._preset_picked)
-        lay.addWidget(self.preset_box)
-        self.b_preset_menu = ctl_button("fa6s.ellipsis", t("presets_menu"), 15, self._preset_menu)
-        lay.addWidget(self.b_preset_menu)
-        lay.addStretch(1)
-        self.b_start = text_button("fa6s.play", t("start"), self.start_queue, "primaryBtn")
-        self.b_pause = ctl_button("fa6s.pause", t("pause") + " (Space)", 16, self.toggle_pause)
-        self.b_stop = ctl_button("fa6s.stop", t("stop"), 16, self.stop_queue)
-        lay.addWidget(self.b_start)
-        lay.addWidget(self.b_pause)
-        lay.addWidget(self.b_stop)
-        lay.addSpacing(6)
-        lay.addWidget(ctl_button("fa6s.bars", t("menu"), 17, self._main_menu))
-        self._fill_presets()
-        return w
-
-    def _build_queue(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(14, 12, 6, 10)
-        lay.setSpacing(6)
-        top = QHBoxLayout()
-        self.q_title = QLabel(t("queue"))
-        self.q_title.setStyleSheet("font-size: 12pt; font-weight: 700;")
-        top.addWidget(self.q_title)
-        self.q_count = QLabel()
-        self.q_count.setObjectName("hint")
-        top.addWidget(self.q_count)
-        top.addStretch(1)
-        lay.addLayout(top)
-        self.view = QTreeWidget()
-        self.view.setObjectName("playlist")
-        self.view.setColumnCount(5)
-        self.view.setHeaderLabels(["#", t("col_file"), t("col_src"), t("col_profile"), t("col_state")])
-        self.view.setRootIsDecorated(False)
-        self.view.setUniformRowHeights(True)
-        self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
-        self.view.setAlternatingRowColors(False)
-        self.view.setIconSize(QSize(15, 15))
-        h = self.view.header()
-        h.setStretchLastSection(False)
-        h.setSectionResizeMode(COL_N, QHeaderView.Fixed)
-        h.setSectionResizeMode(COL_FILE, QHeaderView.Stretch)
-        h.setSectionResizeMode(COL_SRC, QHeaderView.Interactive)
-        h.setSectionResizeMode(COL_PROFILE, QHeaderView.Interactive)
-        h.setSectionResizeMode(COL_STATE, QHeaderView.Fixed)
-        self.view.setColumnWidth(COL_N, 34)
-        self.view.setColumnWidth(COL_SRC, 200)
-        self.view.setColumnWidth(COL_PROFILE, 190)
-        self.view.setColumnWidth(COL_STATE, 96)
-        self.view.itemSelectionChanged.connect(self._select_changed)
-        self.view.setContextMenuPolicy(Qt.CustomContextMenu)
-        self.view.customContextMenuRequested.connect(self._queue_menu)
-        self.view.itemDoubleClicked.connect(lambda it, _c: self._open_result(self._job_of(it)))
-        lay.addWidget(self.view, 1)
-        self.empty = QLabel(t("empty"), self.view.viewport())
-        self.empty.setAlignment(Qt.AlignCenter)
-        self.empty.setWordWrap(True)
-        self.empty.setStyleSheet(f"color: {style.MUTED}; font-size: 11pt;")
-        self.empty.setAttribute(Qt.WA_TransparentForMouseEvents)
-        return w
-
-    def _build_tabs(self) -> QWidget:
-        w = QWidget()
-        w.setMinimumWidth(600)
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(6, 12, 14, 10)
-        lay.setSpacing(6)
-        self.scope = QLabel()
-        self.scope.setObjectName("hint")
-        self.scope.setWordWrap(True)
-        lay.addWidget(self.scope)
-        self.tabs = QTabWidget()
-        self.tabs.addTab(self._tab_info(), t("tab_info"))
-        self.tabs.addTab(self._scroll(self._tab_video()), t("tab_video"))
-        self.tabs.addTab(self._scroll(self._tab_audio()), t("tab_audio"))
-        self.tabs.addTab(self._tab_tracks(), t("tab_tracks"))
-        self.trim_tab = TrimTab()
-        self.trim_tab.changed.connect(self._job_edited)
-        self.tabs.addTab(self.trim_tab, t("tab_trim"))
-        self.meta_tab = MetaTab()
-        self.meta_tab.changed.connect(self._job_edited)
-        self.tabs.addTab(self._scroll(self.meta_tab), t("tab_meta"))
-        self.chap_tab = ChaptersTab(self.trim_tab.position)
-        self.chap_tab.changed.connect(self._job_edited)
-        self.tabs.addTab(self.chap_tab, t("tab_chapters"))
-        self.status_tab = self._tab_status()
-        self.tabs.addTab(self.status_tab, t("tab_status"))
-        lay.addWidget(self.tabs, 1)
-        return w
-
-    @staticmethod
-    def _scroll(inner: QWidget) -> QScrollArea:
-        sa = QScrollArea()
-        sa.setWidgetResizable(True)
-        sa.setFrameShape(QFrame.NoFrame)
-        sa.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        sa.setWidget(inner)
-        sa.setStyleSheet("QScrollArea { background: transparent; } QScrollArea > QWidget > QWidget { background: transparent; }")
-        return sa
-
-    # File / Info
-    def _tab_info(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
-        self.i_thumb = QLabel()
-        self.i_thumb.setAlignment(Qt.AlignCenter)
-        self.i_thumb.setMinimumHeight(200)
-        self.i_thumb.setStyleSheet(f"background: {style.PANEL}; border: 1px solid {style.BORDER}; border-radius: 10px;")
-        lay.addWidget(self.i_thumb)
-        self.i_name = QLabel()
-        self.i_name.setStyleSheet("font-size: 11.5pt; font-weight: 700;")
-        self.i_name.setWordWrap(True)
-        self.i_name.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        lay.addWidget(self.i_name)
-        self.i_text = QLabel()
-        self.i_text.setWordWrap(True)
-        self.i_text.setTextFormat(Qt.RichText)
-        self.i_text.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.i_text.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        sa = self._scroll(self.i_text)
-        lay.addWidget(sa, 1)
-        return w
-
-    # Video
-    def _tab_video(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
-        box = QGroupBox(t("grp_format"))
-        f = QFormLayout(box)
-        self.v_cont = QComboBox()
-        self.v_cont.setMaxVisibleItems(20)
-        for c in E.CONTAINERS:
-            if c.audio_only and not self.v_cont.findData("mka") >= 0:
-                self.v_cont.insertSeparator(self.v_cont.count())
-            self.v_cont.addItem((t("audio_only") + ": " if c.audio_only else "") + c.label, c.id)
-        self.v_cont.currentIndexChanged.connect(lambda: self._set(None, "container", self.v_cont.currentData()))
-        f.addRow(t("container"), self.v_cont)
-        self.v_mode = QComboBox()
-        self.v_mode.addItem(t("v_encode"), "encode")
-        self.v_mode.addItem(t("v_copy_long"), "copy")
-        self.v_mode.currentIndexChanged.connect(lambda: self._set("video", "mode", self.v_mode.currentData()))
-        f.addRow(t("video"), self.v_mode)
-        self.v_enc = QComboBox()
-        self.v_enc.currentIndexChanged.connect(self._enc_changed)
-        f.addRow(t("encoder"), self.v_enc)
-        self.v_bits = QComboBox()
-        for key in ("auto", "8", "10"):
-            self.v_bits.addItem(t("bits_" + key), key)
-        self.v_bits.currentIndexChanged.connect(lambda: self._set("video", "bits", self.v_bits.currentData()))
-        f.addRow(t("bit_depth"), self.v_bits)
-        self.v_enc_hint = QLabel()
-        self.v_enc_hint.setObjectName("hint")
-        self.v_enc_hint.setWordWrap(True)
-        f.addRow("", self.v_enc_hint)
-        lay.addWidget(box)
-
-        box = QGroupBox(t("grp_rate"))
-        g = QGridLayout(box)
-        g.setVerticalSpacing(8)
-        self.rc_group = QButtonGroup(self)
-        self.rc_q = QRadioButton(t("rc_quality"))
-        self.rc_b = QRadioButton(t("rc_bitrate"))
-        self.rc_s = QRadioButton(t("rc_size"))
-        for i, (rb, key) in enumerate(((self.rc_q, "quality"), (self.rc_b, "bitrate"), (self.rc_s, "size"))):
-            self.rc_group.addButton(rb, i)
-            rb.toggled.connect(lambda on, k=key: on and self._set("video", "rc", k))
-            g.addWidget(rb, i, 0)
-        self.v_q = QSpinBox()
-        self.v_q.setRange(0, 63)
-        self.v_q.valueChanged.connect(lambda x: self._set("video", "quality", int(x)))
-        self.v_q_hint = QLabel()
-        self.v_q_hint.setObjectName("hint")
-        self.v_q_hint.setWordWrap(True)
-        self.v_br = QSpinBox()
-        self.v_br.setRange(200, 200000)
-        self.v_br.setSingleStep(500)
-        self.v_br.setSuffix(" kbit/s")
-        self.v_br.valueChanged.connect(lambda x: self._set("video", "bitrate", int(x)))
-        self.v_size = QSpinBox()
-        self.v_size.setRange(10, 500000)
-        self.v_size.setSingleStep(100)
-        self.v_size.setSuffix(" MB")
-        self.v_size.valueChanged.connect(lambda x: self._set("video", "size_mb", int(x)))
-        self.v_size_hint = QLabel()
-        self.v_size_hint.setObjectName("hint")
-        g.addWidget(self.v_q, 0, 1)
-        g.addWidget(self.v_q_hint, 0, 2)
-        g.addWidget(self.v_br, 1, 1)
-        g.addWidget(self.v_size, 2, 1)
-        g.addWidget(self.v_size_hint, 2, 2)
-        g.setColumnStretch(2, 1)
-        sp = QHBoxLayout()
-        a = QLabel(t("faster"))
-        a.setObjectName("hint")
-        b = QLabel(t("better"))
-        b.setObjectName("hint")
-        self.v_speed = QSlider(Qt.Horizontal)
-        self.v_speed.setRange(1, 7)
-        self.v_speed.setPageStep(1)
-        self.v_speed.setTickPosition(QSlider.TicksBelow)
-        self.v_speed.valueChanged.connect(lambda x: (self._set("video", "speed", int(x)), self._speed_label()))
-        self.v_speed_lab = QLabel()
-        self.v_speed_lab.setMinimumWidth(90)
-        sp.addWidget(a)
-        sp.addWidget(self.v_speed, 1)
-        sp.addWidget(b)
-        sp.addSpacing(10)
-        sp.addWidget(self.v_speed_lab)
-        g.addWidget(QLabel(t("speed")), 3, 0)
-        g.addLayout(sp, 3, 1, 1, 2)
-        lay.addWidget(box)
-
-        box = QGroupBox(t("grp_picture"))
-        f = QFormLayout(box)
-        self.v_h = QComboBox()
-        self.v_h.addItem(t("as_source"), 0)
-        for h in (2160, 1440, 1080, 720, 576, 480):
-            self.v_h.addItem(f"{h}p", h)
-        self.v_h.currentIndexChanged.connect(lambda: self._set("video", "height", self.v_h.currentData()))
-        f.addRow(t("resolution"), self.v_h)
-        self.v_fps = QComboBox()
-        self.v_fps.addItem(t("as_source"), 0)
-        for x in (60, 50, 30, 25, 24):
-            self.v_fps.addItem(f"{x} fps", x)
-        self.v_fps.currentIndexChanged.connect(lambda: self._set("video", "fps", self.v_fps.currentData()))
-        f.addRow(t("fps"), self.v_fps)
-        self.v_deint = QComboBox()
-        for key in ("auto", "on", "off"):
-            self.v_deint.addItem(t("deint_" + key), key)
-        self.v_deint.currentIndexChanged.connect(lambda: self._set("video", "deint", self.v_deint.currentData()))
-        f.addRow(t("deint"), self.v_deint)
-        self.v_meta = QCheckBox(t("keep_meta"))
-        self.v_meta.toggled.connect(lambda on: self._set(None, "meta", bool(on)))
-        f.addRow("", self.v_meta)
-        lay.addWidget(box)
-        lay.addStretch(1)
-        return w
-
-    # Audio
-    def _tab_audio(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(10)
-        box = QGroupBox(t("grp_audio"))
-        f = QFormLayout(box)
-        self.a_codec = QComboBox()
-        self.a_codec.addItem(t("a_auto"), "auto")
-        self.a_codec.addItem(t("a_copy"), "copy")
-        for a in E.AUDIO:
-            self.a_codec.addItem(t("a_name_" + a.id), a.id)
-        self.a_codec.currentIndexChanged.connect(lambda: self._set("audio", "codec", self.a_codec.currentData()))
-        f.addRow(t("codec"), self.a_codec)
-        self.a_kbps = QComboBox()
-        self.a_kbps.addItem(t("auto"), 0)
-        for k in (96, 128, 160, 192, 224, 256, 320, 384, 448, 512, 640):
-            self.a_kbps.addItem(f"{k} kbit/s", k)
-        self.a_kbps.currentIndexChanged.connect(lambda: self._set("audio", "kbps", self.a_kbps.currentData()))
-        f.addRow(t("bitrate"), self.a_kbps)
-        self.a_ch = QComboBox()
-        for key in ("keep", "stereo", "5.1"):
-            self.a_ch.addItem(t("ch_" + key.replace(".", "")), key)
-        self.a_ch.currentIndexChanged.connect(lambda: self._set("audio", "channels", self.a_ch.currentData()))
-        f.addRow(t("channels"), self.a_ch)
-        self.a_tracks = QComboBox()
-        self.a_tracks.addItem(t("tracks_all"), "all")
-        self.a_tracks.addItem(t("tracks_first"), "first")
-        self.a_tracks.currentIndexChanged.connect(lambda: self._set("audio", "tracks", self.a_tracks.currentData()))
-        f.addRow(t("audio_tracks"), self.a_tracks)
-        self.a_norm = QCheckBox(t("normalize"))
-        self.a_norm.toggled.connect(lambda on: self._set("audio", "normalize", bool(on)))
-        f.addRow("", self.a_norm)
-        hint = QLabel(t("audio_hint"))
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        f.addRow("", hint)
-        lay.addWidget(box)
-        box = QGroupBox(t("grp_subs"))
-        f = QFormLayout(box)
-        self.s_mode = QComboBox()
-        for key in ("all", "first", "none"):
-            self.s_mode.addItem(t("subs_" + key), key)
-        self.s_mode.currentIndexChanged.connect(lambda: self._set(None, "subs", self.s_mode.currentData()))
-        f.addRow(t("subtitles"), self.s_mode)
-        hint = QLabel(t("subs_hint"))
-        hint.setObjectName("hint")
-        hint.setWordWrap(True)
-        f.addRow("", hint)
-        lay.addWidget(box)
-        lay.addStretch(1)
-        return w
-
-    # Tracks
-    def _tab_tracks(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
-        self.tr_hint = QLabel()
-        self.tr_hint.setObjectName("hint")
-        self.tr_hint.setWordWrap(True)
-        lay.addWidget(self.tr_hint)
-        self.tr_view = QTreeWidget()
-        self.tr_view.setObjectName("playlist")
-        self.tr_view.setColumnCount(4)
-        self.tr_view.setHeaderLabels(["#", t("tr_track"), t("tr_lang"), t("tr_action")])
-        self.tr_view.setRootIsDecorated(False)
-        h = self.tr_view.header()
-        h.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(1, QHeaderView.Stretch)
-        h.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        h.setSectionResizeMode(3, QHeaderView.ResizeToContents)
-        self.tr_view.itemChanged.connect(self._track_toggled)
-        lay.addWidget(self.tr_view, 1)
-        return w
-
-    # Status
-    def _tab_status(self) -> QWidget:
-        w = QWidget()
-        lay = QVBoxLayout(w)
-        lay.setContentsMargins(12, 12, 12, 12)
-        lay.setSpacing(8)
-        self.st_name = QLabel(t("st_idle"))
-        self.st_name.setStyleSheet("font-weight: 700; font-size: 11pt;")
-        self.st_name.setWordWrap(True)
-        lay.addWidget(self.st_name)
-        self.st_bar = QProgressBar()
-        self.st_bar.setRange(0, 1000)
-        self.st_bar.setTextVisible(True)
-        self.st_bar.setFormat("")
-        lay.addWidget(self.st_bar)
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(18)
-        grid.setVerticalSpacing(5)
-        self.st: dict[str, QLabel] = {}
-        left = ("elapsed", "eta", "speed", "fps", "bitrate", "size", "encoder")
-        right = ("cpu", "ram", "ff_mem", "disk", "gpu", "gpu_enc", "gpu_temp")
-        for col, keys in ((0, left), (2, right)):
-            for row, k in enumerate(keys):
-                lab = QLabel(t("st_" + k))
-                lab.setObjectName("hint")
-                val = QLabel("—")
-                val.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                grid.addWidget(lab, row, col)
-                grid.addWidget(val, row, col + 1)
-                self.st[k] = val
-        grid.setColumnStretch(1, 1)
-        grid.setColumnStretch(3, 1)
-        lay.addLayout(grid)
-        top = QHBoxLayout()
-        lab = QLabel(t("log"))
-        lab.setStyleSheet("font-weight: 600;")
-        top.addWidget(lab)
-        top.addStretch(1)
-        top.addWidget(ctl_button("fa6s.copy", t("log_copy"), 13,
-                                 lambda: QApplication.clipboard().setText(self.log.toPlainText())))
-        top.addWidget(ctl_button("fa6s.eraser", t("log_clear"), 13, lambda: self.log.clear()))
-        lay.addLayout(top)
-        self.log = QPlainTextEdit()
-        self.log.setReadOnly(True)
-        self.log.setMaximumBlockCount(Runner.LOG_KEEP)
-        self.log.setLineWrapMode(QPlainTextEdit.NoWrap)
-        self.log.setStyleSheet(f"background: {style.PANEL}; border: 1px solid {style.BORDER}; border-radius: 8px;"
-                               "font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 8.5pt;")
-        lay.addWidget(self.log, 1)
-        return w
-
-    def _build_bottom(self) -> QWidget:
-        w = QWidget()
-        w.setObjectName("transport")
-        w.setAttribute(Qt.WA_StyledBackground)
-        lay = QHBoxLayout(w)
-        lay.setContentsMargins(14, 8, 14, 10)
-        lay.setSpacing(8)
-        lab = QLabel(t("out_to"))
-        lab.setObjectName("hint")
-        lay.addWidget(lab)
-        self.o_mode = QComboBox()
-        self.o_mode.addItem(t("out_source"), "source")
-        self.o_mode.addItem(t("out_folder"), "folder")
-        self.o_mode.setCurrentIndex(1 if self.cfg.get("out_mode") == "folder" else 0)
-        self.o_mode.currentIndexChanged.connect(self._out_mode_changed)
-        lay.addWidget(self.o_mode)
-        self.o_dir = QLabel()
-        self.o_dir.setObjectName("hint")
-        self.o_dir.setMaximumWidth(300)
-        lay.addWidget(self.o_dir)
-        self.o_pick = ctl_button("fa6s.folder-open", t("out_pick"), 15, self._pick_out_dir)
-        lay.addWidget(self.o_pick)
-        lay.addSpacing(12)
-        lab = QLabel(t("priority"))
-        lab.setObjectName("hint")
-        lay.addWidget(lab)
-        self.prio = QComboBox()
-        for key in config.PRIORITIES:
-            self.prio.addItem(t("prio_" + key), key)
-        self.prio.setCurrentIndex(config.PRIORITIES.index(self.cfg.get("priority", "below")))
-        self.prio.currentIndexChanged.connect(self._prio_changed)
-        lay.addWidget(self.prio)
-        lab = QLabel(t("on_done"))
-        lab.setObjectName("hint")
-        lay.addWidget(lab)
-        self.done_box = QComboBox()
-        for key in config.ON_DONE:
-            self.done_box.addItem(t("done_" + key), key)
-        self.done_box.setCurrentIndex(config.ON_DONE.index(self.cfg.get("on_done", "nothing")))
-        self.done_box.currentIndexChanged.connect(lambda: self.cfg.__setitem__("on_done", self.done_box.currentData()))
-        lay.addWidget(self.done_box)
-        lay.addStretch(1)
-        self.total = QProgressBar()
-        self.total.setRange(0, 1000)
-        self.total.setFixedWidth(230)
-        self.total.setFormat("")
-        lay.addWidget(self.total)
-        self._out_mode_changed()
-        return w
-
-    def _shortcuts(self):
-        def sc(keys, fn):
-            for k in (keys if isinstance(keys, (list, tuple)) else [keys]):
-                s = QShortcut(QKeySequence(k), self)
-                s.setContext(Qt.WindowShortcut)
-                s.activated.connect(fn)
-        sc("Ctrl+O", self.add_files_dialog)
-        sc("Ctrl+Shift+O", self.add_folder_dialog)
-        sc("Delete", self.remove_selected)
-        sc("Ctrl+Up", lambda: self.move_selected(-1))
-        sc("Ctrl+Down", lambda: self.move_selected(1))
-        sc("Ctrl+A", self.view.selectAll)
-        sc("Ctrl+Return", self.start_queue)
-        sc("Space", self.toggle_pause)
-        sc("Escape", self.view.clearSelection)
-        sc("Ctrl+,", self.settings_dialog)
 
     # ── presets ───────────────────────────────────────────────
     def _fill_presets(self):
@@ -811,6 +312,7 @@ class MainWindow(QMainWindow):
         j.info = info
         if j.status == "probe":
             j.status = "wait"
+        self._show_thumb(j)
         if info.error:
             j.status, j.error = "error", info.error
         elif info.video is None and j.settings.get("video", {}).get("mode") != "copy" and not info.of("audio"):
@@ -826,10 +328,9 @@ class MainWindow(QMainWindow):
         pm = QPixmap()
         if data and pm.loadFromData(data):
             self.thumbs[uid] = pm
-        sel = self.selected_jobs()
-        if sel and sel[0].uid == uid:
-            self._show_thumb(sel[0])
-
+        it = self.items.get(uid)
+        if it is not None:
+            self.view.viewport().update()
     def _refresh(self, j: J.Job):
         it = self.items.get(j.uid)
         if it is None:
@@ -948,6 +449,8 @@ class MainWindow(QMainWindow):
             if any(x.status in ("wait", "probe") for x in jobs):
                 m.addAction(style.icon("fa6s.forward"), t("skip"), lambda: self._skip(jobs))
             m.addAction(style.icon("fa6s.terminal"), t("copy_cmd"), lambda: self._copy_cmd(j))
+            if j.log_path and os.path.isfile(j.log_path):
+                m.addAction(style.icon("fa6s.file-lines"), t("open_log"), lambda: self.open_log(j))
             m.addSeparator()
             m.addAction(style.icon("fa6s.trash-can"), t("remove") + "\tDel", self.remove_selected)
         m.addAction(style.icon("fa6s.broom"), t("clear_done"), self.clear_done)
@@ -996,7 +499,12 @@ class MainWindow(QMainWindow):
             self._show_info(None)
         self._fill_tracks()
         self._edit_tabs()
+        self._show_out_path()
         self._update_buttons()
+    def _one_job(self) -> tuple:
+        jobs = self.selected_jobs()
+        j = jobs[0] if len(jobs) == 1 else None
+        return j, j is not None and j.status in EDITABLE and j is not self.current
 
     def _edit_tabs(self):
         """Trim / Metadata / Chapters show the one selected task."""
@@ -1021,9 +529,8 @@ class MainWindow(QMainWindow):
         for other in (self.trim_tab, self.meta_tab, self.chap_tab):
             if other is not tab:
                 other.set_job(j, True)
-        if tab is self.trim_tab:
-            self._fill_tracks()
-
+        self._fill_tracks()
+        self._show_out_path()
     def _shown_settings(self) -> dict:
         jobs = self.selected_jobs()
         return jobs[0].settings if jobs else self.new_settings()
@@ -1054,13 +561,18 @@ class MainWindow(QMainWindow):
             self._queue_changed()
         else:
             config.save(self.cfg)
-        if (section, key) in (("video", "encoder"), ("video", "rc"), ("video", "mode"), (None, "container")):
+        if (section, key) in (("video", "encoder"), ("video", "rc"), ("video", "mode"), (None, "container"),
+                              ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale"),
+                              ("video", "quality"), ("video", "bitrate"), ("video", "size_mb"), ("video", "speed")):
             self._load_settings()
+        if key in ("container", "subs", "lang", "tracks", "codec", "channels", "normalize", "kbps", "mode"):
             if key == "container":
-                self._fill_tracks()
                 self._edit_tabs()
-                j = self.selected_jobs()
-                self._show_info(j[0] if j else None)
+            self._fill_tracks()
+            self.meta_tab.set_job(*self._one_job())
+            j = self.selected_jobs()
+            self._show_info(j[0] if j else None)
+            self._show_out_path()
 
     def _load_settings(self):
         st = self._shown_settings()
@@ -1069,9 +581,10 @@ class MainWindow(QMainWindow):
         try:
             self._fill_encoders()
             sel = lambda box, val: box.setCurrentIndex(max(0, box.findData(val)))   # noqa: E731
+            cont = E.container(st.get("container", "mkv"))
+            mode = v.get("mode", "encode")
             sel(self.v_cont, st.get("container", "mkv"))
-            sel(self.v_mode, v.get("mode", "encode"))
-            sel(self.v_enc, v.get("encoder", "auto_hevc"))
+            sel(self.v_enc, "copy" if mode == "copy" else v.get("encoder", "auto_hevc"))
             sel(self.v_bits, str(v.get("bits", "auto")))
             enc = self.av.resolve(v.get("encoder", "auto_hevc")) if self.av_ready else \
                 E.BY_ID.get(v.get("encoder", "")) or E.BY_ID["x265"]
@@ -1091,26 +604,52 @@ class MainWindow(QMainWindow):
             self.v_size.setValue(int(v.get("size_mb", 4000)))
             rc = v.get("rc", "quality") if enc.rc else "quality"
             {"quality": self.rc_q, "bitrate": self.rc_b, "size": self.rc_s}.get(rc, self.rc_q).setChecked(True)
+            sel(self.v_rc, rc)
+            if rc == "quality":
+                self.v_val.setRange(lo, hi)
+                self.v_val.setSuffix("")
+                self.v_val.setSingleStep(1)
+                self.v_val.setValue(self.v_q.value())
+            elif rc == "bitrate":
+                self.v_val.setRange(200, 200000)
+                self.v_val.setSuffix(" k")
+                self.v_val.setSingleStep(500)
+                self.v_val.setValue(self.v_br.value())
+            else:
+                self.v_val.setRange(10, 500000)
+                self.v_val.setSuffix(" MB")
+                self.v_val.setSingleStep(100)
+                self.v_val.setValue(self.v_size.value())
             self.v_q.setEnabled(rc == "quality")
             self.v_br.setEnabled(rc == "bitrate")
             self.v_size.setEnabled(rc == "size")
             self.v_speed.setValue(int(v.get("speed", 5)))
-            sel(self.v_h, int(v.get("height", 0) or 0))
+            sel(self.v_speed_box, int(v.get("speed", 5)))
+            self._fill_res(v)
+            self.v_w.setValue(int(v.get("width", 0) or 0))
+            self.v_hh.setValue(int(v.get("height", 0) or 0))
+            sel(self.v_fit, v.get("fit", "fit"))
+            self.v_up.setChecked(bool(v.get("upscale")))
             sel(self.v_fps, int(v.get("fps", 0) or 0))
             sel(self.v_deint, v.get("deint", "auto"))
-            self.v_meta.setChecked(bool(st.get("meta", True)))
-            cont = E.container(st.get("container", "mkv"))
-            enc_on = v.get("mode", "encode") != "copy" and not cont.audio_only
-            self.v_mode.setEnabled(not cont.audio_only and cont.id != "gif")
-            for wdg in (self.v_enc, self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_h,
-                        self.v_fps, self.v_deint):
+            self.v_on.setChecked(mode != "none" and not cont.audio_only)
+            self.v_on.setEnabled(not cont.audio_only and cont.id != "gif")
+            enc_on = mode == "encode" and not cont.audio_only
+            self.v_body.setEnabled(not cont.audio_only and mode != "none")
+            self.v_enc.setEnabled(not cont.audio_only and mode != "none")
+            for wdg in (self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_res, self.v_w,
+                        self.v_hh, self.v_fit, self.v_up, self.v_fps, self.v_deint, self.v_rc, self.v_val,
+                        self.v_speed_box):
                 wdg.setEnabled(enc_on)
             if enc_on and not enc.rc:
-                for wdg in (self.rc_b, self.rc_s, self.v_br, self.v_size):
+                for wdg in (self.rc_b, self.rc_s, self.v_br, self.v_size, self.v_rc):
                     wdg.setEnabled(False)
                 self.v_q.setEnabled(enc.id != "gif")
+                self.v_val.setEnabled(enc.id != "gif")
             if enc_on and len(enc.bits) == 1:
                 self.v_bits.setEnabled(False)
+            if enc_on and (enc.id in ("prores", "gif", "mpeg4", "mpeg2")):
+                self.v_speed_box.setEnabled(False)
             if not enc_on:
                 for wdg in (self.v_q, self.v_br, self.v_size):
                     wdg.setEnabled(False)
@@ -1125,6 +664,21 @@ class MainWindow(QMainWindow):
             self._speed_label()
             self._enc_hint(enc if enc_on else None, v, cont)
             jobs = self.selected_jobs()
+            jr = jobs[0] if jobs and jobs[0].info is not None and jobs[0].info.video is not None else None
+            if jr is not None:
+                vs = jr.info.video
+                self.v_head_label.setText(f"#{vs.index} " + P.video_line(vs))
+                c = vs.color
+                self.v_color.setText(" ".join(x for x in (vs.hdr, c.get("color_space", ""), c.get("color_transfer", ""),
+                                                          c.get("color_primaries", "")) if x) or "—")
+            else:
+                self.v_head_label.setText(t("video"))
+                self.v_color.setText("—")
+            if jr is not None and enc_on:
+                ow, oh = J.out_size(jr, enc)
+                self.v_res_hint.setText(t("res_result", jr.info.video.width, jr.info.video.height, ow, oh))
+            else:
+                self.v_res_hint.setText("")
             dur = J.out_duration(jobs[0]) if jobs and jobs[0].info else 0.0
             self.v_size_hint.setText(t("size_hint", E.target_kbps(float(v.get("size_mb", 0)), dur, 0)) if dur else "")
             sel(self.a_codec, a.get("codec", "auto"))
@@ -1133,12 +687,63 @@ class MainWindow(QMainWindow):
             sel(self.a_tracks, a.get("tracks", "all"))
             self.a_norm.setChecked(bool(a.get("normalize")))
             sel(self.s_mode, st.get("subs", "all"))
-            jobs_all = self.selected_jobs()
-            locked = bool(jobs_all) and not self.selected_jobs(editable=True)
-            for tab in range(1, 4):                       # Video, Audio, Tracks (the edit tabs lock themselves)
-                self.tabs.widget(tab).setEnabled(not locked)
+            sel(self.s_lang, st.get("lang", ""))
+            locked = bool(jobs) and not self.selected_jobs(editable=True)
+            for wdg in (self.side.widget(4), self.v_cont, self.preset_box):         # Streams + the format
+                wdg.setEnabled(not locked)
         finally:
             self._loading = False
+    def _fill_res(self, v: dict):
+        """The resolution list: as the source, the usual frames, the current own size, «own size…»."""
+        w, h = int(v.get("width", 0) or 0), int(v.get("height", 0) or 0)
+        if h and not w:
+            w = J._even(h * 16 / 9)
+        cur = f"{w}x{h}" if w and h else "0x0"
+        b = self.v_res
+        b.blockSignals(True)
+        b.clear()
+        b.addItem(t("as_source"), "0x0")
+        b.insertSeparator(b.count())
+        for rw, rh in J.RESOLUTIONS:
+            b.addItem(t(f"res_{rw}x{rh}"), f"{rw}x{rh}")
+        if b.findData(cur) < 0:
+            b.addItem(f"{w}×{h}", cur)
+        b.insertSeparator(b.count())
+        b.addItem(t("res_own"), "custom")
+        b.setCurrentIndex(max(0, b.findData(cur)))
+        b.blockSignals(False)
+
+    def _res_picked(self):
+        data = self.v_res.currentData()
+        if self._loading or not data:
+            return
+        if data == "custom":
+            self._load_settings()                     # back to the current entry until a size is typed
+            self.v_w.setFocus()
+            self.v_w.selectAll()
+            return
+        w, h = (int(x) for x in data.split("x"))
+        self._put("video", "width", w)
+        self._set("video", "height", h)
+
+    def _res_typed(self):
+        if self._loading:
+            return
+        self._put("video", "width", int(self.v_w.value()))
+        self._set("video", "height", int(self.v_hh.value()))
+
+    def _put(self, section: str, key: str, value):
+        """Write one value like _set, without the refresh (the next _set does it)."""
+        if self._loading:
+            return
+        jobs = self.selected_jobs(editable=True)
+        targets = [j.settings for j in jobs]
+        if not jobs and not self.selected_jobs():
+            if not self.cfg.get("defaults"):
+                self.cfg["defaults"] = J.merged(self.new_settings())
+            targets = [self.cfg["defaults"]]
+        for st in targets:
+            st.setdefault(section, {})[key] = value
 
     def _fill_encoders(self):
         cur = self.v_enc.currentData()
@@ -1152,6 +757,8 @@ class MainWindow(QMainWindow):
             item = model.item(self.v_enc.count() - 1)
             item.setEnabled(False)
             item.setToolTip(why)
+        self.v_enc.addItem(t("v_copy_long"), "copy")
+        self.v_enc.insertSeparator(self.v_enc.count())
         for fam in E.FAMILIES:
             e = self.av.resolve("auto_" + fam) if self.av_ready else None
             name = E.FAMILY_LABEL[fam] + " — " + t("enc_auto") + (f" ({self._vendor(e)})" if e else "")
@@ -1179,18 +786,22 @@ class MainWindow(QMainWindow):
 
     def _enc_changed(self):
         eid = self.v_enc.currentData()
-        if eid:
-            self._set("video", "encoder", eid)
-            if not self._loading:
-                self._set("video", "quality", 0)          # the new encoder's own default
-                self._load_settings()
-
+        if not eid or self._loading:
+            return
+        if eid == "copy":
+            self._set("video", "mode", "copy")
+            return
+        self._put("video", "mode", "encode")
+        self._put("video", "quality", 0)                  # the new encoder's own default
+        self._set("video", "encoder", eid)
     def _enc_hint(self, enc: E.VEnc | None, v: dict, cont: E.Container | None = None):
+        self.codec_hint.setText("")
         if cont is not None and cont.audio_only:
             self.v_enc_hint.setText(t("audio_only_hint"))
             return
         if enc is None:
-            self.v_enc_hint.setText(t("copy_hint") if v.get("mode") == "copy" else "")
+            self.v_enc_hint.setText(t("copy_hint") if v.get("mode") == "copy" else
+                                    t("v_none_hint") if v.get("mode") == "none" else "")
             return
         if not self.av_ready:
             self.v_enc_hint.setText(t("enc_checking"))
@@ -1208,6 +819,7 @@ class MainWindow(QMainWindow):
         elif src is not None and src.hdr == "Dolby Vision":
             txt += "\n⚠ " + t("w_dv")
         self.v_enc_hint.setText(txt)
+        self.codec_hint.setText(txt)
 
     def _speed_label(self):
         x = self.v_speed.value()
@@ -1216,9 +828,7 @@ class MainWindow(QMainWindow):
     def _show_info(self, j: J.Job | None):
         if j is None:
             self.i_name.setText(t("info_none"))
-            self.i_text.setText("")
-            self.i_thumb.setPixmap(QPixmap())
-            self.i_thumb.setText(t("info_drop"))
+            self.i_text.setText(t("info_drop"))
             return
         self.i_name.setText(j.name)
         info = j.info
@@ -1266,92 +876,10 @@ class MainWindow(QMainWindow):
         self._show_thumb(j)
 
     def _show_thumb(self, j: J.Job):
-        pm = self.thumbs.get(j.uid)
-        if pm is None:
-            self.i_thumb.setPixmap(QPixmap())
-            self.i_thumb.setText("")
-            if j.info is not None and j.info.video is not None:
-                self.worker.thumb(j.uid, j.src, max(0.0, j.info.duration * 0.12))
-            return
-        w = max(200, self.i_thumb.width() - 12)
-        self.i_thumb.setPixmap(pm.scaled(w, 260, Qt.KeepAspectRatio, Qt.SmoothTransformation))
-
-    def _fill_tracks(self):
-        self.tr_view.blockSignals(True)
-        self.tr_view.clear()
-        jobs = self.selected_jobs()
-        if len(jobs) != 1 or jobs[0].info is None or jobs[0].info.error:
-            self.tr_hint.setText(t("tr_pick_one"))
-            self.tr_view.blockSignals(False)
-            self.tr_view.setEnabled(False)
-            return
-        j = jobs[0]
-        self.tr_view.setEnabled(j.status in EDITABLE)
-        self.tr_hint.setText(t("tr_hint"))
-        pl = J.plan(j)
-        out_audio = {s.index: c for s, c in pl["audio"]}
-        out_subs = {s.index for s, _ in pl["subs"]}
-        for s in j.info.streams:
-            if s.kind not in ("video", "audio", "subtitle") or s.cover:
-                continue
-            it = QTreeWidgetItem(self.tr_view)
-            it.setData(0, Qt.UserRole, s.index)
-            icon = {"video": "fa6s.film", "audio": "fa6s.volume-high", "subtitle": "fa6s.closed-captioning"}[s.kind]
-            it.setIcon(1, style.icon(icon, style.MUTED))
-            it.setText(0, str(s.index))
-            line = {"video": P.video_line, "audio": P.audio_line, "subtitle": P.sub_line}[s.kind](s)
-            it.setText(1, line + (f" — {s.title}" if s.title else ""))
-            it.setToolTip(1, it.text(1))
-            it.setText(2, s.lang_label())
-            if s.kind == "video":
-                it.setText(3, t("v_copy") if j.settings["video"].get("mode") == "copy" else t("tr_encode"))
-                continue
-            keep = s.index in out_audio if s.kind == "audio" else s.index in out_subs
-            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
-            it.setCheckState(0, Qt.Checked if keep else Qt.Unchecked)
-            if s.kind == "audio":
-                box = QComboBox()
-                box.addItem(t("tr_default") + (f" ({self._a_label(out_audio.get(s.index))})" if keep else ""), "")
-                box.addItem(t("a_copy"), "copy")
-                for a in E.AUDIO:
-                    box.addItem(a.label.split(" (")[0], a.id)
-                box.setCurrentIndex(max(0, box.findData(j.track(s).get("codec", ""))))
-                box.currentIndexChanged.connect(lambda _i, b=box, idx=s.index: self._track_codec(idx, b.currentData()))
-                self.tr_view.setItemWidget(it, 3, box)
-            else:
-                it.setText(3, ("mov_text" if j.settings.get("container") == "mp4" else t("a_copy")) if keep else "")
-        self.tr_view.blockSignals(False)
-
-    @staticmethod
-    def _a_label(codec: str | None) -> str:
-        if not codec:
-            return ""
-        return t("a_copy") if codec == "copy" else E.A_BY_ID[codec].label.split(" (")[0]
-
-    def _track_toggled(self, it: QTreeWidgetItem, col: int):
-        jobs = self.selected_jobs(editable=True)
-        if len(jobs) != 1 or col != 0:
-            return
-        j = jobs[0]
-        idx = str(it.data(0, Qt.UserRole))
-        j.tracks.setdefault(idx, {})["keep"] = it.checkState(0) == Qt.Checked
-        self._refresh(j)
-        self._queue_changed()
-        QTimer.singleShot(0, self._fill_tracks)
-        self._show_info(j)
-        self.meta_tab.set_job(j, True)
-
-    def _track_codec(self, idx: int, codec: str):
-        jobs = self.selected_jobs(editable=True)
-        if len(jobs) != 1:
-            return
-        j = jobs[0]
-        j.tracks.setdefault(str(idx), {})["codec"] = codec or ""
-        if codec:
-            j.tracks[str(idx)]["keep"] = True
-        self._refresh(j)
-        self._queue_changed()
-
+        """The card's picture: asked once per task (a frame at 12 % of the film)."""
+        if j.uid not in self.thumbs and j.info is not None and j.info.video is not None and not j.info.error:
+            self.thumbs[j.uid] = QPixmap()
+            self.worker.thumb(j.uid, j.src, max(0.0, j.info.duration * 0.12))
     # ── output / priority ─────────────────────────────────────
     def _out_mode_changed(self):
         mode = self.o_mode.currentData()
@@ -1361,21 +889,65 @@ class MainWindow(QMainWindow):
                 self.o_mode.setCurrentIndex(0)
                 return
         d = self.cfg.get("out_dir", "")
-        self.o_dir.setText(_elide_path(d, 44) if mode == "folder" else "")
+        self.o_dir.setText(_elide_path(d, 60) if mode == "folder" else "")
+        self.o_dir.setVisible(mode == "folder")
         self.o_dir.setToolTip(d)
         self.o_pick.setVisible(mode == "folder")
         config.save(self.cfg)
+        self._show_out_path()
 
+    def _show_out_path(self):
+        """The result's path of the selected task (Streams → Save files)."""
+        if not hasattr(self, "o_path"):
+            return
+        jobs = self.selected_jobs()
+        if len(jobs) == 1:
+            j = jobs[0]
+            p = j.out if j.status in ("done", "run", "pause") and j.out else J.out_name(j, self.cfg)
+            self.o_path.setText(p)
+            self.o_path.setEnabled(j.status in EDITABLE and j is not self.current)
+        else:
+            self.o_path.setText("")
+            self.o_path.setEnabled(False)
+
+    def _out_path_typed(self):
+        jobs = self.selected_jobs(editable=True)
+        text = self.o_path.text().strip()
+        if len(jobs) != 1 or not text:
+            return
+        j = jobs[0]
+        if os.path.normcase(text) != os.path.normcase(J.out_name(j, self.cfg)):
+            j.dest = text
+            self._refresh(j)
+            self._queue_changed()
+        self._show_out_path()
+
+    def save_as(self):
+        """«Save as»: where the selected task's result goes (its extension follows the container)."""
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1:
+            self._toast(t("pick_one_edit"))
+            return
+        j = jobs[0]
+        c = E.container(j.settings.get("container", "mkv"))
+        path, _ = QFileDialog.getSaveFileName(self, t("save_as"), J.out_name(j, self.cfg),
+                                              f"{c.label} (*.{c.ext});;{t('all_files')} (*)")
+        if not path:
+            return
+        j.dest = path
+        self._refresh(j)
+        self._queue_changed()
+        self._show_out_path()
     def _pick_out_dir(self) -> bool:
         d = QFileDialog.getExistingDirectory(self, t("out_pick"), self.cfg.get("out_dir") or self.cfg.get("last_dir", ""))
         if not d:
             return False
         self.cfg["out_dir"] = d
-        self.o_dir.setText(_elide_path(d, 44))
+        self.o_dir.setText(_elide_path(d, 60))
         self.o_dir.setToolTip(d)
         config.save(self.cfg)
+        self._show_out_path()
         return True
-
     def _prio_changed(self):
         self.cfg["priority"] = self.prio.currentData()
         if self.runner.running:
@@ -1399,7 +971,7 @@ class MainWindow(QMainWindow):
             return
         self.running = True
         self.log.clear()
-        self.tabs.setCurrentWidget(self.status_tab)
+        self.show_side("status")
         self._next()
 
     def _next(self):
@@ -1430,6 +1002,8 @@ class MainWindow(QMainWindow):
         self.st_name.setText(f"{j.name}  →  {os.path.basename(out)}")
         self.st["encoder"].setText(self._enc_text(j))
         self._last_stat = {}
+        self._run_log = []
+        self._run_started = time.time()
         self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"))
         self._update_buttons()
         self._queue_changed()
@@ -1464,6 +1038,7 @@ class MainWindow(QMainWindow):
 
     def _on_log(self, line: str):
         self.log.appendPlainText(line)
+        self._run_log.append(line)
 
     def _on_finished(self, ok: bool, err: str):
         j = self.current
@@ -1487,6 +1062,7 @@ class MainWindow(QMainWindow):
             else:
                 j.status, j.error, j.out = "error", err, ""
                 self.log.appendPlainText("✗ " + err)
+            self._save_log(j)
             self._refresh(j)
             sel = self.selected_jobs()
             if sel and sel[0] is j:
@@ -1496,6 +1072,26 @@ class MainWindow(QMainWindow):
         self._queue_changed()
         if self.running:
             QTimer.singleShot(200, self._next)
+
+    def _save_log(self, j: J.Job):
+        """The conversion's log file (Settings → keep logs): what, into what, the result, all of ffmpeg."""
+        lines, self._run_log = self._run_log, []
+        if not self.cfg.get("save_logs", True):
+            return
+        cmd = lines[0][2:] if lines and lines[0].startswith("$ ") else ""
+        path = logs.save(j.src, j.out, j.status, j.error, j.elapsed, j.out_size,
+                         J.describe(j.settings, self.av if self.av_ready else None, t), cmd,
+                         lines[1:] if cmd else lines, j.settings,
+                         bool(self.cfg.get("log_next_to_output")), self._run_started or None)
+        if path:
+            j.log_path = path
+
+    def open_log(self, j: J.Job | None):
+        if j is None or not j.log_path or not os.path.isfile(j.log_path):
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(j.log_path))
 
     def _queue_done(self):
         self.running = False
@@ -1527,9 +1123,13 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1500, self.close)
 
     def toggle_pause(self):
-        if self.tabs.currentWidget() is self.trim_tab:          # Space on the Trim tab plays the preview
+        """Space: the preview plays / stops while it is shown, otherwise the encoding pauses."""
+        if self.center.currentIndex() == 0 and self.trim_tab.preview is not None and self.trim_tab.job is not None:
             self.trim_tab.toggle_play()
             return
+        self.toggle_queue_pause()
+
+    def toggle_queue_pause(self):
         if not self.runner.running:
             return
         on = not self.runner.paused
@@ -1538,7 +1138,6 @@ class MainWindow(QMainWindow):
             self._refresh(self.current)
         self._update_buttons()
         self._update_total()
-
     def stop_queue(self):
         self.running = False
         if self.runner.running:
@@ -1577,7 +1176,7 @@ class MainWindow(QMainWindow):
 
     # ── system usage ──────────────────────────────────────────
     def _sys_tick(self):
-        if self.tabs.currentWidget() is not self.status_tab or not self.isVisible():
+        if self.side_bar.currentIndex() != 5 or not self.isVisible():
             return
         try:
             import psutil
@@ -1638,21 +1237,6 @@ class MainWindow(QMainWindow):
             self._next()
 
     # ── menu, settings, updates ───────────────────────────────
-    def _main_menu(self):
-        m = QMenu(self)
-        m.addAction(style.icon("fa6s.gear"), t("settings") + "\tCtrl+,", self.settings_dialog)
-        m.addAction(style.icon("fa6s.microchip"), t("encoders_here"), self.encoders_dialog)
-        m.addSeparator()
-        from . import updater
-        if updater.can_self_update():
-            m.addAction(style.icon("fa6s.cloud-arrow-down"), t("upd_check_now"), lambda: self.check_updates(True))
-        m.addAction(style.icon("fa6s.circle-info"), t("about"), self.about)
-        btn = self.sender()
-        if isinstance(btn, QToolButton):
-            m.exec(btn.mapToGlobal(btn.rect().bottomLeft()))
-        else:
-            m.exec(self.cursor().pos())
-
     def settings_dialog(self):
         from .dialogs import SettingsDialog
         lang, theme = self.cfg.get("language"), self.cfg.get("theme", "dark")
@@ -1765,7 +1349,7 @@ class MainWindow(QMainWindow):
         if g:
             self.restoreGeometry(QByteArray.fromBase64(g.encode()))
         sp = self.cfg.get("splitter")
-        if isinstance(sp, list) and len(sp) == 2 and all(isinstance(x, int) and x > 100 for x in sp):
+        if isinstance(sp, list) and len(sp) == 3 and all(isinstance(x, int) and x > 100 for x in sp):
             self.split.setSizes(sp)
 
     # ── window ────────────────────────────────────────────────

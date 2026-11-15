@@ -48,7 +48,7 @@ def test_containers_in_the_video_tab(qapp, media, data_dir):
     assert not aac.isEnabled()
     assert "W" in w.items[j.uid].text(3).upper() and "Opus" not in w.items[j.uid].text(3)
     w.v_cont.setCurrentIndex(w.v_cont.findData("mp3"))
-    assert not w.v_enc.isEnabled() and not w.v_mode.isEnabled()
+    assert not w.v_enc.isEnabled() and not w.v_on.isEnabled()
     assert w.items[j.uid].text(3).endswith("MP3")
     w.v_cont.setCurrentIndex(w.v_cont.findData("mov"))
     w.v_enc.setCurrentIndex(w.v_enc.findData("prores"))
@@ -64,7 +64,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     j = _one(qapp, w, os.path.join(media, "Movie (2017).mkv"))
     j.settings["video"].update(encoder="x264", speed=1, height=360)
     tr = w.trim_tab
-    w.tabs.setCurrentWidget(tr)
+    w.show_side("trim")
     assert pump(qapp, 15, lambda: tr.preview is not None and tr.bar.dur > 0)
     if mpvview.load_mpv() is not None:
         assert isinstance(tr.preview, mpvview.MpvView), mpvview.mpv_error()
@@ -95,7 +95,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     assert len(j.trim) == 1 and "⚠" in tr.summary.text()
     # metadata: the title, a sound track's language and default flag
     mt = w.meta_tab
-    w.tabs.setCurrentIndex(w.tabs.indexOf(w.meta_tab.parentWidget().parentWidget()))
+    w.show_side("meta")
     title = next(mt.tags.topLevelItem(i) for i in range(mt.tags.topLevelItemCount())
                  if mt.tags.topLevelItem(i).text(0) == "title")
     assert title.text(1) == "Test movie"
@@ -112,7 +112,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     assert j.meta["streams"]["1"]["lang"] == "ukr" and j.meta["streams"]["2"]["title"] == "English"
     # chapters: the source's «Two» (at 1 s) fell into the cut-out second → moved to its end (1.0 of the result)
     ch = w.chap_tab
-    w.tabs.setCurrentWidget(ch)
+    w.show_side("chapters")
     assert [ch.view.topLevelItem(i).text(2) for i in range(ch.view.topLevelItemCount())] == ["One", "Two"]
     assert ch.view.topLevelItem(1).text(1) == "0:01.000" and j.chapters is None
     ch.view.topLevelItem(1).setText(2, "Вторая")
@@ -141,6 +141,46 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     a = info.of("audio")
     assert (a[0].lang, a[0].default, a[1].default, a[1].title) == ("ukr", False, True, "English")
     assert [round(c[0], 1) for c in info.chapter_list] == [0.5]
+    # its log
+    from convert import logs
+    assert os.path.isfile(j.log_path) and os.path.dirname(j.log_path) == logs.logs_dir()
+    text = open(j.log_path, encoding="utf-8").read()
+    assert "Source:   " + j.src in text and "Status:   done" in text and "\n$ " in text and "concat" in text
+    h = logs.history()[0]
+    assert h["log"] == j.log_path and h["status"] == "done" and h["out"] == j.out
+    w.close()
+
+
+def test_resolution_and_logs(qapp, media, data_dir, tmp_path):
+    w = _win(qapp, out_mode="folder", out_dir=str(tmp_path / "out"), log_next_to_output=True)
+    j = _one(qapp, w, os.path.join(media, "Movie (2017).mkv"))
+    j.settings["video"].update(encoder="x264", speed=1)
+    w.v_res.setCurrentIndex(w.v_res.findData("720x576"))
+    assert (j.settings["video"]["width"], j.settings["video"]["height"]) == (720, 576)
+    assert "720×406" in w.v_res_hint.text()                                   # fit keeps 16:9
+    w.v_fit.setCurrentIndex(w.v_fit.findData("pad"))
+    assert "720×576" in w.v_res_hint.text().split("→")[1]
+    w.v_w.setValue(1000)                                                       # an own size
+    w.v_hh.setValue(500)
+    assert (j.settings["video"]["width"], j.settings["video"]["height"]) == (1000, 500)
+    assert w.v_res.currentText() == "1000×500"
+    w.v_res.setCurrentIndex(w.v_res.findData("custom"))
+    assert w.v_res.currentData() == "1000x500"                                # «own size…» keeps the value
+    assert "1000×500" in w.items[j.uid].text(3)
+    w.start_queue()
+    assert pump(qapp, 120, lambda: not w.running)
+    assert j.status == "done", j.error
+    v = P.probe(j.out).video
+    assert (v.width, v.height) == (1000, 500)
+    assert os.path.isfile(os.path.splitext(j.out)[0] + ".log")                 # the copy next to the result
+    w.close()
+    # logs off: none written
+    w = _win(qapp, out_mode="folder", out_dir=str(tmp_path / "out2"), save_logs=False)
+    j = _one(qapp, w, os.path.join(media, "dts.mkv"))
+    j.settings["video"].update(encoder="x264", speed=1)
+    w.start_queue()
+    assert pump(qapp, 120, lambda: not w.running)
+    assert j.status == "done" and not j.log_path
     w.close()
 
 

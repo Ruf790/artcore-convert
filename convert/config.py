@@ -31,6 +31,8 @@ DEFAULTS = {
     "hw_decode":     True,          # decode on the GPU too (-hwaccel auto) when the encoder is a hardware one
     "keep_queue":    True,          # the queue comes back on the next start
     "notify":        True,          # a tray message when the queue is done (window not active)
+    "save_logs":     True,          # a log file of every conversion in <data>\logs (the Log tab)
+    "log_next_to_output": False,    # and a copy next to the result (name.log)
     "encoders":      {},            # cache of the hardware test: {ffmpeg version: {encoder: ok}}
 }
 

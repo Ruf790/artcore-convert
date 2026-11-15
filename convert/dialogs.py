@@ -38,7 +38,8 @@ def _hint(text: str) -> QLabel:
 
 class SettingsDialog(QDialog):
     CHECKS = [("grp_start", ("single_window", "keep_queue", "check_updates", "notify")),
-              ("grp_encode", ("hw_decode", "overwrite"))]
+              ("grp_encode", ("hw_decode", "overwrite")),
+              ("grp_logs", ("save_logs", "log_next_to_output"))]
 
     def __init__(self, cfg: dict, parent=None):
         super().__init__(parent)

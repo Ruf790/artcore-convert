@@ -219,3 +219,52 @@ def test_job_roundtrip_with_edits():
     k = J.Job.from_dict(j.to_dict())
     assert (k.trim, k.trim_cut, k.meta, k.chapters) == (j.trim, True, j.meta, j.chapters) and k.edited
     assert not J.Job.from_dict(J.Job("/y.mkv", J.merged({})).to_dict()).edited
+
+
+# ── resolution ───────────────────────────────────────────────
+def test_resolution_math():
+    j = J.Job("/dvd.vob", J.merged({}))
+    j.info = P.MediaInfo("/dvd.vob", duration=10)
+    j.info.streams = [P.Stream(0, "video", codec="mpeg2video", width=720, height=576, sar="64:45")]
+    assert J.scale_filters(j) == [] and J.out_size(j) == (720, 576)          # as the source
+    j.settings["video"].update(width=1280, height=720)                       # fit, no upscale: square pixels only
+    assert J.scale_filters(j) == ["scale=1024:576:flags=lanczos", "setsar=1"] and J.out_size(j) == (1024, 576)
+    j.settings["video"]["upscale"] = True
+    assert J.out_size(j) == (1280, 720)
+    j.settings["video"].update(width=720, height=576, fit="stretch")
+    assert J.scale_filters(j) == ["scale=720:576:flags=lanczos", "setsar=1"]  # anamorphic → square, same size
+    j.info.streams[0] = P.Stream(0, "video", codec="h264", width=1920, height=1080, sar="1:1")
+    j.settings["video"].update(fit="pad", upscale=False)
+    assert J.scale_filters(j) == ["scale=720:406:flags=lanczos", "setsar=1",
+                                  "pad=720:576:(720-iw)/2:(576-ih)/2:color=black"]
+    j.settings["video"].update(width=0, height=720, fit="fit")              # 1.0 presets: a height alone
+    assert J.out_size(j) == (1280, 720) and J.res_label(j.settings["video"]) == "720p"
+    j.info.streams[0] = P.Stream(0, "video", codec="h264", width=3840, height=1600, sar="1:1")
+    j.settings["video"].update(width=1920, height=1080)
+    assert J.out_size(j) == (1920, 800)                                     # wide films stay wide
+    assert J.res_label({"width": 720, "height": 576}) == "720×576"
+
+
+def test_resolution_encode(qapp, media, tmp_path, av):
+    j = _job(media, "dts.mkv", video={"encoder": "x264", "speed": 1, "width": 720, "height": 576, "fit": "pad"})
+    info, _ = _encode(qapp, j, av, tmp_path)
+    assert (info.video.width, info.video.height) == (720, 576)
+    j = _job(media, "dts.mkv", video={"encoder": "x264", "speed": 1, "width": 1280, "height": 720, "upscale": True})
+    info, _ = _encode(qapp, j, av, tmp_path, "up")
+    assert (info.video.width, info.video.height) == (1280, 720)
+
+
+def test_per_track_audio_and_language(media, av):
+    j = _job(media, "Movie (2017).mkv", video={"mode": "copy"}, audio={"codec": "ac3", "kbps": 448})
+    j.tracks = {"2": {"codec": "opus", "kbps": 96, "channels": "stereo", "normalize": True}}
+    a = " ".join(J.build_args(j, "ffmpeg", "/o.mkv", av))
+    assert "-c:a:0 ac3" in a and "-b:a:0 448k" in a and "-filter:a:0" not in a
+    assert "-c:a:1 libopus" in a and "-b:a:1 96k" in a and "-filter:a:1 loudnorm" in a
+    j = _job(media, "Movie (2017).mkv", lang="eng")
+    p = J.plan(j)
+    assert [s.lang for s, _ in p["audio"]] == ["eng"] and not p["subs"]          # the Russian subtitles too
+    j = _job(media, "Movie (2017).mkv", lang="rus")
+    p = J.plan(j)
+    assert [s.lang for s, _ in p["audio"]] == ["rus"] and len(p["subs"]) == 1
+    j = _job(media, "Movie (2017).mkv", lang="jpn")                               # none: the first audio stays
+    assert len(J.plan(j)["audio"]) == 1

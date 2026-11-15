@@ -3,7 +3,8 @@
 Settings are a plain dict (JSON in the queue / presets):
   container  mkv | mp4 | mov | webm | avi | ts | m2ts | gif | mka | mp3 | m4a | flac | opus | ogg | wav | ac3
   video      {mode: encode | copy, encoder: auto_hevc | nvenc_hevc | x265 | …, rc: quality | bitrate | size,
-              quality, bitrate (kbit/s), size_mb, speed 1..7, bits: auto | 8 | 10, height: 0 = as is,
+              quality, bitrate (kbit/s), size_mb, speed 1..7, bits: auto | 8 | 10, width / height: the frame
+              (0 = as is; height alone = a 16:9 box), fit: fit | pad | stretch, upscale: bool,
               fps: 0 = as is, deint: auto | on | off}
   audio      {codec: auto | copy | aac | ac3 | eac3 | opus | flac | mp3, kbps: 0 = auto, channels: keep | stereo | 5.1,
               normalize: bool, tracks: all | first}
@@ -27,9 +28,11 @@ from .probe import MediaInfo, Stream
 DEFAULT_SETTINGS = {
     "container": "mkv",
     "video": {"mode": "encode", "encoder": "auto_hevc", "rc": "quality", "quality": 0, "bitrate": 8000,
-              "size_mb": 4000, "speed": 5, "bits": "auto", "height": 0, "fps": 0, "deint": "auto"},
+              "size_mb": 4000, "speed": 5, "bits": "auto", "width": 0, "height": 0, "fit": "fit", "upscale": False,
+              "fps": 0, "deint": "auto"},
     "audio": {"codec": "auto", "kbps": 0, "channels": "keep", "normalize": False, "tracks": "all"},
     "subs": "all",
+    "lang": "",          # «Select streams»: only the audio / subtitles of this language ("" = any)
     "meta": True,
 }
 
@@ -95,12 +98,15 @@ class Job:
     trim_cut: bool = False                          # True: the pieces are cut out, the rest is kept
     meta: dict = field(default_factory=dict)        # {"tags": {…} | None, "streams": {"index": {…}}}
     chapters: list | None = None                    # None = from the source; [[start, title], …]
+    dest: str = ""                                  # «Save as…»: the result's path (the extension follows the format)
+    log_path: str = ""                              # the log of the last run
 
     def to_dict(self) -> dict:
         return {"src": self.src, "settings": self.settings, "preset": self.preset, "tracks": self.tracks,
                 "status": self.status if self.status in ("done", "error", "stop", "skip") else "wait",
                 "out": self.out if self.status == "done" else "", "error": self.error,
-                "trim": self.trim, "trim_cut": self.trim_cut, "meta": self.meta, "chapters": self.chapters}
+                "trim": self.trim, "trim_cut": self.trim_cut, "meta": self.meta, "chapters": self.chapters,
+                "dest": self.dest, "log": self.log_path}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Job":
@@ -108,6 +114,8 @@ class Job:
                 tracks={str(k): v for k, v in (d.get("tracks") or {}).items() if isinstance(v, dict)})
         j.trim = [[float(a), float(b)] for a, b in (d.get("trim") or []) if float(b) > float(a)]
         j.trim_cut = bool(d.get("trim_cut"))
+        j.dest = str(d.get("dest") or "")
+        j.log_path = str(d.get("log") or "")
         j.meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         ch = d.get("chapters")
         j.chapters = [[float(c[0]), str(c[1])] for c in ch if isinstance(c, (list, tuple)) and len(c) >= 2] \
@@ -125,6 +133,15 @@ class Job:
 
     def track(self, s: Stream) -> dict:
         return self.tracks.get(str(s.index), {})
+
+    def acfg(self, s: Stream) -> dict:
+        """The audio settings of one track: the common ones with this track's own (Streams tab) laid over."""
+        out = dict(self.settings.get("audio", {}))
+        t = self.track(s)
+        for k in ("kbps", "channels", "normalize"):
+            if k in t:
+                out[k] = t[k]
+        return out
 
     def smeta(self, s: Stream) -> dict:
         """The user's edits of a stream's language / title / default / forced (Metadata tab)."""
@@ -298,7 +315,7 @@ def fit_container(st: dict) -> dict:
 def multi_encode(job: Job) -> bool:
     """Several pieces with the video encoded: they are joined by the concat filter."""
     c = E.container(job.settings.get("container", "mkv"))
-    return len(segments(job)) > 1 and job.settings.get("video", {}).get("mode") != "copy" and \
+    return len(segments(job)) > 1 and job.settings.get("video", {}).get("mode", "encode") == "encode" and \
         not c.audio_only and job.info is not None and job.info.video is not None
 
 
@@ -313,7 +330,7 @@ def plan(job: Job) -> dict:
     w = out["warnings"]
     v = info.of("video")
     vcfg = st.get("video", {})
-    if v and not c.audio_only:
+    if v and not c.audio_only and vcfg.get("mode") != "none":
         out["video"] = [v[0]]
         if vcfg.get("mode") == "copy":
             if not c.takes_video(v[0].codec):
@@ -328,7 +345,10 @@ def plan(job: Job) -> dict:
     recut = bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy"
     out["same_rate"] = set()
     a_cfg = st.get("audio", {})
+    lang = (st.get("lang") or "").lower()
     audios = info.of("audio")
+    if lang:                                                      # «any language» or only this one
+        audios = [s for s in audios if (s.lang or "").lower() == lang] or audios[:1]
     if a_cfg.get("tracks") == "first":
         audios = audios[:1]
     if c.audio is not None and not c.audio:                       # GIF: no sound
@@ -343,8 +363,9 @@ def plan(job: Job) -> dict:
             w.append("w_one_audio")
             break
         codec = t.get("codec") or a_cfg.get("codec", "auto")
+        tc = job.acfg(s)
         if codec == "auto":
-            changes = a_cfg.get("channels", "keep") != "keep" or a_cfg.get("normalize")
+            changes = tc.get("channels", "keep") != "keep" or tc.get("normalize")
             codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
         if codec == "copy" and not c.takes_audio(s.codec):
             codec = c.a_default
@@ -360,6 +381,8 @@ def plan(job: Job) -> dict:
             w.append("w_trim_audio")
         out["audio"].append((s, codec))
     subs = info.of("subtitle")
+    if lang:
+        subs = [s for s in subs if (s.lang or "").lower() == lang]
     mode = st.get("subs", "all")
     if mode == "none":
         subs = []
@@ -411,14 +434,94 @@ def video_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
         fps = 15.0
     if fps and src is not None and (not src.fps or fps < src.fps - 0.01):
         out.append(f"fps={fps:g}")
-    h = int(v.get("height", 0) or 0)
-    if gif and not h and src is not None and src.height > 480:
-        h = 480
-    if h and src is not None and src.height and h < src.height:
-        out.append(f"scale=-2:{h}:flags=lanczos")
+    out += scale_filters(job, enc)
     if gif:
         out.append("split[g0][g1];[g0]palettegen=stats_mode=diff[gp];[g1][gp]paletteuse=dither=bayer:bayer_scale=5")
     return out
+
+
+RESOLUTIONS = ((3840, 2160), (2560, 1440), (1920, 1080), (1280, 720), (1024, 576), (854, 480), (640, 360),
+               (720, 576), (720, 480), (640, 480))
+
+
+def _even(x: float) -> int:
+    return max(2, int(x / 2 + 0.5) * 2)
+
+
+def _ratio(s: str) -> float:
+    try:
+        a, b = str(s).split(":")
+        return float(a) / float(b) if float(a) > 0 and float(b) > 0 else 1.0
+    except (ValueError, ZeroDivisionError):
+        return 1.0
+
+
+def target_box(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
+    """The frame the user asked for (0, 0 = as the source). A height alone (1.0 presets) is a 16:9 box."""
+    v = job.settings.get("video", {})
+    w, h = int(v.get("width", 0) or 0), int(v.get("height", 0) or 0)
+    src = job.info.video if job.info else None
+    if enc is not None and enc.id == "gif" and not h and src is not None and src.height > 480:
+        h = 480
+    if h and not w:
+        w = _even(h * 16 / 9)
+    return (w, h) if w and h else (0, 0)
+
+
+def out_size(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
+    """The frame size of the result (what the scale filters make)."""
+    src = job.info.video if job.info else None
+    if src is None or not src.width:
+        return 0, 0
+    w, h = target_box(job, enc)
+    if not w:
+        return src.width, src.height
+    v = job.settings.get("video", {})
+    if v.get("fit", "fit") in ("stretch", "pad"):
+        return w, h
+    sar = _ratio(src.sar) if src.sar and src.sar not in ("0:1", "1:1") else 1.0
+    dw, dh = src.width * sar, float(src.height)
+    k = min(w / dw, h / dh)
+    if not v.get("upscale"):
+        k = min(k, 1.0)
+    return _even(dw * k), _even(dh * k)
+
+
+def scale_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
+    """Scale into the chosen frame: fit (inside, keeping the shape), pad (fit + black bars to exactly W×H),
+    stretch (exactly W×H). Anamorphic sources (DVD, SAR ≠ 1) become square pixels on the way."""
+    src = job.info.video if job.info else None
+    w, h = target_box(job, enc)
+    if src is None or not src.width or not w:
+        return []
+    v = job.settings.get("video", {})
+    mode = v.get("fit", "fit")
+    anamorphic = bool(src.sar) and src.sar not in ("0:1", "1:1") and abs(_ratio(src.sar) - 1.0) > 0.001
+    if mode == "stretch":
+        if (w, h) == (src.width, src.height) and not anamorphic:
+            return []
+        return [f"scale={w}:{h}:flags=lanczos", "setsar=1"]
+    sar = _ratio(src.sar) if anamorphic else 1.0
+    dw, dh = src.width * sar, float(src.height)
+    k = min(w / dw, h / dh)
+    if not v.get("upscale"):
+        k = min(k, 1.0)
+    ow, oh = _even(dw * k), _even(dh * k)
+    out = []
+    if (ow, oh) != (src.width, src.height) or anamorphic:
+        out += [f"scale={ow}:{oh}:flags=lanczos", "setsar=1"]
+    if mode == "pad" and (ow, oh) != (w, h):
+        out.append(f"pad={w}:{h}:({w}-iw)/2:({h}-ih)/2:color=black")
+    return out
+
+
+def res_label(v: dict) -> str:
+    w, h = int(v.get("width", 0) or 0), int(v.get("height", 0) or 0)
+    if not h:
+        return ""
+    if not w or w == _even(h * 16 / 9):
+        return f"{h}p"
+    return f"{w}×{h}"
 
 
 def audio_kbps(codec: str, channels: int, cfg: dict) -> int:
@@ -516,8 +619,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         else:
             bits = out_bits(job, enc)
             dur = out_duration(job)
-            a_total = sum(audio_kbps(cd, a.channels if a_cfg.get("channels") == "keep" else
-                                     (2 if a_cfg.get("channels") == "stereo" else 6), a_cfg) or
+            a_total = sum(audio_kbps(cd, a.channels if job.acfg(a).get("channels", "keep") == "keep" else
+                                     (2 if job.acfg(a).get("channels") == "stereo" else 6), job.acfg(a)) or
                           (a.bitrate // 1000 if cd == "copy" else 0) for a, cd in p["audio"])
             vv = dict(v)
             vv["audio_kbps"] = a_total
@@ -558,6 +661,7 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         args[vi:vi] = ["-map", "[vout]"]
     # audio
     for n, (s, codec) in enumerate(p["audio"]):
+        a_cfg = job.acfg(s)
         norm = a_cfg.get("normalize") and codec != "copy"
         if joined:
             if norm:
@@ -641,9 +745,13 @@ def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
 def out_name(job: Job, cfg: dict) -> str:
     """Where the result goes: next to the source or into the chosen folder, name + suffix, never over the
     source; an existing file gets « (2)» unless overwrite is on."""
+    ext = "." + E.container(job.settings.get("container", "mkv")).ext
+    if job.dest:                                         # chosen in «Save as…» (overwrite was asked there)
+        path = os.path.splitext(job.dest)[0] + ext
+        if os.path.normcase(os.path.abspath(path)) != os.path.normcase(os.path.abspath(job.src)):
+            return path
     stem = os.path.splitext(os.path.basename(job.src))[0]
     folder = cfg.get("out_dir") if cfg.get("out_mode") == "folder" and cfg.get("out_dir") else os.path.dirname(job.src)
-    ext = "." + E.container(job.settings.get("container", "mkv")).ext
     base = os.path.join(folder, stem + (cfg.get("out_suffix") or ""))
     path = base + ext
     if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(job.src)):
@@ -666,6 +774,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
     bits = []
     if c.audio_only:
         pass
+    elif v.get("mode") == "none":
+        bits.append(tr("v_none"))
     elif v.get("mode") == "copy":
         bits.append(tr("v_copy"))
     else:
@@ -691,8 +801,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
                 bits.append(f"{v.get('bitrate')} kbit/s")
             else:
                 bits.append(f"{v.get('size_mb')} MB")
-        if v.get("height"):
-            bits.append(f"{v['height']}p")
+        if res_label(v):
+            bits.append(res_label(v))
     a = st.get("audio", {})
     if a.get("codec") not in ("auto", "copy") and a.get("codec") in E.A_BY_ID:
         bits.append(E.A_BY_ID[a["codec"]].label.split(" (")[0])

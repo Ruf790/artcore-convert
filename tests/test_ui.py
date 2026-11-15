@@ -2,7 +2,7 @@
 import os
 
 from conftest import pump
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication
 
 from convert import config
@@ -25,6 +25,13 @@ def _close_popup_later(ms=300):
         if m is not None:
             m.close()
     QTimer.singleShot(ms, go)
+
+
+def _tracks(w) -> dict:
+    """Streams tab: {stream index: its «keep» checkbox}."""
+    from PySide6.QtWidgets import QCheckBox, QFrame
+    return {sec.property("stream"): sec.findChild(QCheckBox) for sec in w.tracks_box.findChildren(QFrame, "section")
+            if sec.property("stream") is not None}
 
 
 def test_queue_and_settings(qapp, media, data_dir, tmp_path):
@@ -50,8 +57,9 @@ def test_queue_and_settings(qapp, media, data_dir, tmp_path):
     for j in others[:2]:
         w.items[j.uid].setSelected(True)
     pump(qapp, 0.2)
-    w.v_h.setCurrentIndex(w.v_h.findData(720))
-    assert all(j.settings["video"]["height"] == 720 for j in [movie] + others[:2])
+    w.v_res.setCurrentIndex(w.v_res.findData("1280x720"))
+    assert all((j.settings["video"]["width"], j.settings["video"]["height"]) == (1280, 720)
+               for j in [movie] + others[:2])
     # a preset on the selection
     w.preset_box.setCurrentIndex(w.preset_box.findData("remux_mkv"))
     w._preset_picked()
@@ -66,16 +74,14 @@ def test_queue_and_settings(qapp, media, data_dir, tmp_path):
     w.view.clearSelection()
     w.items[movie.uid].setSelected(True)
     pump(qapp, 0.2)
-    assert w.tr_view.topLevelItemCount() == 4                    # video, 2 audio, subtitles
-    rus = w.tr_view.topLevelItem(1)
-    rus.setCheckState(0, Qt.Unchecked)
+    assert sorted(_tracks(w)) == [1, 2, 3]                       # 2 audio, subtitles (the video has its block)
+    _tracks(w)[1].setChecked(False)
     pump(qapp, 0.2)
     assert movie.tracks["1"]["keep"] is False
     # menus, the encoders dialog
     _close_popup_later()
     w._queue_menu(w.view.visualItemRect(w.items[movie.uid]).center())
-    _close_popup_later()
-    w._main_menu()
+    assert [a.text() for a in w.menuBar().actions()][1:4] == ["Файл", "Задания", "Лог"]
     _close_popup_later()
     w._preset_menu()
     from convert.dialogs import EncodersDialog, SettingsDialog
@@ -110,7 +116,7 @@ def test_run_queue(qapp, media, data_dir, tmp_path):
     w.jobs[1].settings["container"] = "mp4"
     w.start_queue()
     assert pump(qapp, 3, lambda: w.current is not None)
-    assert w.tabs.currentWidget() is w.status_tab and w.st_name.text()
+    assert w.side_bar.currentIndex() == 5 and w.center.currentIndex() == 1 and w.st_name.text()
     assert pump(qapp, 120, lambda: not w.running)
     a, b, c = w.jobs
     assert (a.status, b.status, c.status) == ("done", "done", "error")
