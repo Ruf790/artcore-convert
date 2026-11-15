@@ -480,7 +480,7 @@ TEXT_SUBS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 # ── self-check without the hardware ──────────────────────────
 GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params", "q:v", "bf",
-           "threads"}
+           "threads", "forced-idr"}
 
 
 def check_options(e: VEnc) -> list[str]:

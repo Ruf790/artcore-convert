@@ -910,7 +910,6 @@ def _concat_graph(job: Job, p: dict, pcs, graph: list[str]) -> tuple[str | None,
     track). Returns the video label (or None) and the labels of the source's sound tracks."""
     v0 = p["video"][0] if p["video"] else None
     auds = [s for s, _c in p["audio"] if ext_no(s) is None]
-    files = sources(job)
     ins = ""
     if v0 is not None:
         W, H, sar0, fps0 = v0.width, v0.height, _sar(v0), v0.fps or 25.0
@@ -1180,6 +1179,11 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                     args[i] += f":pass={pass_n}:stats={E.x265_path(pass_prefix(job, work_dir) + '.x265.log')}"
             if pass_n:
                 args += E.pass_args(enc, pass_n, pass_prefix(job, work_dir))
+            sp = st.get("split") or {}
+            if split_on(job) and sp.get("mode") == "time":           # 1.4: a keyframe where every part begins
+                args += ["-force_key_frames", f"expr:gte(t,n_forced*{float(sp.get('minutes', 20)) * 60:g})"]
+                if enc.vendor == "nvidia":                          # (both passes: x264 keeps pass 1's types)
+                    args += ["-forced-idr", "1"]
             if mode == "pass1":
                 break
             args += F.fps_args(job)

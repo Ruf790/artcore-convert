@@ -2,7 +2,6 @@
 dragging tasks, the task list in a file, cards / rows, joining, external tracks, the split, two passes, the
 speed test — real encodes, results checked by ffprobe."""
 import os
-import shutil
 
 import pytest
 
@@ -120,7 +119,12 @@ def test_drag_order_save_load_rows(qapp, films, data_dir, tmp_path):
     assert [j.name for j in w.jobs] == ["Part3.mkv", "Part1.mkv", "Part2.mkv"]
     assert w.jobs[2].trim == [[0.2, 1.5]] and w.jobs[0].ext[0]["delay"] == 120
     assert w.jobs[0].settings["video"]["encoder"] == "x264"
-    assert w.load_task_list(str(tmp_path / "nope.acq")) == 0 or True
+    bad = tmp_path / "bad.acq"
+    bad.write_text("not json", encoding="utf-8")
+    from PySide6.QtCore import QTimer
+    from PySide6.QtWidgets import QApplication
+    QTimer.singleShot(300, lambda: QApplication.activeModalWidget() and QApplication.activeModalWidget().close())
+    assert w.load_task_list(str(bad)) == 0 and len(w.jobs) == 3
     w.close()
 
 
@@ -160,7 +164,7 @@ def test_join_external_two_pass_split(qapp, films, data_dir):
     _run_all(qapp, w)
     assert j.status == "done", j.error
     assert "pass1" in kinds and "main" in kinds
-    assert len(j.parts) >= 3 and j.out == j.parts[0] and all(os.path.isfile(p) for p in j.parts)
+    assert len(j.parts) == 4 and j.out == j.parts[0] and all(os.path.isfile(p) for p in j.parts)
     whole = os.path.splitext(j.parts[0])[0][:-3] + ".mkv"
     assert not os.path.exists(whole)                           # only the parts stay
     total = sum(P.probe(p).duration for p in j.parts)
