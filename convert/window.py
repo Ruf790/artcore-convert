@@ -732,10 +732,10 @@ class MainWindow(MainUI, QMainWindow):
             if len(ed) > 1:
                 m.addAction(style.icon("fa6s.object-group"), t("join_selected"), self.join_selected)
             if len(jobs) == 1 and j in ed:
-                m.addAction(style.icon("fa6s.link"), t("join_add") + "…", self.join_add_dialog)
+                m.addAction(style.icon("fa6s.link"), t("join_add") + "…", lambda: self.join_add_dialog())
                 if j.joins:
                     m.addAction(style.icon("fa6s.link-slash"), t("join_split"), lambda: self.join_undo(j))
-                m.addAction(style.icon("fa6s.plus"), t("ext_add") + "…", self.add_external_dialog)
+                m.addAction(style.icon("fa6s.plus"), t("ext_add") + "…", lambda: self.add_external_dialog())
             if j.log_path and os.path.isfile(j.log_path):
                 m.addAction(style.icon("fa6s.file-lines"), t("open_log"), lambda: self.open_log(j))
             m.addSeparator()
@@ -875,6 +875,8 @@ class MainWindow(MainUI, QMainWindow):
             self._toast(t("tr_pick_one"))
             return
         j = jobs[0]
+        if not isinstance(files, (list, tuple)):        # a menu's triggered(bool) must not pass for «files»
+            files = None
         if files is None:
             exts = " ".join("*" + e for e in VIDEO_EXT + AUDIO_EXT)
             files, _ = QFileDialog.getOpenFileNames(self, t("join_add"), os.path.dirname(j.src),
@@ -907,6 +909,8 @@ class MainWindow(MainUI, QMainWindow):
             self._toast(t("tr_pick_one"))
             return
         j = jobs[0]
+        if not isinstance(files, (list, tuple)):        # a button's clicked(bool) must not pass for «files»
+            files = None
         if files is None:
             a = " ".join("*" + e for e in J.EXT_AUDIO)
             sub = " ".join("*" + e for e in J.EXT_SUBS)
