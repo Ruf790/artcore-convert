@@ -147,7 +147,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     text = open(j.log_path, encoding="utf-8").read()
     # 1.6: the log in sections
     assert "ENCODING STARTED " in text and "Input file: " + j.src in text and "ENCODING COMPLETED! " in text
-    assert "Command: " in text and "concat" in text and "Encoded file path: " + j.out in text
+    assert "Command: " in text and "concat" in text and "Encoded file: " + j.out in text
     assert "Completed video stream at index: 0" in text and "Total file size: " in text
     h = logs.history()[0]
     assert h["log"] == j.log_path and h["status"] == "done" and h["out"] == j.out
