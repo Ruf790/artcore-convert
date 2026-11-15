@@ -1,9 +1,9 @@
 ﻿; ArtCore Convert installer — Inno Setup 6.3+
-; Build: run build.bat (FFmpeg + PyInstaller first, then this script).
+; Build: run build.bat (FFmpeg + libmpv + PyInstaller first, then this script).
 ; Expects the PyInstaller output (with ffmpeg\ inside) in dist\ArtCoreConvert\.
 
 #define AppName      "ArtCore Convert"
-#define AppVersion   "1.0.1"
+#define AppVersion   "1.1.0"
 #define AppPublisher "ArtCore"
 #define AppURL       "https://github.com/Ruf790/artcore-convert"
 #define AppExe       "ArtCoreConvert.exe"
@@ -47,8 +47,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 ru.GroupIntegration=Интеграция с Windows:
 en.GroupIntegration=Windows integration:
-ru.FileMenu=Пункт «Конвертировать в ArtCore Convert» в меню видеофайлов и папок
-en.FileMenu="Convert with ArtCore Convert" in the menu of video files and folders
+ru.FileMenu=Пункт «Конвертировать в ArtCore Convert» в меню видео- и аудиофайлов и папок
+en.FileMenu="Convert with ArtCore Convert" in the menu of video and audio files and folders
 ru.ConvertIn=Конвертировать в ArtCore Convert
 en.ConvertIn=Convert with ArtCore Convert
 
@@ -75,6 +75,9 @@ Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExe}"; Tasks: desktopic
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
 Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu
 Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
 Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
 Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu

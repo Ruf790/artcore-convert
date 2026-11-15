@@ -110,7 +110,7 @@ def test_run_queue(qapp, media, data_dir, tmp_path):
     w.jobs[1].settings["container"] = "mp4"
     w.start_queue()
     assert pump(qapp, 3, lambda: w.current is not None)
-    assert w.tabs.currentIndex() == 4 and w.st_name.text()
+    assert w.tabs.currentWidget() is w.status_tab and w.st_name.text()
     assert pump(qapp, 120, lambda: not w.running)
     a, b, c = w.jobs
     assert (a.status, b.status, c.status) == ("done", "done", "error")

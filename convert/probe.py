@@ -69,6 +69,8 @@ class MediaInfo:
     streams: list[Stream] = field(default_factory=list)
     chapters: int = 0
     error: str = ""
+    tags: dict = field(default_factory=dict)                 # the file's own tags (keys in lower case)
+    chapter_list: list = field(default_factory=list)         # [(start s, end s, title)]
 
     def of(self, kind: str) -> list[Stream]:
         return [s for s in self.streams if s.kind == kind and not s.cover]
@@ -103,7 +105,10 @@ def parse(path: str, j: dict) -> MediaInfo:
     info = MediaInfo(path=path, format=fmt.get("format_name", ""), format_long=fmt.get("format_long_name", ""),
                      duration=_num(fmt.get("duration")), size=int(_num(fmt.get("size"))),
                      bitrate=int(_num(fmt.get("bit_rate"))), title=tags.get("title", ""),
-                     chapters=len(j.get("chapters") or []))
+                     chapters=len(j.get("chapters") or []), tags=tags)
+    for ch in j.get("chapters") or []:
+        ct = {k.lower(): v for k, v in (ch.get("tags") or {}).items()}
+        info.chapter_list.append((_num(ch.get("start_time")), _num(ch.get("end_time")), ct.get("title", "")))
     for st in j.get("streams") or []:
         kind = st.get("codec_type", "")
         disp = st.get("disposition") or {}

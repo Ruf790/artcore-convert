@@ -16,14 +16,16 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QC
                                QScrollArea, QSlider, QSpinBox, QSplitter, QSystemTrayIcon, QTabWidget, QToolButton,
                                QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
 
-from . import APP_TITLE, VERSION, VIDEO_EXT, config, ff, style, winint
+from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
 from . import encoders as E
 from . import job as J
 from . import probe as P
+from .edit_tabs import ChaptersTab, MetaTab, TrimTab
 from .i18n import t
 from .runner import Runner
 
 COL_N, COL_FILE, COL_SRC, COL_PROFILE, COL_STATE = range(5)
+BUILD_ERRORS = ("no_encoder", "bad_copy", "bad_codec", "nothing_out")
 def state_icon(status: str):
     """The status icon of a queue row, in the colours of the theme."""
     name, color = {"wait": ("fa6s.clock", "MUTED"), "probe": ("fa6s.magnifying-glass", "MUTED"),
@@ -177,7 +179,7 @@ class MainWindow(QMainWindow):
         self.split.addWidget(self._build_tabs())
         self.split.setStretchFactor(0, 1)
         self.split.setStretchFactor(1, 0)
-        self.split.setSizes([740, 600])
+        self.split.setSizes([640, 700])
         v.addWidget(self.split, 1)
         v.addWidget(self._build_bottom())
         self._shortcuts()
@@ -282,7 +284,7 @@ class MainWindow(QMainWindow):
 
     def _build_tabs(self) -> QWidget:
         w = QWidget()
-        w.setMinimumWidth(520)
+        w.setMinimumWidth(600)
         lay = QVBoxLayout(w)
         lay.setContentsMargins(6, 12, 14, 10)
         lay.setSpacing(6)
@@ -295,7 +297,17 @@ class MainWindow(QMainWindow):
         self.tabs.addTab(self._scroll(self._tab_video()), t("tab_video"))
         self.tabs.addTab(self._scroll(self._tab_audio()), t("tab_audio"))
         self.tabs.addTab(self._tab_tracks(), t("tab_tracks"))
-        self.tabs.addTab(self._tab_status(), t("tab_status"))
+        self.trim_tab = TrimTab()
+        self.trim_tab.changed.connect(self._job_edited)
+        self.tabs.addTab(self.trim_tab, t("tab_trim"))
+        self.meta_tab = MetaTab()
+        self.meta_tab.changed.connect(self._job_edited)
+        self.tabs.addTab(self._scroll(self.meta_tab), t("tab_meta"))
+        self.chap_tab = ChaptersTab(self.trim_tab.position)
+        self.chap_tab.changed.connect(self._job_edited)
+        self.tabs.addTab(self.chap_tab, t("tab_chapters"))
+        self.status_tab = self._tab_status()
+        self.tabs.addTab(self.status_tab, t("tab_status"))
         lay.addWidget(self.tabs, 1)
         return w
 
@@ -343,8 +355,11 @@ class MainWindow(QMainWindow):
         box = QGroupBox(t("grp_format"))
         f = QFormLayout(box)
         self.v_cont = QComboBox()
-        self.v_cont.addItem("MKV (Matroska)", "mkv")
-        self.v_cont.addItem("MP4", "mp4")
+        self.v_cont.setMaxVisibleItems(20)
+        for c in E.CONTAINERS:
+            if c.audio_only and not self.v_cont.findData("mka") >= 0:
+                self.v_cont.insertSeparator(self.v_cont.count())
+            self.v_cont.addItem((t("audio_only") + ": " if c.audio_only else "") + c.label, c.id)
         self.v_cont.currentIndexChanged.connect(lambda: self._set(None, "container", self.v_cont.currentData()))
         f.addRow(t("container"), self.v_cont)
         self.v_mode = QComboBox()
@@ -718,8 +733,10 @@ class MainWindow(QMainWindow):
     # ── queue ─────────────────────────────────────────────────
     def add_files_dialog(self):
         exts = " ".join("*" + e for e in VIDEO_EXT)
+        aexts = " ".join("*" + e for e in AUDIO_EXT)
         files, _ = QFileDialog.getOpenFileNames(self, t("add_files"), self.cfg.get("last_dir", ""),
-                                                f"{t('video_files')} ({exts});;{t('all_files')} (*)")
+                                                f"{t('media_files')} ({exts} {aexts});;{t('video_files')} ({exts});;"
+                                                f"{t('audio_files')} ({aexts});;{t('all_files')} (*)")
         if files:
             self.cfg["last_dir"] = os.path.dirname(files[0])
             self.add_paths(files)
@@ -738,7 +755,7 @@ class MainWindow(QMainWindow):
                 for root, dirs, files in os.walk(p):
                     dirs.sort(key=str.lower)
                     for f in sorted(files, key=str.lower):
-                        if f.lower().endswith(VIDEO_EXT):
+                        if f.lower().endswith(VIDEO_EXT + AUDIO_EXT):
                             out.append(os.path.join(root, f))
             elif os.path.isfile(p):
                 out.append(p)
@@ -823,7 +840,8 @@ class MainWindow(QMainWindow):
         it.setToolTip(COL_FILE, j.src + (f"\n→ {j.out}" if j.out else ""))
         it.setText(COL_SRC, P.summary(j.info) if j.info is not None else "…")
         it.setToolTip(COL_SRC, it.text(COL_SRC))
-        it.setText(COL_PROFILE, J.describe(j.settings, self.av if self.av_ready else None, t))
+        it.setText(COL_PROFILE, ("✂ " if J.segments(j) else "") +
+                   J.describe(j.settings, self.av if self.av_ready else None, t))
         it.setToolTip(COL_PROFILE, it.text(COL_PROFILE))
         it.setIcon(COL_STATE, state_icon(j.status))
         if j.status in ("run", "pause"):
@@ -948,7 +966,7 @@ class MainWindow(QMainWindow):
         try:
             args = J.build_args(j, ff.ffmpeg() or "ffmpeg", J.out_name(j, self.cfg), self.av,
                                 bool(self.cfg.get("hw_decode", True)))
-        except RuntimeError as e:
+        except (RuntimeError, OSError) as e:
             self._toast(t(str(e)))
             return
         QApplication.clipboard().setText(" ".join(f'"{a}"' if " " in a else a for a in args))
@@ -977,7 +995,34 @@ class MainWindow(QMainWindow):
             self.scope.setText(t("scope_new"))
             self._show_info(None)
         self._fill_tracks()
+        self._edit_tabs()
         self._update_buttons()
+
+    def _edit_tabs(self):
+        """Trim / Metadata / Chapters show the one selected task."""
+        jobs = self.selected_jobs()
+        j = jobs[0] if len(jobs) == 1 else None
+        ed = j is not None and j.status in EDITABLE and j is not self.current
+        for tab in (self.trim_tab, self.meta_tab, self.chap_tab):
+            tab.set_job(j, ed)
+
+    def _job_edited(self):
+        """A per-file tab changed its task."""
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1:
+            return
+        j = jobs[0]
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        tab = self.sender()
+        for other in (self.trim_tab, self.meta_tab, self.chap_tab):
+            if other is not tab:
+                other.set_job(j, True)
+        if tab is self.trim_tab:
+            self._fill_tracks()
 
     def _shown_settings(self) -> dict:
         jobs = self.selected_jobs()
@@ -998,6 +1043,8 @@ class MainWindow(QMainWindow):
                 st.setdefault(section, {})[key] = value
             else:
                 st[key] = value
+            if key == "container":
+                J.fit_container(st)
         for j in jobs:
             if j.status in ("done", "error", "stop", "skip") and j is not self.current:
                 j.status, j.error, j.progress = ("wait" if j.info is not None and not j.info.error else j.status), \
@@ -1011,6 +1058,7 @@ class MainWindow(QMainWindow):
             self._load_settings()
             if key == "container":
                 self._fill_tracks()
+                self._edit_tabs()
                 j = self.selected_jobs()
                 self._show_info(j[0] if j else None)
 
@@ -1031,11 +1079,17 @@ class MainWindow(QMainWindow):
             lo, hi = enc.q_range
             self.v_q.setRange(lo, hi)
             self.v_q.setValue(int(v.get("quality") or enc.q_default))
-            self.v_q_hint.setText(t("q_hint", "CRF" if not enc.hw else "CQ" if enc.vendor == "nvidia" else "QP",
-                                    enc.q_default))
+            if enc.id == "prores":
+                self.v_q_hint.setText(t("q_hint_prores"))
+            elif enc.id == "gif":
+                self.v_q_hint.setText(t("q_hint_gif"))
+            else:
+                qn = "CRF" if not enc.hw and enc.family not in ("mpeg4", "mpeg2video") else \
+                    "CQ" if enc.vendor == "nvidia" else "QP" if enc.hw else "qscale"
+                self.v_q_hint.setText(t("q_hint", qn, enc.q_default))
             self.v_br.setValue(int(v.get("bitrate", 8000)))
             self.v_size.setValue(int(v.get("size_mb", 4000)))
-            rc = v.get("rc", "quality")
+            rc = v.get("rc", "quality") if enc.rc else "quality"
             {"quality": self.rc_q, "bitrate": self.rc_b, "size": self.rc_s}.get(rc, self.rc_q).setChecked(True)
             self.v_q.setEnabled(rc == "quality")
             self.v_br.setEnabled(rc == "bitrate")
@@ -1045,17 +1099,33 @@ class MainWindow(QMainWindow):
             sel(self.v_fps, int(v.get("fps", 0) or 0))
             sel(self.v_deint, v.get("deint", "auto"))
             self.v_meta.setChecked(bool(st.get("meta", True)))
-            enc_on = v.get("mode", "encode") != "copy"
+            cont = E.container(st.get("container", "mkv"))
+            enc_on = v.get("mode", "encode") != "copy" and not cont.audio_only
+            self.v_mode.setEnabled(not cont.audio_only and cont.id != "gif")
             for wdg in (self.v_enc, self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_h,
                         self.v_fps, self.v_deint):
                 wdg.setEnabled(enc_on)
+            if enc_on and not enc.rc:
+                for wdg in (self.rc_b, self.rc_s, self.v_br, self.v_size):
+                    wdg.setEnabled(False)
+                self.v_q.setEnabled(enc.id != "gif")
+            if enc_on and len(enc.bits) == 1:
+                self.v_bits.setEnabled(False)
             if not enc_on:
                 for wdg in (self.v_q, self.v_br, self.v_size):
                     wdg.setEnabled(False)
+            amodel = self.a_codec.model()
+            for i in range(self.a_codec.count()):
+                cid = self.a_codec.itemData(i)
+                item = amodel.item(i)
+                if item is not None and cid not in ("auto", "copy"):
+                    fits = cont.takes_audio(E.A_CODEC.get(cid, cid))
+                    item.setEnabled(fits)
+                    item.setToolTip("" if fits else t("not_in_container", cont.id.upper()))
             self._speed_label()
-            self._enc_hint(enc if enc_on else None, v)
+            self._enc_hint(enc if enc_on else None, v, cont)
             jobs = self.selected_jobs()
-            dur = jobs[0].info.duration if jobs and jobs[0].info else 0.0
+            dur = J.out_duration(jobs[0]) if jobs and jobs[0].info else 0.0
             self.v_size_hint.setText(t("size_hint", E.target_kbps(float(v.get("size_mb", 0)), dur, 0)) if dur else "")
             sel(self.a_codec, a.get("codec", "auto"))
             sel(self.a_kbps, int(a.get("kbps", 0) or 0))
@@ -1065,35 +1135,47 @@ class MainWindow(QMainWindow):
             sel(self.s_mode, st.get("subs", "all"))
             jobs_all = self.selected_jobs()
             locked = bool(jobs_all) and not self.selected_jobs(editable=True)
-            for tab in range(1, 4):
+            for tab in range(1, 4):                       # Video, Audio, Tracks (the edit tabs lock themselves)
                 self.tabs.widget(tab).setEnabled(not locked)
         finally:
             self._loading = False
 
     def _fill_encoders(self):
         cur = self.v_enc.currentData()
+        cont = E.container(self._shown_settings().get("container", "mkv"))
         self.v_enc.blockSignals(True)
         self.v_enc.clear()
+        self.v_enc.setMaxVisibleItems(24)
         model = self.v_enc.model()
+
+        def off(why: str):
+            item = model.item(self.v_enc.count() - 1)
+            item.setEnabled(False)
+            item.setToolTip(why)
         for fam in E.FAMILIES:
             e = self.av.resolve("auto_" + fam) if self.av_ready else None
             name = E.FAMILY_LABEL[fam] + " — " + t("enc_auto") + (f" ({self._vendor(e)})" if e else "")
             self.v_enc.addItem(name, "auto_" + fam)
+            if not cont.takes_video(fam):
+                off(t("not_in_container", cont.id.upper()))
         self.v_enc.insertSeparator(self.v_enc.count())
+        last = ""
         for e in E.VIDEO:
+            if e.family in ("vp9", "mpeg4") and last not in ("vp9", "mpeg4"):
+                self.v_enc.insertSeparator(self.v_enc.count())
+            last = e.family
             self.v_enc.addItem(f"{E.FAMILY_LABEL[e.family]} — {self._vendor(e)}", e.id)
             if self.av_ready and not self.av.ok.get(e.id):
-                item = model.item(self.v_enc.count() - 1)
-                item.setEnabled(False)
-                item.setToolTip(t("enc_missing") + (": " + self.av.errors[e.id] if e.id in self.av.errors else ""))
+                off(t("enc_missing") + (": " + self.av.errors[e.id] if e.id in self.av.errors else ""))
+            elif not cont.takes_video(e.family):
+                off(t("not_in_container", cont.id.upper()))
         i = self.v_enc.findData(cur)
         self.v_enc.setCurrentIndex(max(0, i))
         self.v_enc.blockSignals(False)
 
     @staticmethod
     def _vendor(e: E.VEnc) -> str:
-        return E.VENDOR_LABEL[e.vendor] if e.hw else {"x264": "x264", "x265": "x265", "svtav1": "SVT-AV1"}[e.id] + \
-            " (" + t("cpu") + ")"
+        return E.VENDOR_LABEL[e.vendor] if e.hw else E.CPU_LABEL.get(e.id, e.ffname) + " (" + t("cpu") + ")"
 
     def _enc_changed(self):
         eid = self.v_enc.currentData()
@@ -1103,7 +1185,10 @@ class MainWindow(QMainWindow):
                 self._set("video", "quality", 0)          # the new encoder's own default
                 self._load_settings()
 
-    def _enc_hint(self, enc: E.VEnc | None, v: dict):
+    def _enc_hint(self, enc: E.VEnc | None, v: dict, cont: E.Container | None = None):
+        if cont is not None and cont.audio_only:
+            self.v_enc_hint.setText(t("audio_only_hint"))
+            return
         if enc is None:
             self.v_enc_hint.setText(t("copy_hint") if v.get("mode") == "copy" else "")
             return
@@ -1114,6 +1199,8 @@ class MainWindow(QMainWindow):
             self.v_enc_hint.setText("⚠ " + t("enc_none_here"))
             return
         txt = t("enc_gpu") if enc.hw else t("enc_cpu")
+        if enc.id in ("gif", "prores", "xvid", "mpeg4", "mpeg2", "vp9"):
+            txt = t("enc_hint_" + enc.id)
         jobs = self.selected_jobs()
         src = jobs[0].info.video if jobs and jobs[0].info else None
         if src is not None and src.hdr and 10 not in enc.bits:
@@ -1148,6 +1235,14 @@ class MainWindow(QMainWindow):
             rows.append(f"<b>{t('i_title')}</b>: {_esc(info.title)}")
         if info.chapters:
             rows.append(f"<b>{t('i_chapters')}</b>: {info.chapters}")
+        segs = J.segments(j)
+        if segs:
+            rows.append(f"<b>{t('i_trim')}</b>: " + t("trm_total", J.fmt_tc(J.out_duration(j), False),
+                                                     P.fmt_time(info.duration), len(segs)))
+        edits = [t(k) for k, on in (("i_meta_edited", j.meta.get("tags") is not None or bool(j.meta.get("streams"))),
+                                    ("i_chap_edited", j.chapters is not None)) if on]
+        if edits:
+            rows.append(f"<span style='color:{style.MUTED}'>✎ " + ", ".join(edits) + "</span>")
         mut = style.MUTED
 
         def track(s, line):
@@ -1244,6 +1339,7 @@ class MainWindow(QMainWindow):
         self._queue_changed()
         QTimer.singleShot(0, self._fill_tracks)
         self._show_info(j)
+        self.meta_tab.set_job(j, True)
 
     def _track_codec(self, idx: int, codec: str):
         jobs = self.selected_jobs(editable=True)
@@ -1303,7 +1399,7 @@ class MainWindow(QMainWindow):
             return
         self.running = True
         self.log.clear()
-        self.tabs.setCurrentIndex(4)
+        self.tabs.setCurrentWidget(self.status_tab)
         self._next()
 
     def _next(self):
@@ -1320,7 +1416,7 @@ class MainWindow(QMainWindow):
             os.makedirs(os.path.dirname(out), exist_ok=True)
             args = J.build_args(j, ff.ffmpeg() or "ffmpeg", out, self.av, bool(self.cfg.get("hw_decode", True)))
         except (RuntimeError, OSError) as e:
-            j.status, j.error = "error", t(str(e)) if str(e) in ("no_encoder",) else str(e)
+            j.status, j.error = "error", t(str(e)) if str(e) in BUILD_ERRORS else str(e)
             self._refresh(j)
             QTimer.singleShot(0, self._next)
             return
@@ -1334,7 +1430,7 @@ class MainWindow(QMainWindow):
         self.st_name.setText(f"{j.name}  →  {os.path.basename(out)}")
         self.st["encoder"].setText(self._enc_text(j))
         self._last_stat = {}
-        self.runner.start(args, out, j.info.duration if j.info else 0.0, self.cfg.get("priority", "below"))
+        self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"))
         self._update_buttons()
         self._queue_changed()
 
@@ -1354,7 +1450,7 @@ class MainWindow(QMainWindow):
         self._refresh(j)
         self.st_bar.setValue(int(d["frac"] * 1000))
         self.st_bar.setFormat(f"{d['frac'] * 100:.1f}%  ·  {P.fmt_time(d['out_time'])} / "
-                              f"{P.fmt_time(j.info.duration if j.info else 0)}")
+                              f"{P.fmt_time(J.out_duration(j))}")
         self.st["elapsed"].setText(P.fmt_time(d["elapsed"]))
         self.st["eta"].setText(P.fmt_time(d["eta"]) if d["eta"] else "—")
         self.st["speed"].setText(f"{d['speed']:.2f}×" if d["speed"] else "—")
@@ -1373,6 +1469,11 @@ class MainWindow(QMainWindow):
         j = self.current
         self.current = None
         if j is not None:
+            for kind in ("pieces", "chapters"):                 # the small lists of Trim / Chapters
+                try:
+                    os.remove(J.work_file(j, kind))
+                except OSError:
+                    pass
             j.elapsed = self.runner.elapsed()
             if ok:
                 j.status, j.progress = "done", 1.0
@@ -1426,6 +1527,9 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(1500, self.close)
 
     def toggle_pause(self):
+        if self.tabs.currentWidget() is self.trim_tab:          # Space on the Trim tab plays the preview
+            self.trim_tab.toggle_play()
+            return
         if not self.runner.running:
             return
         on = not self.runner.paused
@@ -1473,7 +1577,7 @@ class MainWindow(QMainWindow):
 
     # ── system usage ──────────────────────────────────────────
     def _sys_tick(self):
-        if self.tabs.currentIndex() != 4 or not self.isVisible():
+        if self.tabs.currentWidget() is not self.status_tab or not self.isVisible():
             return
         try:
             import psutil
@@ -1703,6 +1807,7 @@ class MainWindow(QMainWindow):
         config.save(self.cfg)
         self.worker.stop()
         self.sys_timer.stop()
+        self.trim_tab.shutdown()
         self.taskbar.set(int(self.winId()), None)
         installer = getattr(self, "_installer", "")
         if installer:

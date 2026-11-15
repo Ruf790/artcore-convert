@@ -270,7 +270,7 @@ QDoubleSpinBox, QSpinBox {{ background: {PANEL2}; border: 1px solid {BORDER}; bo
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: 10px; margin-top: 12px; padding: 12px 10px 8px 10px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {MUTED}; }}
 QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; top: -1px; }}
-QTabBar::tab {{ background: transparent; padding: 7px 14px; color: {MUTED}; border: none; }}
+QTabBar::tab {{ background: transparent; padding: 7px 10px; color: {MUTED}; border: none; }}
 QTabBar::tab:selected {{ color: {STRONG}; border-bottom: 2px solid {ACCENT}; }}
 QTabBar#plTabs::tab {{ padding: 6px 8px 6px 12px; min-width: 60px; max-width: 220px; }}
 QTabBar#plTabs::tab:hover:!selected {{ color: {TEXT}; }}
