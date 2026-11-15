@@ -134,7 +134,7 @@ class TaskCard(QStyledItemDelegate):
         p.setRenderHint(QPainter.Antialiasing)
         sel = bool(option.state & QStyle.State_Selected)
         if sel:
-            p.fillRect(r, QColor(style.ACCENT))
+            p.fillRect(r, QColor(style.CARD_SEL))
         elif option.state & QStyle.State_MouseOver:
             p.fillRect(r, QColor(style.PANEL2))
         tw = int(r.height() * 16 / 9 * 0.62)
@@ -148,8 +148,9 @@ class TaskCard(QStyledItemDelegate):
         elif j.info is not None and j.info.video is None and not j.info.error:
             p.drawPixmap(thumb.center().x() - 16, thumb.center().y() - 16,
                          style.icon("fa6s.music", style.MUTED).pixmap(32, 32))
-        fg = QColor("#ffffff") if sel else QColor(style.TEXT)
-        mut = QColor("#e6ecff") if sel else QColor(style.MUTED)
+        fg = QColor(style.CARD_SEL_FG) if sel else QColor(style.TEXT)
+        mut = QColor(style.CARD_SEL_MUT) if sel else QColor(style.MUTED)
+        light_sel = sel and QColor(style.CARD_SEL).lightness() > 160      # XviD4PSP: light blue, dark text
         x0, x1 = thumb.right() + 8, r.right() - 6
         fm = p.fontMetrics()
         f = QFont(option.font)
@@ -172,11 +173,13 @@ class TaskCard(QStyledItemDelegate):
         p.drawText(QRect(x0, r.top() + 28, x1 - x0, 18), Qt.AlignLeft | Qt.AlignVCenter, line2)
         bar = QRect(x0, r.top() + 52, x1 - x0, 6)
         p.setPen(Qt.NoPen)
-        p.setBrush(QColor(255, 255, 255, 70) if sel else QColor(style.PANEL2))
+        p.setBrush(QColor(255, 255, 255, 70) if sel and not light_sel else
+                   QColor(255, 255, 255) if light_sel else QColor(style.PANEL2))
         p.drawRoundedRect(bar, 3, 3)
         frac = 1.0 if j.status == "done" else j.progress if j.status in ("run", "pause") else 0.0
         if frac > 0:
-            p.setBrush(QColor("#ffffff") if sel else QColor(style.OK if j.status == "done" else style.ACCENT))
+            p.setBrush(QColor("#ffffff") if sel and not light_sel else
+                       QColor(style.OK if j.status == "done" else style.ACCENT))
             p.drawRoundedRect(QRect(bar.left(), bar.top(), max(4, int(bar.width() * frac)), bar.height()), 3, 3)
         state = {"run": f"{t('s_run').upper()} {j.progress * 100:.1f}%", "pause": t("s_pause").upper(),
                  "error": t("s_error").upper()}.get(j.status, t("s_" + j.status).upper())
@@ -200,7 +203,7 @@ class TaskCard(QStyledItemDelegate):
 class TaskList(QTreeWidget):
     """The task list: tasks are put in order with the mouse (1.4); files dropped on it are added."""
     reordered = Signal()
-    files_dropped = Signal(list)
+    files_dropped = Signal(list, int)               # the files, the uid of the card they fell on (0: none)
 
     def __init__(self):
         super().__init__()
@@ -226,8 +229,10 @@ class TaskList(QTreeWidget):
         if e.mimeData().hasUrls():
             paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
             e.acceptProposedAction()
+            it = self.itemAt(e.position().toPoint())
+            uid = it.data(0, Qt.UserRole) if it is not None else 0
             if paths:
-                self.files_dropped.emit(paths)
+                self.files_dropped.emit(paths, int(uid or 0))
             return
         super().dropEvent(e)
         self.reordered.emit()
@@ -471,7 +476,7 @@ class MainUI:
         self.view.setStyleSheet(f"QTreeWidget#cards {{ background: {style.PANEL}; border: none; outline: none; }}"
                                 "QTreeWidget#cards::item { border: none; padding: 0; }")
         self.view.reordered.connect(self._on_reordered)
-        self.view.files_dropped.connect(self.add_paths)
+        self.view.files_dropped.connect(lambda paths, uid: self.add_incoming(paths, uid))
         self._apply_task_view()
         self.view.itemSelectionChanged.connect(self._select_changed)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
@@ -675,13 +680,15 @@ class MainUI:
         lay.addStretch(1)
         return w
 
-    def _section(self, text: str, right: QWidget | None = None, check: QCheckBox | None = None) -> QWidget:
+    def _section(self, text: str, right: QWidget | None = None, check: QCheckBox | None = None,
+                 fold: QWidget | None = None) -> QWidget:
         w = QFrame()
         w.setObjectName("section")
-        w.setStyleSheet(f"QFrame#section {{ background: {style.PANEL2}; border-top: 1px solid {style.BORDER};"
-                        f"border-bottom: 1px solid {style.BORDER}; }}")
+        w.setStyleSheet(style.section_css())
         lay = QHBoxLayout(w)
-        lay.setContentsMargins(10, 5, 10, 5)
+        lay.setContentsMargins(4 if fold is not None else 10, 5, 10, 5)
+        if fold is not None:
+            lay.addWidget(fold)
         if check is not None:
             lay.addWidget(check)
         lab = QLabel(text)
@@ -874,6 +881,59 @@ class MainUI:
             self._set("video", "mode", "copy" if self.v_enc.currentData() == "copy" else "encode")
 
     # the tracks of one file: a block per audio / subtitle track (keep, language, its own codec …)
+    # 1.6: the cards of the tracks fold like an accordion — an unticked track closes, a ticked one opens;
+    # the arrow on the left opens / closes a card by hand
+    def _fold_key(self, j, key) -> tuple:
+        return (j.uid, key)
+
+    def _fold_open(self, j, key, default: bool) -> bool:
+        return self.__dict__.setdefault("_fold_hand", {}).get(self._fold_key(j, key), default)
+
+    def _fold_button(self, j, key, is_open: bool) -> QToolButton:
+        b = QToolButton()
+        b.setObjectName("ctl")
+        b.setProperty("fold", True)
+        b.setAutoRaise(True)
+        b.setIcon(style.icon("fa6s.chevron-down" if is_open else "fa6s.chevron-right", style.TEXT))
+        b.setIconSize(QSize(11, 11))
+        b.setFixedSize(20, 20)
+        b.setToolTip(t("tr_fold_tip"))
+        b.clicked.connect(lambda _c=False, k=key, o=is_open: self._fold_toggle(j, k, not o))
+        return b
+
+    def _fold_toggle(self, j, key, on: bool):
+        self.__dict__.setdefault("_fold_hand", {})[self._fold_key(j, key)] = on
+        self._fill_tracks()
+
+    def _fold_body(self, j, key, body: QWidget, is_open: bool):
+        """Show or hide the card's body; if it changed since the last time the panel was built, slide."""
+        shown = self.__dict__.setdefault("_fold_shown", {})
+        k = self._fold_key(j, key)
+        was = shown.get(k)
+        shown[k] = is_open
+        body.setProperty("foldOpen", is_open)
+        if was is None or was == is_open or not self.isVisible():
+            body.setVisible(is_open)
+            return
+        from PySide6.QtCore import QEasingCurve, QPropertyAnimation
+        full = max(1, body.sizeHint().height())
+        body.setVisible(True)
+        body.setMaximumHeight(0 if is_open else full)
+        an = QPropertyAnimation(body, b"maximumHeight", body)
+        an.setDuration(160)
+        an.setEasingCurve(QEasingCurve.OutCubic)
+        an.setStartValue(0 if is_open else full)
+        an.setEndValue(full if is_open else 0)
+
+        def done(b=body, o=is_open):
+            try:
+                b.setMaximumHeight(16777215)
+                b.setVisible(o)
+            except RuntimeError:                        # the panel was built again meanwhile
+                pass
+        an.finished.connect(done)
+        an.start()
+
     def _fill_tracks(self):
         while self.tracks_lay.count():
             it = self.tracks_lay.takeAt(0)
@@ -909,6 +969,7 @@ class MainUI:
             cb.setEnabled(ed)
             cb.setToolTip(t("tr_keep_tip"))
             cb.toggled.connect(lambda on, idx=s.index: self._track_keep(idx, on))
+            is_open = self._fold_open(j, s.index, keep)
             lang = QComboBox()
             lang.setObjectName("trackLang")
             from .edit_tabs import LANGS
@@ -921,7 +982,7 @@ class MainUI:
             lang.setEnabled(ed)
             lang.currentIndexChanged.connect(lambda _i, b=lang, st=s: self._track_lang(st, b.currentData()))
             line = (P.audio_line(s) if audio else P.sub_line(s)) + (f" — {s.title}" if s.title else "")
-            head = self._section(f"#{s.index} " + line, lang, cb)
+            head = self._section(f"#{s.index} " + line, lang, cb, self._fold_button(j, s.index, is_open))
             head.setProperty("stream", s.index)
             self.tracks_lay.addWidget(head)
             body = QWidget()
@@ -1007,7 +1068,9 @@ class MainUI:
                 g.addWidget(QLabel(t("codec") + ":"), 0, 0)
                 g.addWidget(QLabel(text), 0, 1)
             g.setColumnStretch(1, 1)
+            body.setProperty("stream", s.index)
             self.tracks_lay.addWidget(body)
+            self._fold_body(j, s.index, body, is_open)
         self._compact(self.tracks_box, 8)
 
     def _fill_ext(self, j, ed: bool):
@@ -1045,7 +1108,9 @@ class MainUI:
                 text += " — " + t("ext_bad")
             elif n not in used:
                 text += " — " + t("sub_drop")
-            self.ext_lay.addWidget(self._section(text, head))
+            key = "ext:" + e["path"]
+            is_open = self._fold_open(j, key, True)
+            self.ext_lay.addWidget(self._section(text, head, None, self._fold_button(j, key, is_open)))
             body = QWidget()
             g = QGridLayout(body)
             g.setContentsMargins(12, 4, 12, 8)
@@ -1084,6 +1149,7 @@ class MainUI:
             g.addWidget(dft, 2, 1)
             g.setColumnStretch(1, 1)
             self.ext_lay.addWidget(body)
+            self._fold_body(j, key, body, is_open)
         if not j.ext:
             self.ext_lay.addWidget(_hint(t("ext_hint")))
         self._compact(self.ext_box, 8)
@@ -1094,6 +1160,7 @@ class MainUI:
             return
         j = jobs[0]
         j.tracks.setdefault(str(idx), {})["keep"] = bool(on)
+        self.__dict__.setdefault("_fold_hand", {}).pop(self._fold_key(j, idx), None)   # the tick decides again
         self._track_changed(j)
 
     def _track_codec(self, idx: int, codec: str):

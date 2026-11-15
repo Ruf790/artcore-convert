@@ -160,8 +160,8 @@ def test_light_theme(qapp, media, data_dir):
     from convert import style
     try:
         style.set_theme("light")
-        qapp.setStyleSheet(style.stylesheet())
-        assert not style.IS_DARK and style.TEXT == style.PALETTES["light"]["TEXT"]
+        assert not style.IS_DARK and style.TEXT == style.palette()["TEXT"] == style.XVID["light"]["TEXT"]
+        assert style.palette()["PANEL"] in qapp.styleSheet()
         assert style.PALETTES["light"]["PANEL"] in qapp.styleSheet()
         w = _win(qapp, theme="light")
         w.add_paths([os.path.join(media, "Movie (2017).mkv")])

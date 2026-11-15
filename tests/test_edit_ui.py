@@ -145,7 +145,10 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     from convert import logs
     assert os.path.isfile(j.log_path) and os.path.dirname(j.log_path) == logs.logs_dir()
     text = open(j.log_path, encoding="utf-8").read()
-    assert "Source:   " + j.src in text and "Status:   done" in text and "\n$ " in text and "concat" in text
+    # 1.6: as XviD4PSP writes it
+    assert "ENCODING STARTED " in text and "Input file: " + j.src in text and "ENCODING COMPLETED! " in text
+    assert "Command: " in text and "concat" in text and "Encoded file path: " + j.out in text
+    assert "Completed video stream at index: 0" in text and "Total file size: " in text
     h = logs.history()[0]
     assert h["log"] == j.log_path and h["status"] == "done" and h["out"] == j.out
     w.close()

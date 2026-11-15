@@ -60,6 +60,11 @@ class SettingsDialog(QDialog):
             self.theme.addItem(t("theme_" + key), key)
         self.theme.setCurrentIndex(max(0, self.theme.findData(cfg.get("theme", "dark"))))
         form.addRow(t("theme"), self.theme)
+        self.look = QComboBox()
+        for key in ("xvid", "modern"):
+            self.look.addItem(t("look_" + key), key)
+        self.look.setCurrentIndex(max(0, self.look.findData(cfg.get("look", "xvid"))))
+        form.addRow(t("look"), self.look)
         self.suffix = QLineEdit(cfg.get("out_suffix", "_convert"))
         self.suffix.setPlaceholderText(t("suffix_empty"))
         form.addRow(t("out_suffix"), self.suffix)
@@ -82,6 +87,7 @@ class SettingsDialog(QDialog):
     def accept(self):
         self.cfg["language"] = self.lang.currentData()
         self.cfg["theme"] = self.theme.currentData()
+        self.cfg["look"] = self.look.currentData()
         self.cfg["out_suffix"] = self.suffix.text().strip()
         for k, cb in self.checks.items():
             self.cfg[k] = cb.isChecked()

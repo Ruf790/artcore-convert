@@ -18,8 +18,46 @@ PALETTES = {
                   PROG_TEXT="#1c2027", OK="#2f9e44", ERR="#e03131", WARN="#d48806", RUN="#1c7ed6",
                   RUN_TEXT="#0b5ed7"),
 }
+# 1.6: the look — "xvid": flat, square, compact rows like XviD4PSP 8 (our buttons and icons stay);
+# "modern": the rounded look of 1.0–1.5
+XVID = {
+    "dark": dict(ACCENT="#2f8de4", ACCENT2="#2f8de4", BG="#1e1e1e", PANEL="#252526", PANEL2="#2d2d30",
+                 BORDER="#3f3f46", TEXT="#e4e4e4", MUTED="#9d9d9d", ALT="#2a2a2c",
+                 SEL="rgba(47,141,228,90)", HOVER="rgba(255,255,255,24)", PRESSED="rgba(255,255,255,40)",
+                 SECTION="#333337", SECTION2="#2b2b2e", FIELD="#1b1b1c", BTN="#333337", BTN_HOT="#3e3e42",
+                 CARD_SEL="#264f78", CARD_SEL_FG="#ffffff", CARD_SEL_MUT="#c9d6e4", MENU_SEL="#094771",
+                 MENU_SEL_FG="#ffffff"),
+    "light": dict(ACCENT="#0078d7", ACCENT2="#0078d7", BG="#f0f0f0", PANEL="#ffffff", PANEL2="#f5f5f5",
+                  BORDER="#cfcfcf", TEXT="#1a1a1a", MUTED="#6d6d6d", ALT="#f7f7f7", STRONG="#000000",
+                  SEL="#cce8ff", SEL_TEXT="#000000", HOVER="#e5f1fb", PRESSED="#cce4f7", HANDLE="#0078d7",
+                  SECTION="#ececec", SECTION2="#e2e2e2", FIELD="#ffffff", BTN="#e1e1e1", BTN_HOT="#e5f1fb",
+                  CARD_SEL="#cce8ff", CARD_SEL_FG="#000000", CARD_SEL_MUT="#3b4a5c", MENU_SEL="#91c9f7",
+                  MENU_SEL_FG="#000000"),
+}
+MODERN = dict(SECTION="", SECTION2="", FIELD="", BTN="", BTN_HOT="", MENU_SEL="", MENU_SEL_FG="#ffffff",
+              CARD_SEL_FG="#ffffff", CARD_SEL_MUT="#e6ecff")
+LOOK = "xvid"
 THEME = "dark"
 IS_DARK = True
+SECTION = SECTION2 = FIELD = BTN = BTN_HOT = CARD_SEL = CARD_SEL_FG = CARD_SEL_MUT = MENU_SEL = MENU_SEL_FG = ""
+
+
+def set_look(name: str) -> str:
+    """xvid | modern. Call before set_theme."""
+    global LOOK
+    LOOK = name if name in ("xvid", "modern") else "xvid"
+    return LOOK
+
+
+def palette() -> dict:
+    """The colours in use: the theme, and for the XviD4PSP look its own greys and blues on top."""
+    pal = dict(PALETTES[THEME])
+    if LOOK == "xvid":
+        pal.update(XVID[THEME])
+    else:
+        pal.update(MODERN, CARD_SEL=pal["ACCENT"], SECTION=pal["PANEL2"], SECTION2=pal["PANEL2"],
+                   FIELD=pal["PANEL2"], BTN=pal["PANEL2"], BTN_HOT=pal["PANEL2"], MENU_SEL=pal["ACCENT"])
+    return pal
 ACCENT = ACCENT2 = BG = PANEL = PANEL2 = BORDER = TEXT = MUTED = STRONG = ICON = ""
 OK = ERR = WARN = RUN = RUN_TEXT = ""
 
@@ -40,7 +78,7 @@ def set_theme(name: str) -> str:
             pass
     THEME = name if name in PALETTES else "dark"
     IS_DARK = THEME == "dark"
-    globals().update(PALETTES[THEME])
+    globals().update(palette())
     _icons.clear()
     return THEME
 
@@ -71,8 +109,22 @@ def _icon_png(name: str, color: str, file: str, px: int = 12) -> str:
     return path.replace("\\", "/")
 
 
+def section_css() -> str:
+    """The grey header of a block (a track, the filters …) — XviD4PSP draws them as a light bar."""
+    if LOOK == "xvid":
+        return (f"QFrame#section {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {SECTION}, "
+                f"stop:1 {SECTION2}); border-top: 1px solid {BORDER}; border-bottom: 1px solid {BORDER}; }}")
+    return (f"QFrame#section {{ background: {PANEL2}; border-top: 1px solid {BORDER};"
+            f"border-bottom: 1px solid {BORDER}; }}")
+
+
 def stylesheet() -> str:
-    return (QSS.format(**PALETTES[THEME])
+    pal = palette()
+    qss = QSS + (XVID_QSS if LOOK == "xvid" else "")
+    tag = f"{LOOK}_{THEME}"
+    return (qss.format(**pal)
+            .replace("%DOWN%", _icon_png("fa6s.chevron-down", pal["MUTED"], f"artcore_convert_down_{tag}.png", 9))
+            .replace("%UP%", _icon_png("fa6s.chevron-up", pal["MUTED"], f"artcore_convert_up_{tag}.png", 9))
             .replace("%CHECK%", _check_png())
             .replace("%CLOSE%", _icon_png("fa6s.xmark", MUTED, f"artcore_convert_close_{THEME}.png"))
             .replace("%CLOSE_HOT%", _icon_png("fa6s.xmark", STRONG, f"artcore_convert_close_hot_{THEME}.png")))
@@ -301,6 +353,68 @@ QStatusBar::item {{ border: none; }}
 QScrollBar:horizontal {{ background: transparent; height: 8px; margin: 0; }}
 QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 4px; min-width: 30px; }}
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
+"""
+
+# 1.6: the XviD4PSP 8 look on top of the rules above — square corners, thin grey frames, white fields,
+# grey buttons that turn light blue under the mouse, blue segmented tabs, compact rows
+XVID_QSS = """
+QWidget {{ font-size: 9pt; }}
+QMenu {{ border-radius: 0; padding: 2px; }}
+QMenu::item {{ padding: 5px 24px 5px 10px; border-radius: 0; }}
+QMenu::item:selected {{ background: {MENU_SEL}; color: {MENU_SEL_FG}; }}
+QMenuBar::item:selected {{ background: {MENU_SEL}; color: {MENU_SEL_FG}; border-radius: 0; }}
+QToolTip {{ border-radius: 0; }}
+QPushButton {{ background: {BTN}; border: 1px solid {BORDER}; border-radius: 2px; padding: 4px 14px; min-height: 16px; }}
+QPushButton:hover {{ background: {BTN_HOT}; border-color: {ACCENT}; }}
+QPushButton#primary {{ background: {ACCENT}; border: 1px solid {ACCENT}; border-radius: 2px; }}
+QToolButton#ctl, QToolButton#ctlText, QToolButton#on {{ border-radius: 2px; }}
+QToolButton#ctl:hover, QToolButton#ctlText:hover {{ background: {BTN_HOT}; }}
+QToolButton#primaryBtn {{ background: {ACCENT}; border: 1px solid {ACCENT}; border-radius: 2px; padding: 5px 16px; }}
+QToolButton#primaryBtn:hover {{ background: {ACCENT}; border-color: {STRONG}; }}
+QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox, QPlainTextEdit, QTextEdit, QTimeEdit {{
+    background: {FIELD}; border: 1px solid {BORDER}; border-radius: 2px; padding: 3px 6px; min-height: 17px; }}
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {{ border-color: {ACCENT}; }}
+QLineEdit:focus, QComboBox:focus, QSpinBox:focus, QDoubleSpinBox:focus {{ border-color: {ACCENT}; }}
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {{ color: {MUTED}; background: {PANEL2}; }}
+QComboBox::drop-down {{ subcontrol-origin: padding; subcontrol-position: top right; width: 18px; border: none; }}
+QComboBox::down-arrow {{ image: url(%DOWN%); width: 9px; height: 9px; }}
+QComboBox QAbstractItemView {{ border-radius: 0; selection-background-color: {MENU_SEL}; selection-color: {MENU_SEL_FG};
+                               outline: none; }}
+QSpinBox::up-button, QDoubleSpinBox::up-button {{ subcontrol-origin: border; subcontrol-position: top right;
+    width: 16px; border: none; border-left: 1px solid {BORDER}; background: transparent; }}
+QSpinBox::down-button, QDoubleSpinBox::down-button {{ subcontrol-origin: border; subcontrol-position: bottom right;
+    width: 16px; border: none; border-left: 1px solid {BORDER}; background: transparent; }}
+QSpinBox::up-button:hover, QDoubleSpinBox::up-button:hover,
+QSpinBox::down-button:hover, QDoubleSpinBox::down-button:hover {{ background: {BTN_HOT}; }}
+QSpinBox::up-arrow, QDoubleSpinBox::up-arrow {{ image: url(%UP%); width: 8px; height: 8px; }}
+QSpinBox::down-arrow, QDoubleSpinBox::down-arrow {{ image: url(%DOWN%); width: 8px; height: 8px; }}
+QCheckBox {{ spacing: 7px; }}
+QCheckBox::indicator {{ width: 13px; height: 13px; border-radius: 2px; border: 1px solid {MUTED}; background: {FIELD}; }}
+QCheckBox::indicator:hover {{ border-color: {ACCENT}; background: {BTN_HOT}; }}
+QCheckBox::indicator:checked {{ background: {ACCENT}; border-color: {ACCENT}; image: url(%CHECK%); }}
+QCheckBox::indicator:disabled {{ border-color: {BORDER}; background: {PANEL2}; }}
+QCheckBox::indicator:checked:disabled {{ background: {MUTED}; border-color: {MUTED}; }}
+QRadioButton::indicator {{ width: 13px; height: 13px; border-radius: 7px; border: 1px solid {MUTED}; background: {FIELD}; }}
+QGroupBox {{ border-radius: 0; }}
+QTabWidget::pane {{ border-radius: 0; }}
+QTabBar#segTabs {{ background: transparent; }}
+QTabBar#segTabs::tab {{ background: {FIELD}; color: {TEXT}; border: 1px solid {BORDER}; border-left: none;
+                        padding: 4px 11px; margin: 0; }}
+QTabBar#segTabs::tab:first {{ border-left: 1px solid {BORDER}; border-top-left-radius: 3px; border-bottom-left-radius: 3px; }}
+QTabBar#segTabs::tab:last {{ border-top-right-radius: 3px; border-bottom-right-radius: 3px; }}
+QTabBar#segTabs::tab:hover:!selected {{ background: {BTN_HOT}; }}
+QTabBar#segTabs::tab:selected {{ background: {ACCENT}; color: #ffffff; border-color: {ACCENT}; }}
+QProgressBar {{ border-radius: 0; min-height: 16px; }}
+QProgressBar::chunk {{ border-radius: 0; background: {ACCENT}; }}
+QTreeWidget#playlist {{ border-radius: 0; padding: 0; }}
+QListWidget#playlist::item, QListWidget#recent::item {{ border-radius: 0; }}
+QScrollBar:vertical {{ background: {PANEL2}; width: 12px; }}
+QScrollBar::handle:vertical {{ background: {SCROLL}; border-radius: 0; min-height: 24px; margin: 2px; }}
+QScrollBar:horizontal {{ background: {PANEL2}; height: 12px; }}
+QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 0; min-width: 24px; margin: 2px; }}
+QHeaderView::section {{ background: {SECTION}; color: {TEXT}; border-right: 1px solid {BORDER}; font-weight: 400; }}
+QLabel#format {{ border-radius: 2px; }}
+QLabel#badge, QLabel#badgeHdr {{ border-radius: 2px; }}
 """
 
 
