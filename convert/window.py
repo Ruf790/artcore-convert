@@ -43,6 +43,29 @@ class Bridge(QObject):
     update = Signal(object, str)
     gpu = Signal(dict)
     crop = Signal(int, object)            # uid, (l, t, r, b) | None — the automatic crop
+    extra = Signal(int, str, object)      # 1.4: uid, path, MediaInfo of a joined / external file
+    split = Signal(int, object)           # 1.4: slot number, the cut times (by size) or an error text
+
+
+class Slot:
+    """1.4: one place where a task is encoded (Settings: N tasks at the same time) — its ffmpeg, its task,
+    its log lines. stage: main (pre passes, the conversion, the metrics) → split (the parts)."""
+
+    def __init__(self, win: "MainWindow", n: int):
+        self.n = n
+        self.runner = Runner(win)
+        self.job: J.Job | None = None
+        self.log: list[str] = []
+        self.started = 0.0
+        self.stat: dict = {}
+        self.stage = "main"
+        self.runner.progress.connect(lambda d, s=self: win._on_progress(d, s))
+        self.runner.log.connect(lambda line, s=self: win._on_log(line, s))
+        self.runner.finished.connect(lambda ok, err, s=self: win._on_finished(ok, err, s))
+
+    @property
+    def busy(self) -> bool:
+        return self.job is not None
 
 
 class Worker:
@@ -86,7 +109,7 @@ class Worker:
                 exe = ff.ffmpeg()
                 if exe:
                     try:
-                        r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.2f}", "-i", path, "-map", "0:v:0",
+                        r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.2f}", *ff.inp(path), "-map", "0:v:0",
                                     "-frames:v", "1", "-vf", "scale=480:-2", "-f", "image2pipe", "-c:v", "png", "-"],
                                    30, binary=True)
                         data = r.stdout if r.returncode == 0 else b""
@@ -134,12 +157,11 @@ class MainWindow(MainUI, QMainWindow):
         self.bridge.gpu.connect(self._on_gpu)
         self.bridge.crop.connect(self._on_crop)
         self._crop_busy: set[int] = set()        # tasks whose black bars are being looked for
+        self.bridge.extra.connect(self._on_extra)
+        self.bridge.split.connect(self._on_split_times)
         self.worker = Worker(self.bridge)
-        self.runner = Runner(self)
-        self.runner.progress.connect(self._on_progress)
-        self.runner.log.connect(self._on_log)
-        self.runner.finished.connect(self._on_finished)
-        self.current: J.Job | None = None
+        self.slots: list[Slot] = [Slot(self, 0)]
+        self.runner = self.slots[0].runner       # the first place (older code, tests)
         self.running = False                     # the queue is being worked through
         self.taskbar = winint.TaskbarProgress()
         self.update_info = None
@@ -148,15 +170,16 @@ class MainWindow(MainUI, QMainWindow):
         self._last_stat: dict = {}
         self._gpu: dict = {}
         self._gpu_busy = False
-        self._run_log: list[str] = []            # every ffmpeg line of the task being encoded (its log file)
-        self._run_started = 0.0
+        self._frame_mtime = 0.0
 
         self._build_ui()
 
         self.sys_timer = QTimer(self)
         self.sys_timer.setInterval(1000)
         self.sys_timer.timeout.connect(self._sys_tick)
+        self.sys_timer.timeout.connect(self._frame_tick)
         self.sys_timer.start()
+        self._cpu_label()
         self.save_timer = QTimer(self)
         self.save_timer.setSingleShot(True)
         self.save_timer.setInterval(800)
@@ -164,6 +187,115 @@ class MainWindow(MainUI, QMainWindow):
         self._select_changed()
         self._update_buttons()
         self.detect_encoders()
+
+    # ── 1.4: the places where tasks are encoded ──────────────
+    @property
+    def current(self) -> J.Job | None:
+        """The task shown on the Status tab: the selected one if it runs, else the first one running."""
+        s = self._shown_slot()
+        return s.job if s is not None else None
+
+    def _busy(self, j: J.Job | None) -> bool:
+        return j is not None and any(s.job is j for s in self.slots)
+
+    def _busy_slots(self) -> list[Slot]:
+        return [s for s in self.slots if s.busy]
+
+    def _shown_slot(self) -> Slot | None:
+        busy = self._busy_slots()
+        if not busy:
+            return None
+        sel = self.selected_jobs() if hasattr(self, "view") else []
+        for s in busy:
+            if sel and s.job is sel[0]:
+                return s
+        return busy[0]
+
+    def _any_running(self) -> bool:
+        return any(s.runner.running or s.busy for s in self.slots)
+
+    def _all_paused(self) -> bool:
+        run = [s for s in self.slots if s.runner.running]
+        return bool(run) and all(s.runner.paused for s in run)
+
+    def _threads(self) -> int:
+        pct = int(self.cfg.get("cpu_limit", 100))
+        if pct >= 100:
+            return 0
+        return max(1, round((os.cpu_count() or 1) * pct / 100))
+
+    def _cores(self, slot: Slot) -> list[int] | None:
+        n = self._threads()
+        total = os.cpu_count() or 1
+        if not n:
+            return None
+        start = (slot.n * n) % total
+        return [(start + i) % total for i in range(n)]
+
+    def _cpu_label(self):
+        pct = int(self.cfg.get("cpu_limit", 100))
+        n = self._threads() or (os.cpu_count() or 1)
+        self.b_cpu.setText(f"{pct}% ▾")
+        self.b_cpu.setToolTip(t("cpu_limit_tip") + "\n" + t("cpu_threads", n, os.cpu_count() or 1))
+
+    def set_cpu_limit(self, pct: int):
+        """«100% ▾»: how much of the processor ffmpeg may take. Running tasks move to fewer cores at once;
+        the thread counts apply from the next task."""
+        self.cfg["cpu_limit"] = int(pct)
+        config.save(self.cfg)
+        self._cpu_label()
+        for s in self.slots:
+            if s.runner.running:
+                s.runner.set_cores(self._cores(s))
+
+    def set_parallel(self, n: int):
+        self.cfg["parallel"] = max(1, min(4, int(n or 1)))
+        config.save(self.cfg)
+        if self.par_box.currentData() != self.cfg["parallel"]:
+            self.par_box.setCurrentIndex(self.cfg["parallel"] - 1)
+        if self.running:
+            QTimer.singleShot(0, self._next)
+
+    def _metrics_changed(self):
+        self.cfg["metrics"] = [k for k, cb in self.m_check.items() if cb.isChecked()]
+        config.save(self.cfg)
+
+    def _frame_toggled(self, on: bool):
+        self.cfg["show_frame"] = bool(on)
+        config.save(self.cfg)
+        if not on:
+            self.fr_img.clear()
+            self.fr_img.setText(t("st_frame_off"))
+
+    def _frame_tick(self):
+        """The frame being encoded (ffmpeg writes it once a second of the film) on the Status tab."""
+        if self.side_bar.currentIndex() != 5 or not self.fr_on.isChecked():
+            return
+        s = self._shown_slot()
+        if s is None:
+            return
+        path = J.work_file(s.job, "frame", None, "png")
+        try:
+            m = os.path.getmtime(path)
+        except OSError:
+            return
+        if m == self._frame_mtime and self.fr_img.pixmap() is not None and not self.fr_img.pixmap().isNull():
+            return
+        pm = QPixmap()
+        if pm.load(path) and not pm.isNull():
+            self._frame_mtime = m
+            w = max(160, self.fr_img.width() - 28)
+            self.fr_img.setPixmap(pm.scaledToWidth(min(w, 480), Qt.SmoothTransformation))
+
+    def _show_metrics(self, j: J.Job | None):
+        av_vmaf = "libvmaf" in self.av.filters
+        self.m_check["vmaf"].setEnabled(av_vmaf or not self.av_ready)
+        self.m_check["vmaf"].setToolTip(t("m_tip_vmaf") if av_vmaf or not self.av_ready else t("m_no_vmaf"))
+        m = j.metrics if j is not None else {}
+        for k, lab in self.m_val.items():
+            v = m.get(k)
+            lab.setText("—" if v is None else f"{v:.2f} dB" if k == "psnr" else f"{v:.4f}" if k == "ssim"
+                        else f"{v:.2f}")
 
     # ── presets ───────────────────────────────────────────────
     def _fill_presets(self):
@@ -288,8 +420,10 @@ class MainWindow(MainUI, QMainWindow):
         self.jobs.append(j)
         it = QTreeWidgetItem()
         it.setData(0, Qt.UserRole, j.uid)
+        it.setFlags(it.flags() & ~Qt.ItemIsDropEnabled)          # 1.4: dropped between tasks, not into one
         self.items[j.uid] = it
         self.view.addTopLevelItem(it)
+        self._probe_extra(j)
         if j.info is None:
             if j.status == "wait":
                 j.status = "probe"
@@ -326,8 +460,35 @@ class MainWindow(MainUI, QMainWindow):
         sel = self.selected_jobs()
         if sel and sel[0] is j:
             self._select_changed()
-        if self.running and self.current is None:
+        self._probe_extra(j)
+        if self.running:
             QTimer.singleShot(0, self._next)
+
+    def _probe_extra(self, j: J.Job):
+        """1.4: ffprobe the joined / external files of a task in the background."""
+        todo = [p for p in list(j.joins) + [e["path"] for e in j.ext] if p not in j.infos]
+        if not todo:
+            return
+        for p in todo:
+            j.infos[p] = None
+        uid = j.uid
+
+        def work():
+            for p in todo:
+                self.bridge.extra.emit(uid, p, P.probe(p))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_extra(self, uid: int, path: str, info):
+        j = next((x for x in self.jobs if x.uid == uid), None)
+        if j is None:
+            return
+        j.infos[path] = info
+        self._refresh(j)
+        sel = self.selected_jobs()
+        if sel and sel[0] is j:
+            self._show_info(j)
+            self._fill_tracks()
+            self._edit_tabs()
 
     def _on_thumb(self, uid: int, data: bytes):
         pm = QPixmap()
@@ -346,14 +507,16 @@ class MainWindow(MainUI, QMainWindow):
         it.setToolTip(COL_FILE, j.src + (f"\n→ {j.out}" if j.out else ""))
         it.setText(COL_SRC, P.summary(j.info) if j.info is not None else "…")
         it.setToolTip(COL_SRC, it.text(COL_SRC))
-        it.setText(COL_PROFILE, ("✂ " if J.segments(j) else "") +
+        it.setText(COL_PROFILE, ("✂ " if J.segments(j) else "") + (f"⧉{len(j.joins) + 1} " if j.joins else "") +
+                   (f"＋{len(j.ext)} " if j.ext else "") +
                    J.describe(j.settings, self.av if self.av_ready else None, t))
         it.setToolTip(COL_PROFILE, it.text(COL_PROFILE))
         it.setIcon(COL_STATE, state_icon(j.status))
         if j.status in ("run", "pause"):
             text = f"{j.progress * 100:.1f}%"
         elif j.status == "done":
-            text = P.fmt_size(j.out_size) if j.out_size else t("s_done")
+            text = (P.fmt_size(j.out_size) if j.out_size else t("s_done")) + \
+                (f" · {t('parts_n', len(j.parts))}" if len(j.parts) > 1 else "")
         else:
             text = t("s_" + j.status)
         it.setText(COL_STATE, text)
@@ -385,7 +548,7 @@ class MainWindow(MainUI, QMainWindow):
     def remove_selected(self):
         if self.view.hasFocus() is False and not self.view.selectedItems():
             return
-        jobs = [j for j in self.selected_jobs() if j is not self.current]
+        jobs = [j for j in self.selected_jobs() if not self._busy(j)]
         if not jobs:
             return
         for j in jobs:
@@ -429,7 +592,7 @@ class MainWindow(MainUI, QMainWindow):
 
     def retry(self, jobs: list[J.Job]):
         for j in jobs:
-            if j.status in ("error", "stop", "skip", "done") and j is not self.current:
+            if j.status in ("error", "stop", "skip", "done") and not self._busy(j):
                 j.status, j.error, j.progress = ("wait" if j.info is not None else "probe"), "", 0.0
                 if j.info is None or j.info.error:
                     j.info = None
@@ -454,6 +617,15 @@ class MainWindow(MainUI, QMainWindow):
             if any(x.status in ("wait", "probe") for x in jobs):
                 m.addAction(style.icon("fa6s.forward"), t("skip"), lambda: self._skip(jobs))
             m.addAction(style.icon("fa6s.terminal"), t("copy_cmd"), lambda: self._copy_cmd(j))
+            m.addSeparator()
+            ed = [x for x in jobs if x.status in EDITABLE and not self._busy(x)]
+            if len(ed) > 1:
+                m.addAction(style.icon("fa6s.object-group"), t("join_selected"), self.join_selected)
+            if len(jobs) == 1 and j in ed:
+                m.addAction(style.icon("fa6s.link"), t("join_add") + "…", self.join_add_dialog)
+                if j.joins:
+                    m.addAction(style.icon("fa6s.link-slash"), t("join_split"), lambda: self.join_undo(j))
+                m.addAction(style.icon("fa6s.plus"), t("ext_add") + "…", self.add_external_dialog)
             if j.log_path and os.path.isfile(j.log_path):
                 m.addAction(style.icon("fa6s.file-lines"), t("open_log"), lambda: self.open_log(j))
             m.addSeparator()
@@ -474,8 +646,17 @@ class MainWindow(MainUI, QMainWindow):
         try:
             hw = bool(self.cfg.get("hw_decode", True))
             out = J.out_name(j, self.cfg)
-            cmds = J.pre_passes(j, ff.ffmpeg() or "ffmpeg", out, self.av, hw) + \
-                [J.build_args(j, ff.ffmpeg() or "ffmpeg", out, self.av, hw)]
+            exe = ff.ffmpeg() or "ffmpeg"
+            n = self._threads()
+            cmds = J.pre_passes(j, exe, out, self.av, hw, threads=n) + \
+                [J.build_args(j, exe, out, self.av, hw, threads=n)] + \
+                J.post_passes(j, exe, out, self.av, self.cfg.get("metrics", []), threads=n)
+            if J.split_on(j):
+                sp = j.settings.get("split") or {}
+                times = None
+                if sp.get("mode") == "size":                    # cut times are known only after encoding:
+                    times = J.estimate_size_times(j, self.av)    # here from the planned bit rate
+                cmds.append(J.split_args(j, exe, out, times))
         except (RuntimeError, OSError) as e:
             self._toast(t(str(e)))
             return
@@ -490,6 +671,185 @@ class MainWindow(MainUI, QMainWindow):
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl.fromLocalFile(j.out))
 
+    # ── 1.4: the order with the mouse, the list in a file ─────
+    def _on_reordered(self):
+        """The cards were dragged: the queue takes the order they now stand in."""
+        order = [self.view.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.view.topLevelItemCount())]
+        by = {j.uid: j for j in self.jobs}
+        jobs = [by[u] for u in order if u in by]
+        jobs += [j for j in self.jobs if j not in jobs]
+        self.jobs = jobs
+        self._renumber()
+        self._queue_changed()
+
+    TASK_FILTER = "ArtCore Convert (*.acq);;JSON (*.json)"
+
+    def save_task_list(self, path: str = ""):
+        """File → Save the task list: the tasks with all their settings (trim, filters, tracks …) in a file."""
+        if not path:
+            path, _ = QFileDialog.getSaveFileName(self, t("q_save"), os.path.join(self.cfg.get("last_dir", ""),
+                                                                                    "tasks.acq"), self.TASK_FILTER)
+        if not path:
+            return False
+        import json
+        data = {"app": APP_TITLE, "version": VERSION, "jobs": [j.to_dict() for j in self.jobs]}
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False, indent=1)
+        except OSError as e:
+            QMessageBox.warning(self, APP_TITLE, str(e))
+            return False
+        self._toast(t("q_saved", len(self.jobs)))
+        return True
+
+    def load_task_list(self, path: str = ""):
+        """File → Load a task list: its tasks are added to the queue (finished ones come back as done)."""
+        if not path:
+            path, _ = QFileDialog.getOpenFileName(self, t("q_load"), self.cfg.get("last_dir", ""), self.TASK_FILTER)
+        if not path:
+            return 0
+        import json
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, APP_TITLE, f"{t('q_load_bad')}\n{e}")
+            return 0
+        n = 0
+        for d in (data.get("jobs") if isinstance(data, dict) else None) or []:
+            if not isinstance(d, dict) or not d.get("src"):
+                continue
+            j = J.Job.from_dict(d)
+            if j.status in ("run", "pause", "probe"):
+                j.status = "wait"
+            if not os.path.isfile(j.src):
+                j.status, j.error = "error", t("missing_file")
+            self._append(j)
+            n += 1
+        self._queue_changed()
+        self._toast(t("q_loaded", n))
+        return n
+
+    # ── 1.4: joining files, external tracks ───────────────────
+    def join_selected(self):
+        """The selected tasks become one: the first one takes the others' files after its own."""
+        jobs = [j for j in self.selected_jobs(editable=True) if not self._busy(j)]
+        if len(jobs) < 2:
+            self._toast(t("join_need_two"))
+            return
+        head = jobs[0]
+        for j in jobs[1:]:
+            head.joins += [j.src] + list(j.joins)
+            for k, v in j.infos.items():
+                head.infos.setdefault(k, v)
+            if j.info is not None:
+                head.infos[j.src] = j.info
+            it = self.items.pop(j.uid, None)
+            if it is not None:
+                self.view.takeTopLevelItem(self.view.indexOfTopLevelItem(it))
+            self.jobs.remove(j)
+            self.thumbs.pop(j.uid, None)
+        head.trim = []
+        head.status = "wait" if head.info is not None else head.status
+        self._probe_extra(head)
+        self._renumber()
+        self._refresh(head)
+        self.view.setCurrentItem(self.items[head.uid])
+        self._queue_changed()
+        self._select_changed()
+        self._toast(t("joined_n", len(head.joins) + 1))
+
+    def join_add_dialog(self, files: list[str] | None = None):
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or self._busy(jobs[0]):
+            self._toast(t("tr_pick_one"))
+            return
+        j = jobs[0]
+        if files is None:
+            exts = " ".join("*" + e for e in VIDEO_EXT + AUDIO_EXT)
+            files, _ = QFileDialog.getOpenFileNames(self, t("join_add"), os.path.dirname(j.src),
+                                                    f"{t('media_files')} ({exts});;{t('all_files')} (*)")
+        files = [os.path.abspath(f) for f in files or [] if os.path.isfile(f)]
+        if not files:
+            return
+        j.joins += files
+        j.trim = []
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._probe_extra(j)
+        self._refresh(j)
+        self._queue_changed()
+        self._select_changed()
+
+    def join_undo(self, j: J.Job):
+        """The joined files become tasks of their own again."""
+        if self._busy(j) or not j.joins:
+            return
+        files, j.joins, j.trim = list(j.joins), [], []
+        self._refresh(j)
+        self.add_paths(files)
+        self._select_changed()
+
+    def add_external_dialog(self, files: list[str] | None = None):
+        """«+» on the Streams tab: an outside sound or subtitle file goes into the task's result."""
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or self._busy(jobs[0]):
+            self._toast(t("tr_pick_one"))
+            return
+        j = jobs[0]
+        if files is None:
+            a = " ".join("*" + e for e in J.EXT_AUDIO)
+            sub = " ".join("*" + e for e in J.EXT_SUBS)
+            files, _ = QFileDialog.getOpenFileNames(self, t("ext_add"), os.path.dirname(j.src),
+                                                    f"{t('ext_files')} ({a} {sub});;{t('audio_files')} ({a});;"
+                                                    f"{t('subtitles')} ({sub});;{t('all_files')} (*)")
+        for f in files or []:
+            if not os.path.isfile(f):
+                continue
+            kind = J.ext_kind(f)
+            lang = _lang_from_name(f, j.src)
+            j.ext.append(J.clean_ext({"path": os.path.abspath(f), "kind": kind, "lang": lang}))
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._probe_extra(j)
+        self._refresh(j)
+        self._queue_changed()
+        self._fill_tracks()
+        self._show_info(j)
+
+    def _ext_opt(self, n: int, key: str, value):
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or n >= len(jobs[0].ext):
+            return
+        j = jobs[0]
+        j.ext[n][key] = value
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        if key in ("codec", "default"):
+            QTimer.singleShot(0, self._fill_tracks)
+
+    def _ext_remove(self, n: int):
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or n >= len(jobs[0].ext):
+            return
+        j = jobs[0]
+        j.ext.pop(n)
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        QTimer.singleShot(0, self._fill_tracks)
+
+    def bench_dialog(self):
+        from .dialogs import BenchDialog
+        sel = self.selected_jobs()
+        j = sel[0] if sel and sel[0].info is not None and not sel[0].info.error else None
+        d = BenchDialog(self, self.av, j.src if j else None, j.info.duration if j else 0.0, self._threads())
+        self._bench = d
+        d.exec()
+
     # ── settings tabs ─────────────────────────────────────────
     def _select_changed(self):
         jobs = self.selected_jobs()
@@ -502,6 +862,11 @@ class MainWindow(MainUI, QMainWindow):
             else:
                 self.scope.setText(t("scope_many", len(ed)) if ed else t("scope_locked"))
             self._show_info(j)
+            if j.status == "done" or not self._busy_slots():
+                self._show_metrics(j)
+            nxt = self._shown_slot()
+            if nxt is not None and nxt.job is j:
+                self._show_slot(nxt)
         else:
             self.scope.setText(t("scope_new"))
             self._show_info(None)
@@ -516,13 +881,13 @@ class MainWindow(MainUI, QMainWindow):
     def _one_job(self) -> tuple:
         jobs = self.selected_jobs()
         j = jobs[0] if len(jobs) == 1 else None
-        return j, j is not None and j.status in EDITABLE and j is not self.current
+        return j, j is not None and j.status in EDITABLE and not self._busy(j)
 
     def _edit_tabs(self):
         """Trim / Metadata / Chapters show the one selected task."""
         jobs = self.selected_jobs()
         j = jobs[0] if len(jobs) == 1 else None
-        ed = j is not None and j.status in EDITABLE and j is not self.current
+        ed = j is not None and j.status in EDITABLE and not self._busy(j)
         for tab in (self.trim_tab, self.meta_tab, self.chap_tab):
             tab.set_job(j, ed)
 
@@ -565,7 +930,7 @@ class MainWindow(MainUI, QMainWindow):
             if key == "container":
                 J.fit_container(st)
         for j in jobs:
-            if j.status in ("done", "error", "stop", "skip") and j is not self.current:
+            if j.status in ("done", "error", "stop", "skip") and not self._busy(j):
                 j.status, j.error, j.progress = ("wait" if j.info is not None and not j.info.error else j.status), \
                     (j.error if j.info is not None and j.info.error else ""), 0.0
             self._refresh(j)
@@ -610,7 +975,7 @@ class MainWindow(MainUI, QMainWindow):
             fl = st.setdefault("filters", F.defaults())
             fl.setdefault(name, dict(F.FILTER_DEFAULTS[name]))[key] = value
         for j in jobs:
-            if j.status in ("done", "error", "stop", "skip") and j is not self.current and j.info is not None \
+            if j.status in ("done", "error", "stop", "skip") and not self._busy(j) and j.info is not None \
                     and not j.info.error:
                 j.status, j.error, j.progress = "wait", "", 0.0
             self._refresh(j)
@@ -867,6 +1232,12 @@ class MainWindow(MainUI, QMainWindow):
             self.v_size.setEnabled(rc == "size")
             self.v_speed.setValue(int(v.get("speed", 5)))
             sel(self.v_speed_box, int(v.get("speed", 5)))
+            two = self.av.two_pass(enc) or enc.vendor == "nvidia"            # 1.4
+            self.v_2pass.setChecked(int(v.get("passes", 1) or 1) == 2)
+            self.v_2pass.setEnabled(rc != "quality" and enc.rc and (two or not self.av_ready))
+            self.v_2pass_hint.setText(t("two_pass_q") if rc == "quality" else
+                                      t("two_pass_nv") if enc.vendor == "nvidia" else
+                                      t("two_pass_none") if not two and self.av_ready else t("two_pass_hint"))
             self._fill_res(v)
             self.v_w.setValue(int(v.get("width", 0) or 0))
             self.v_hh.setValue(int(v.get("height", 0) or 0))
@@ -1091,10 +1462,20 @@ class MainWindow(MainUI, QMainWindow):
             rows.append(f"<b>{t('i_title')}</b>: {_esc(info.title)}")
         if info.chapters:
             rows.append(f"<b>{t('i_chapters')}</b>: {info.chapters}")
+        if j.joins:                                                   # 1.4
+            rows.append(f"<b>{t('i_joined')}</b>: {len(j.joins) + 1} · {P.fmt_time(J.src_duration(j))}")
+            for pth, inf in J.sources(j):
+                d = "…" if inf is None else ("⚠ " + _esc(inf.error)) if inf.error else P.fmt_time(inf.duration)
+                rows.append(f"&nbsp;&nbsp;⧉ {_esc(os.path.basename(pth))} <span style='color:{style.MUTED}'>· "
+                            f"{d}</span>")
         segs = J.segments(j)
         if segs:
             rows.append(f"<b>{t('i_trim')}</b>: " + t("trm_total", J.fmt_tc(J.out_duration(j), False),
-                                                     P.fmt_time(info.duration), len(segs)))
+                                                     P.fmt_time(J.src_duration(j)), len(segs)))
+        if j.ext:
+            rows.append(f"<b>{t('ext_tracks')}</b>: " + ", ".join(
+                _esc(os.path.basename(e["path"])) + (f" ({e['lang']})" if e.get("lang") else "") +
+                (f" {int(e['delay']):+d} {t('ms')}" if e.get("delay") else "") for e in j.ext))
         edits = [t(k) for k, on in (("i_meta_edited", j.meta.get("tags") is not None or bool(j.meta.get("streams"))),
                                     ("i_chap_edited", j.chapters is not None)) if on]
         if edits:
@@ -1119,6 +1500,12 @@ class MainWindow(MainUI, QMainWindow):
             rows.append("<br>" + "<br>".join(f"<span style='color:{style.WARN}'>⚠ {_esc(w)}</span>" for w in warn))
         if j.status == "done" and j.out:
             rows.append(f"<br><b>{t('i_result')}</b>: {_esc(j.out)} ({P.fmt_size(j.out_size)})")
+            if len(j.parts) > 1:
+                rows.append(t("parts_n", len(j.parts)) + ": " + ", ".join(_esc(os.path.basename(x)) for x in j.parts))
+            if j.metrics:
+                rows.append(f"<b>{t('st_metrics')}</b>: " + " · ".join(
+                    f"{k.upper()} {v:.2f}" + (" dB" if k == "psnr" else "") if k != "ssim" else f"SSIM {v:.4f}"
+                    for k, v in j.metrics.items()))
         elif j.status == "error" and j.error:
             rows.append(f"<br><span style='color:{style.ERR}'>{_esc(j.error)}</span>")
         self.i_text.setText("<br>".join(rows))
@@ -1154,7 +1541,7 @@ class MainWindow(MainUI, QMainWindow):
             j = jobs[0]
             p = j.out if j.status in ("done", "run", "pause") and j.out else J.out_name(j, self.cfg)
             self.o_path.setText(p)
-            self.o_path.setEnabled(j.status in EDITABLE and j is not self.current)
+            self.o_path.setEnabled(j.status in EDITABLE and not self._busy(j))
         else:
             self.o_path.setText("")
             self.o_path.setEnabled(False)
@@ -1199,14 +1586,18 @@ class MainWindow(MainUI, QMainWindow):
         return True
     def _prio_changed(self):
         self.cfg["priority"] = self.prio.currentData()
-        if self.runner.running:
-            self.runner.set_priority(self.cfg["priority"])
+        for s in self.slots:
+            if s.runner.running:
+                s.runner.set_priority(self.cfg["priority"])
 
     # ── running ───────────────────────────────────────────────
     def start_queue(self):
-        if self.runner.running:
-            if self.runner.paused:
-                self.toggle_pause()
+        if self._any_running():
+            if self._all_paused():
+                self.toggle_queue_pause()
+            if not self.running:
+                self.running = True
+                self._next()
             return
         if not any(j.status in ("wait", "probe") for j in self.jobs):
             if any(j.status in ("error", "stop") for j in self.jobs) and \
@@ -1223,43 +1614,80 @@ class MainWindow(MainUI, QMainWindow):
         self.show_side("status")
         self._next()
 
+    def _free_slot(self) -> Slot | None:
+        n = int(self.cfg.get("parallel", 1))
+        while len(self.slots) < n:
+            self.slots.append(Slot(self, len(self.slots)))
+        return next((s for s in self.slots[:n] if not s.busy and not s.runner.running), None)
+
     def _next(self):
-        if not self.running or self.runner.running:
-            return
-        j = next((x for x in self.jobs if x.status == "wait"), None)
-        if j is None:
-            if any(x.status == "probe" for x in self.jobs):
-                return                                    # _on_probed calls us again
-            self._queue_done()
-            return
-        if self._want_crop(j):
-            self.st_name.setText(f"{j.name}: {t('f_detecting')}")
-            return                                        # _on_crop calls us again
-        out = J.out_name(j, self.cfg)
+        """Fill every free place (Settings: N tasks at the same time) with the next waiting task."""
+        while self.running:
+            slot = self._free_slot()
+            if slot is None:
+                return
+            j = next((x for x in self.jobs if x.status == "wait" and not self._busy(x)), None)
+            if j is None:
+                if any(x.status == "probe" for x in self.jobs) or self._busy_slots():
+                    return                                # _on_probed / _on_finished call us again
+                self._queue_done()
+                return
+            if any(j.infos.get(p, 0) is None for p in list(j.joins) + [e["path"] for e in j.ext]):
+                return                                    # its other files are being probed: _on_extra
+            if self._want_crop(j):
+                self.st_name.setText(f"{j.name}: {t('f_detecting')}")
+                return                                    # _on_crop calls us again
+            if not self._start(slot, j):
+                continue
+
+    def _start(self, slot: Slot, j: J.Job) -> bool:
+        out = J.out_name(j, self.cfg, taken={s.job.out for s in self._busy_slots() if s.job.out})
+        exe = ff.ffmpeg() or "ffmpeg"
+        hw = bool(self.cfg.get("hw_decode", True))
+        n = self._threads()
+        frame = J.work_file(j, "frame", None, "png") if self.cfg.get("show_frame", True) else ""
         try:
             os.makedirs(os.path.dirname(out), exist_ok=True)
-            args = J.build_args(j, ff.ffmpeg() or "ffmpeg", out, self.av, bool(self.cfg.get("hw_decode", True)))
-            pre = J.pre_passes(j, ff.ffmpeg() or "ffmpeg", out, self.av, bool(self.cfg.get("hw_decode", True)))
+            args = J.build_args(j, exe, out, self.av, hw, threads=n, preview=frame)
+            pre = J.pre_passes(j, exe, out, self.av, hw, threads=n, preview=frame)
+            post = J.post_passes(j, exe, out, self.av, self.cfg.get("metrics", []), threads=n)
         except (RuntimeError, OSError) as e:
             j.status, j.error = "error", t(str(e)) if str(e) in BUILD_ERRORS else str(e)
             self._refresh(j)
-            QTimer.singleShot(0, self._next)
-            return
+            return False
         if not ff.ffmpeg():
             self.running = False
             QMessageBox.critical(self, APP_TITLE, t("no_ffmpeg"))
-            return
-        self.current = j
-        j.status, j.out, j.progress, j.error, j.out_size = "run", out, 0.0, "", 0
+            return True
+        try:
+            os.remove(frame)
+        except OSError:
+            pass
+        slot.job, slot.stage, slot.stat, slot.log = j, "main", {}, []
+        slot.started = time.time()
+        j.status, j.out, j.progress, j.error, j.out_size, j.metrics, j.parts = "run", out, 0.0, "", 0, {}, []
         self._refresh(j)
-        self.st_name.setText(f"{j.name}  →  {os.path.basename(out)}")
-        self.st["encoder"].setText(self._enc_text(j))
-        self._last_stat = {}
-        self._run_log = []
-        self._run_started = time.time()
-        self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre)
+        if self._shown_slot() is slot:
+            self._show_slot(slot)
+        kinds = ["vidstab"] if J.needs_vidstab(j) else []
+        kinds += ["pass1"] * (len(pre) - len(kinds))
+        kinds += ["main"] + ["metrics"] * len(post)
+        slot.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre, post,
+                          self._cores(slot), kinds=kinds)
         self._update_buttons()
         self._queue_changed()
+        return True
+
+    def _show_slot(self, slot: Slot):
+        j = slot.job
+        if j is None:
+            return
+        self.st_name.setText(f"{j.name}  →  {os.path.basename(j.out)}" +
+                             (f"  ·  {t('st_' + slot.runner.kind)}" if slot.runner.kind != "main" else ""))
+        self.st["encoder"].setText(self._enc_text(j))
+        self._frame_mtime = 0.0
+        if slot.stat:
+            self._on_progress(slot.stat, slot)
 
     def _enc_text(self, j: J.Job) -> str:
         if j.enc_used == "copy":
@@ -1267,14 +1695,26 @@ class MainWindow(MainUI, QMainWindow):
         e = E.BY_ID.get(j.enc_used)
         return f"{e.ffname} · {self._vendor(e)}" if e else "—"
 
-    def _on_progress(self, d: dict):
-        j = self.current
+    def _on_progress(self, d: dict, slot: Slot | None = None):
+        slot = slot or self.slots[0]
+        j = slot.job
         if j is None:
             return
+        slot.stat = d
         self._last_stat = d
-        j.progress = d["frac"]
-        j.out_size = d["size"]
+        if slot.stage == "main":
+            j.progress = d["frac"] * (0.97 if J.split_on(j) else 1.0)
+            j.out_size = d["size"] if slot.runner.kind == "main" else j.out_size
+        else:
+            j.progress = 0.97 + 0.03 * d["frac"]
         self._refresh(j)
+        if self._shown_slot() is not slot:
+            self._update_total()
+            return
+        kind = slot.runner.kind if slot.stage == "main" else "split"
+        name = f"{j.name}  →  {os.path.basename(j.out)}" + (f"  ·  {t('st_' + kind)}" if kind != "main" else "")
+        if self.st_name.text() != name:
+            self.st_name.setText(name)
         self.st_bar.setValue(int(d["frac"] * 1000))
         self.st_bar.setFormat(f"{d['frac'] * 100:.1f}%  ·  {P.fmt_time(d['out_time'])} / "
                               f"{P.fmt_time(J.out_duration(j))}")
@@ -1284,58 +1724,127 @@ class MainWindow(MainUI, QMainWindow):
         self.st["fps"].setText(f"{d['fps']:.1f}" if d["fps"] else "—")
         br = d["bitrate"]
         self.st["bitrate"].setText(br.replace("kbits/s", " kbit/s") if br and br != "N/A" else "—")
-        if d["size"]:
+        if d["size"] and kind == "main":
             est = d["size"] / d["frac"] if d["frac"] > 0.02 else 0
             self.st["size"].setText(P.fmt_size(d["size"]) + (f"  (≈ {P.fmt_size(est)})" if est else ""))
         self._update_total()
 
-    def _on_log(self, line: str):
-        self.log.appendPlainText(line)
-        self._run_log.append(line)
+    def _on_log(self, line: str, slot: Slot | None = None):
+        slot = slot or self.slots[0]
+        many = len(self._busy_slots()) > 1
+        if many and slot.job is not None:
+            self.log.appendPlainText(f"[{self.jobs.index(slot.job) + 1 if slot.job in self.jobs else '?'}] {line}")
+        else:
+            self.log.appendPlainText(line)
+        slot.log.append(line)
 
-    def _on_finished(self, ok: bool, err: str):
-        j = self.current
-        self.current = None
-        if j is not None:
-            for kind, ext in J.WORK_KINDS:                       # the small files of Trim / Chapters / vid.stab
-                try:
-                    os.remove(J.work_file(j, kind, None, ext))
-                except OSError:
-                    pass
-            j.elapsed = self.runner.elapsed()
+    def _on_finished(self, ok: bool, err: str, slot: Slot | None = None):
+        slot = slot or self.slots[0]
+        j = slot.job
+        if j is None:
+            return
+        if slot.stage == "main":
             if ok:
-                j.status, j.progress = "done", 1.0
-                try:
-                    j.out_size = os.path.getsize(j.out)
-                except OSError:
-                    pass
-                self.log.appendPlainText(f"✓ {j.out} — {P.fmt_size(j.out_size)}, {P.fmt_time(j.elapsed)}")
-            elif self.runner.cancelled:
-                j.status, j.progress, j.out = "stop", 0.0, ""
+                j.metrics = J.parse_metrics(slot.log)
+                if slot.runner.post_failed and self.cfg.get("metrics"):
+                    self.log.appendPlainText("⚠ " + t("m_failed"))
+            if ok and J.split_on(j) and os.path.isfile(j.out):
+                self._split(slot)
+                return
+        elif slot.stage == "split":
+            if ok:
+                parts = J.split_parts(j.out)
+                if parts:
+                    try:
+                        os.remove(j.out)
+                    except OSError:
+                        pass
+                    j.parts = parts
+                    j.out = parts[0]
             else:
-                j.status, j.error, j.out = "error", err, ""
-                self.log.appendPlainText("✗ " + err)
-            self._save_log(j)
-            self._refresh(j)
-            sel = self.selected_jobs()
-            if sel and sel[0] is j:
-                self._select_changed()
-        self.st_bar.setValue(1000 if ok else 0)
+                for f in J.split_parts(j.out):                # a broken split: the whole file stays
+                    try:
+                        os.remove(f)
+                    except OSError:
+                        pass
+                self.log.appendPlainText("⚠ " + t("split_failed") + (": " + err if err else ""))
+                ok, err = True, ""
+        J.cleanup(j)
+        slot.job = None
+        j.elapsed = time.time() - slot.started if slot.started else slot.runner.elapsed()
+        if ok:
+            j.status, j.progress = "done", 1.0
+            files = j.parts or [j.out]
+            j.out_size = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
+            extra = "".join(f", {k.upper()} {v:.4g}" for k, v in j.metrics.items())
+            self.log.appendPlainText(f"✓ {j.out} — {P.fmt_size(j.out_size)}, {P.fmt_time(j.elapsed)}" + extra +
+                                     (f" · {t('parts_n', len(j.parts))}" if len(j.parts) > 1 else ""))
+        elif slot.runner.cancelled:
+            j.status, j.progress, j.out = "stop", 0.0, ""
+        else:
+            j.status, j.error, j.out = "error", err, ""
+            self.log.appendPlainText("✗ " + err)
+        self._save_log(j, slot)
+        self._refresh(j)
+        sel = self.selected_jobs()
+        if sel and sel[0] is j:
+            self._select_changed()
+        self._show_metrics(j)
+        nxt = self._shown_slot()
+        if nxt is not None:
+            self._show_slot(nxt)
+        else:
+            self.st_bar.setValue(1000 if ok else 0)
         self._update_buttons()
         self._queue_changed()
         if self.running:
             QTimer.singleShot(200, self._next)
 
-    def _save_log(self, j: J.Job):
+    def _split(self, slot: Slot):
+        """1.4: the finished file into parts — by time at once, by size after reading its packets."""
+        j = slot.job
+        slot.stage = "split"
+        sp = j.settings.get("split") or {}
+        self.log.appendPlainText("✂ " + t("split_running"))
+        if sp.get("mode") != "size":
+            self._on_split_times(slot.n, None)
+            return
+        path, mb = j.out, float(sp.get("size_mb", 700) or 700)
+
+        def work():
+            try:
+                self.bridge.split.emit(slot.n, J.size_times(ff.ffprobe() or "ffprobe", path, mb))
+            except Exception as e:                          # noqa: BLE001
+                self.bridge.split.emit(slot.n, str(e))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_split_times(self, n: int, times):
+        slot = self.slots[n]
+        j = slot.job
+        if j is None or slot.stage != "split":
+            return
+        if isinstance(times, str):
+            self._on_finished(False, times, slot)
+            return
+        if isinstance(times, list) and not times:            # small enough already: one part
+            self._on_finished(True, "", slot)
+            return
+        args = J.split_args(j, ff.ffmpeg() or "ffmpeg", j.out, times)
+        slot.runner.start(args, J.split_pattern(j.out), J.out_duration(j), self.cfg.get("priority", "below"),
+                          cores=self._cores(slot), direct=True, kinds=["split"])
+
+    def _save_log(self, j: J.Job, slot: Slot | None = None):
         """The conversion's log file (Settings → keep logs): what, into what, the result, all of ffmpeg."""
-        lines, self._run_log = self._run_log, []
+        lines = slot.log if slot is not None else []
+        if slot is not None:
+            slot.log = []
         if not self.cfg.get("save_logs", True):
             return
         cmd = lines[0][2:] if lines and lines[0].startswith("$ ") else ""
         path = logs.save(j.src, j.out, j.status, j.error, j.elapsed, j.out_size,
                          J.describe(j.settings, self.av if self.av_ready else None, t), cmd,
                          lines[1:] if cmd else lines, j.settings,
-                         bool(self.cfg.get("log_next_to_output")), self._run_started or None)
+                         bool(self.cfg.get("log_next_to_output")), (slot.started if slot else 0) or None)
         if path:
             j.log_path = path
 
@@ -1383,27 +1892,32 @@ class MainWindow(MainUI, QMainWindow):
         self.toggle_queue_pause()
 
     def toggle_queue_pause(self):
-        if not self.runner.running:
+        run = [s for s in self.slots if s.runner.running]
+        if not run:
             return
-        on = not self.runner.paused
-        if self.runner.pause(on) and self.current is not None:
-            self.current.status = "pause" if on else "run"
-            self._refresh(self.current)
+        on = not self._all_paused()
+        for s in run:
+            if s.runner.pause(on) and s.job is not None:
+                s.job.status = "pause" if on else "run"
+                self._refresh(s.job)
         self._update_buttons()
         self._update_total()
+
     def stop_queue(self):
         self.running = False
-        if self.runner.running:
-            self.runner.cancel()
+        for s in self.slots:
+            if s.runner.running:
+                s.runner.cancel()
         self._update_buttons()
 
     def _update_buttons(self):
-        busy = self.runner.running
-        self.b_start.setEnabled(not busy or self.runner.paused)
-        self.b_start.setText("  " + (t("resume") if busy and self.runner.paused else t("start")))
+        busy = self._any_running()
+        paused = self._all_paused()
+        self.b_start.setEnabled(not busy or paused or not self.running)
+        self.b_start.setText("  " + (t("resume") if busy and paused else t("start")))
         self.b_pause.setEnabled(busy)
-        self.b_pause.setIcon(style.icon("fa6s.play" if self.runner.paused else "fa6s.pause", style.ICON))
-        self.b_pause.setToolTip((t("resume") if self.runner.paused else t("pause")) + " (Space)")
+        self.b_pause.setIcon(style.icon("fa6s.play" if paused else "fa6s.pause", style.ICON))
+        self.b_pause.setToolTip((t("resume") if paused else t("pause")) + " (Space)")
         self.b_stop.setEnabled(busy or self.running)
         has_sel = bool(self.view.selectedItems())
         for b in (self.b_remove, self.b_up, self.b_down):
@@ -1412,18 +1926,18 @@ class MainWindow(MainUI, QMainWindow):
 
     def _update_total(self):
         todo = [j for j in self.jobs if j.status in ("wait", "probe", "run", "pause", "done") and j.info is not None]
-        if not todo or not (self.running or self.runner.running):
+        if not todo or not (self.running or self._any_running()):
             self.total.setValue(0)
             self.total.setFormat("")
             self.setWindowTitle(APP_TITLE)
             return
-        w = [max(1.0, j.info.duration) for j in todo]
+        w = [max(1.0, J.out_duration(j)) for j in todo]
         done = sum(wi * (j.progress if j.status in ("run", "pause", "done") else 0.0) for wi, j in zip(w, todo))
         frac = done / sum(w)
         n_done = sum(1 for j in todo if j.status == "done")
         self.total.setValue(int(frac * 1000))
-        self.total.setFormat(t("total_fmt", n_done + (1 if self.current else 0), len(todo), f"{frac * 100:.0f}"))
-        paused = self.runner.paused
+        self.total.setFormat(t("total_fmt", n_done + len(self._busy_slots()), len(todo), f"{frac * 100:.0f}"))
+        paused = self._all_paused()
         self.taskbar.set(int(self.winId()), frac, winint.TaskbarProgress.PAUSED if paused else winint.TaskbarProgress.NORMAL)
         self.setWindowTitle(f"{frac * 100:.0f}% — {APP_TITLE}" + (f" ({t('s_pause')})" if paused else ""))
 
@@ -1436,8 +1950,15 @@ class MainWindow(MainUI, QMainWindow):
             self.st["cpu"].setText(f"{psutil.cpu_percent(None):.0f}%")
             vm = psutil.virtual_memory()
             self.st["ram"].setText(f"{P.fmt_size(vm.used)} / {P.fmt_size(vm.total)}")
-            pid = self.runner.proc.processId() if self.runner.proc is not None else 0
-            self.st["ff_mem"].setText(P.fmt_size(psutil.Process(int(pid)).memory_info().rss) if pid else "—")
+            rss = 0
+            for sl in self.slots:
+                pid = sl.runner.proc.processId() if sl.runner.proc is not None else 0
+                if pid:
+                    try:
+                        rss += psutil.Process(int(pid)).memory_info().rss
+                    except Exception:
+                        pass
+            self.st["ff_mem"].setText(P.fmt_size(rss) if rss else "—")
         except Exception:
             pass
         d = os.path.dirname(self.current.out) if self.current is not None else \
@@ -1448,7 +1969,7 @@ class MainWindow(MainUI, QMainWindow):
             self.st["disk"].setText(P.fmt_size(shutil.disk_usage(d).free) if d else "—")
         except OSError:
             self.st["disk"].setText("—")
-        if not self._gpu_busy and (self.runner.running or not self._gpu):
+        if not self._gpu_busy and (self._any_running() or not self._gpu):
             self._gpu_busy = True
 
             def work():
@@ -1486,7 +2007,8 @@ class MainWindow(MainUI, QMainWindow):
         gpu = av.gpu()
         self.log.appendPlainText(t("enc_found", E.VENDOR_LABEL.get(gpu, t("enc_no_gpu")) if gpu else t("enc_no_gpu"),
                                    ", ".join(e.ffname for e in E.VIDEO if av.ok.get(e.id)) or "—"))
-        if self.running and self.current is None:
+        self._show_metrics(None)
+        if self.running:
             self._next()
 
     # ── menu, settings, updates ───────────────────────────────
@@ -1559,7 +2081,7 @@ class MainWindow(MainUI, QMainWindow):
             from PySide6.QtGui import QDesktopServices
             QDesktopServices.openUrl(QUrl(info["page"]))
             return
-        if self.runner.running and QMessageBox.question(self, APP_TITLE, t("upd_busy")) != QMessageBox.Yes:
+        if self._any_running() and QMessageBox.question(self, APP_TITLE, t("upd_busy")) != QMessageBox.Yes:
             return
         from .dialogs import UpdateDialog
         d = UpdateDialog(info, self)
@@ -1626,16 +2148,18 @@ class MainWindow(MainUI, QMainWindow):
             self._toast(t("added_n", n) if n else t("added_none"))
 
     def closeEvent(self, e):
-        if self.runner.running and not getattr(self, "_installer", "") and not self._quitting:
+        if self._any_running() and not getattr(self, "_installer", "") and not self._quitting:
             if QMessageBox.question(self, APP_TITLE, t("ask_quit_busy")) != QMessageBox.Yes:
                 e.ignore()
                 return
         self._quitting = True
         self.running = False
-        if self.runner.running:
-            self.runner.cancel()
+        if self._any_running():
+            for sl in self.slots:
+                if sl.runner.running:
+                    sl.runner.cancel()
             t0 = time.monotonic()
-            while self.runner.running and time.monotonic() - t0 < 5:
+            while any(sl.runner.running for sl in self.slots) and time.monotonic() - t0 < 5:
                 QApplication.processEvents()
                 time.sleep(0.02)
         self.save_queue()
@@ -1660,6 +2184,26 @@ class _Shim:
 
     def __init__(self, st: dict):
         self.settings, self.info, self.crop_found = st, None, None
+
+
+def _lang_from_name(path: str, src: str) -> str:
+    """«Film.rus.ac3», «Film_eng.srt», «Film.Russian.srt» → the language code (ISO 639-2), else ""."""
+    import re as _re
+    from .edit_tabs import LANGS
+    stem = os.path.splitext(os.path.basename(path))[0].lower()
+    base = os.path.splitext(os.path.basename(src))[0].lower()
+    if stem.startswith(base):
+        stem = stem[len(base):]
+    words = [w for w in _re.split(r"[^a-zа-яё]+", stem) if w]
+    names = {"russian": "rus", "english": "eng", "bulgarian": "bul", "german": "deu", "french": "fra",
+             "ukrainian": "ukr", "spanish": "spa", "italian": "ita", "japanese": "jpn", "русский": "rus",
+             "английский": "eng", "ru": "rus", "en": "eng", "bg": "bul", "de": "deu", "fr": "fra", "uk": "ukr"}
+    for w in reversed(words):
+        if w in LANGS and w != "und":
+            return w
+        if w in names:
+            return names[w]
+    return ""
 
 
 def _esc(s: str) -> str:

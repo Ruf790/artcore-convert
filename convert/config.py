@@ -34,7 +34,15 @@ DEFAULTS = {
     "save_logs":     True,          # a log file of every conversion in <data>\logs (the Log tab)
     "log_next_to_output": False,    # and a copy next to the result (name.log)
     "encoders":      {},            # cache of the hardware test: {ffmpeg version: {encoder: ok}}
+    # 1.4
+    "cpu_limit":     100,           # % of the processor ffmpeg may use (threads + the cores it runs on)
+    "parallel":      1,             # tasks encoded at the same time (1 … 4)
+    "metrics":       [],            # psnr / ssim / vmaf measured on every finished file (Status tab)
+    "show_frame":    True,          # the frame being encoded on the Status tab
+    "task_view":     "cards",       # cards | rows
 }
+
+CPU_LIMITS = (100, 75, 50, 25)
 
 PRIORITIES = ("idle", "below", "normal", "above")
 ON_DONE = ("nothing", "open", "sleep", "shutdown", "quit")
@@ -103,6 +111,17 @@ def load() -> dict:
     for k in ("defaults", "encoders"):
         if not isinstance(cfg.get(k), dict):
             cfg[k] = {}
+    if cfg.get("cpu_limit") not in CPU_LIMITS:
+        cfg["cpu_limit"] = 100
+    try:
+        cfg["parallel"] = max(1, min(4, int(cfg.get("parallel", 1))))
+    except (TypeError, ValueError):
+        cfg["parallel"] = 1
+    if not isinstance(cfg.get("metrics"), list):
+        cfg["metrics"] = []
+    cfg["metrics"] = [m for m in cfg["metrics"] if m in ("psnr", "ssim", "vmaf")]
+    if cfg.get("task_view") not in ("cards", "rows"):
+        cfg["task_view"] = "cards"
     if not isinstance(cfg.get("out_suffix"), str):
         cfg["out_suffix"] = "_convert"
     return cfg

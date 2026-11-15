@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QRect, QSize, Qt
+from PySide6.QtCore import QRect, QSize, Qt, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -161,9 +161,13 @@ class TaskCard(QStyledItemDelegate):
         p.setFont(option.font)
         line2 = ""
         if j.info is not None and not j.info.error:
-            line2 = f"{J.fmt_tc(j.info.duration)} {P.fmt_size(j.info.size)}"
+            line2 = f"{J.fmt_tc(J.src_duration(j))} {P.fmt_size(j.info.size)}"
+            if j.joins:
+                line2 += f"  ⧉{len(j.joins) + 1}"
             if J.segments(j):
                 line2 += f"  ✂ {J.fmt_tc(J.out_duration(j), False)}"
+            if j.ext:
+                line2 += f"  ＋{len(j.ext)}"
         p.setPen(mut)
         p.drawText(QRect(x0, r.top() + 28, x1 - x0, 18), Qt.AlignLeft | Qt.AlignVCenter, line2)
         bar = QRect(x0, r.top() + 52, x1 - x0, 6)
@@ -181,7 +185,7 @@ class TaskCard(QStyledItemDelegate):
         p.drawText(QRect(x0, r.top() + 66, x1 - x0, 20), Qt.AlignLeft | Qt.AlignVCenter, state + ":")
         right = ""
         if j.status == "done" and j.out_size:
-            right = P.fmt_size(j.out_size)
+            right = P.fmt_size(j.out_size) + (f" · {len(j.parts)}×" if len(j.parts) > 1 else "")
         elif j.info is not None and j.info.video is not None:
             right = P.resolution_name(j.info.video.width, j.info.video.height)
         elif j.info is not None and j.info.of("audio"):
@@ -191,6 +195,42 @@ class TaskCard(QStyledItemDelegate):
         p.setPen(QPen(QColor(style.BORDER), 1))
         p.drawLine(r.left(), r.bottom() + 1, r.right(), r.bottom() + 1)
         p.restore()
+
+
+class TaskList(QTreeWidget):
+    """The task list: tasks are put in order with the mouse (1.4); files dropped on it are added."""
+    reordered = Signal()
+    files_dropped = Signal(list)
+
+    def __init__(self):
+        super().__init__()
+        self.setDragEnabled(True)
+        self.setAcceptDrops(True)
+        self.setDragDropMode(QAbstractItemView.InternalMove)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDropIndicatorShown(True)
+
+    def dragEnterEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragEnterEvent(e)
+
+    def dragMoveEvent(self, e):
+        if e.mimeData().hasUrls():
+            e.acceptProposedAction()
+        else:
+            super().dragMoveEvent(e)
+
+    def dropEvent(self, e):
+        if e.mimeData().hasUrls():
+            paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
+            e.acceptProposedAction()
+            if paths:
+                self.files_dropped.emit(paths)
+            return
+        super().dropEvent(e)
+        self.reordered.emit()
 
 
 class MainUI:
@@ -266,6 +306,9 @@ class MainUI:
         A(m, "fa6s.folder-open", t("add_folder") + "…", self.add_folder_dialog, "Ctrl+Shift+O")
         A(m, "fa6s.floppy-disk", t("save_as") + "…", self.save_as, "Ctrl+S")
         m.addSeparator()
+        A(m, "fa6s.file-export", t("q_save") + "…", self.save_task_list)
+        A(m, "fa6s.file-import", t("q_load") + "…", self.load_task_list)
+        m.addSeparator()
         A(m, "fa6s.play", t("open_result"), lambda: self._open_result(next(iter(self.selected_jobs()), None)))
         A(m, "fa6s.folder", t("show_source"), lambda: [winint.show_in_explorer(j.src) for j in self.selected_jobs()[:1]])
         m = mb.addMenu(t("m_tasks"))
@@ -277,6 +320,10 @@ class MainUI:
         A(m, "fa6s.forward", t("skip"), lambda: self._skip(self.selected_jobs()))
         A(m, "fa6s.arrow-up", t("move_up"), lambda: self.move_selected(-1))
         A(m, "fa6s.arrow-down", t("move_down"), lambda: self.move_selected(1))
+        m.addSeparator()
+        A(m, "fa6s.object-group", t("join_selected"), self.join_selected)
+        A(m, "fa6s.link", t("join_add") + "…", self.join_add_dialog)
+        A(m, "fa6s.plus", t("ext_add") + "…", self.add_external_dialog)
         m.addSeparator()
         A(m, "fa6s.minus", t("remove"), self.remove_selected)
         A(m, "fa6s.broom", t("clear_done"), self.clear_done)
@@ -294,6 +341,7 @@ class MainUI:
         A(m, "", t("preset_default_now"), self._make_default)
         m.addSeparator()
         A(m, "fa6s.microchip", t("encoders_here") + "…", self.encoders_dialog)
+        A(m, "fa6s.gauge-high", t("bench") + "…", self.bench_dialog)
         m = mb.addMenu(t("m_help"))
         A(m, "fa6s.circle-info", t("about"), self.about)
         return mb
@@ -375,6 +423,25 @@ class MainUI:
         self.prio.setCurrentIndex(config.PRIORITIES.index(self.cfg.get("priority", "below")))
         self.prio.currentIndexChanged.connect(self._prio_changed)
         pl.addWidget(self.prio)
+        self.b_cpu = QToolButton()                       # 1.4: «100% ▾» as in XviD4PSP
+        self.b_cpu.setObjectName("ctlText")
+        self.b_cpu.setPopupMode(QToolButton.InstantPopup)
+        self.b_cpu.setToolTip(t("cpu_limit_tip"))
+        cm = QMenu(self.b_cpu)
+        for pct in config.CPU_LIMITS:
+            a = cm.addAction(f"{pct}%")
+            a.triggered.connect(lambda _c=False, x=pct: self.set_cpu_limit(x))
+        self.b_cpu.setMenu(cm)
+        pl.addWidget(self.b_cpu)
+        pl.addSpacing(8)
+        pl.addWidget(QLabel(t("parallel") + ":"))
+        self.par_box = QComboBox()
+        self.par_box.setToolTip(t("parallel_tip"))
+        for n in range(1, 5):
+            self.par_box.addItem(str(n), n)
+        self.par_box.setCurrentIndex(int(self.cfg.get("parallel", 1)) - 1)
+        self.par_box.currentIndexChanged.connect(lambda: self.set_parallel(self.par_box.currentData()))
+        pl.addWidget(self.par_box)
         self.top_right.addWidget(pr)
         lay.addWidget(self.top_right)
         self._fill_presets()
@@ -387,20 +454,22 @@ class MainUI:
         lay = QVBoxLayout(w)
         lay.setContentsMargins(0, 0, 0, 0)
         lay.setSpacing(0)
-        self.view = QTreeWidget()
+        self.view = TaskList()
         self.view.setObjectName("cards")
         self.view.setColumnCount(5)
-        self.view.setHeaderHidden(True)
-        for c in range(1, 5):
-            self.view.setColumnHidden(c, True)
+        self.view.setHeaderLabels(["№", t("col_file"), t("col_source"), t("col_profile"), t("col_state")])
         self.view.setRootIsDecorated(False)
         self.view.setIndentation(0)
         self.view.setUniformRowHeights(True)
         self.view.setSelectionMode(QAbstractItemView.ExtendedSelection)
         self.view.setMouseTracking(True)
-        self.view.setItemDelegate(TaskCard(self))
+        self._card = TaskCard(self)
+        self._plain = QStyledItemDelegate(self.view)
         self.view.setStyleSheet(f"QTreeWidget#cards {{ background: {style.PANEL}; border: none; outline: none; }}"
                                 "QTreeWidget#cards::item { border: none; padding: 0; }")
+        self.view.reordered.connect(self._on_reordered)
+        self.view.files_dropped.connect(self.add_paths)
+        self._apply_task_view()
         self.view.itemSelectionChanged.connect(self._select_changed)
         self.view.setContextMenuPolicy(Qt.CustomContextMenu)
         self.view.customContextMenuRequested.connect(self._queue_menu)
@@ -417,6 +486,31 @@ class MainUI:
         self.q_count.setContentsMargins(10, 4, 10, 4)
         lay.addWidget(self.q_count)
         return w
+
+    def _apply_task_view(self):
+        """1.4: the task list as cards (thumbnail, progress) or as rows (a table, as XviD4PSP)."""
+        rows = self.cfg.get("task_view", "cards") == "rows"
+        self.view.setItemDelegate(self._plain if rows else self._card)
+        self.view.setHeaderHidden(not rows)
+        for c in range(1, 5):
+            self.view.setColumnHidden(c, not rows)
+        hh = self.view.header()
+        if rows:
+            hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
+            hh.setSectionResizeMode(1, QHeaderView.Interactive)
+            hh.resizeSection(1, 200)
+        self.view.setStyleSheet(
+            f"QTreeWidget#cards {{ background: {style.PANEL}; border: none; outline: none; }}" +
+            ("" if rows else "QTreeWidget#cards::item { border: none; padding: 0; }"))
+        for b, key in ((getattr(self, "b_view_cards", None), "cards"), (getattr(self, "b_view_rows", None), "rows")):
+            if b is not None:
+                b.setChecked(self.cfg.get("task_view", "cards") == key)
+        self.view.doItemsLayout()
+
+    def set_task_view(self, mode: str):
+        self.cfg["task_view"] = mode
+        config.save(self.cfg)
+        self._apply_task_view()
 
     # ── centre: the picture + strip, or the log ───────────────
     def _build_center(self) -> QWidget:
@@ -539,6 +633,42 @@ class MainUI:
                 self.st[k] = val
             g.setColumnStretch(1, 1)
             lay.addWidget(box)
+        # 1.4: the frame being encoded
+        self.fr_on = QCheckBox()
+        self.fr_on.setChecked(bool(self.cfg.get("show_frame", True)))
+        self.fr_on.setToolTip(t("st_frame_tip"))
+        self.fr_on.toggled.connect(self._frame_toggled)
+        lay.addWidget(self._section(t("st_frame"), None, self.fr_on))
+        self.fr_img = QLabel(t("st_frame_none"))
+        self.fr_img.setObjectName("hint")
+        self.fr_img.setAlignment(Qt.AlignCenter)
+        self.fr_img.setMinimumHeight(150)
+        self.fr_img.setContentsMargins(14, 6, 14, 8)
+        lay.addWidget(self.fr_img)
+        # 1.4: quality metrics of the finished file
+        lay.addWidget(self._section(t("st_metrics")))
+        mb = QWidget()
+        mg = QGridLayout(mb)
+        mg.setContentsMargins(14, 6, 14, 8)
+        mg.setVerticalSpacing(5)
+        self.m_check: dict[str, QCheckBox] = {}
+        self.m_val: dict[str, QLabel] = {}
+        for row, key in enumerate(J.METRICS):
+            cb = QCheckBox(key.upper())
+            cb.setChecked(key in self.cfg.get("metrics", []))
+            cb.setToolTip(t("m_tip_" + key))
+            cb.toggled.connect(lambda _on: self._metrics_changed())
+            mg.addWidget(cb, row, 0)
+            val = QLabel("—")
+            val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            val.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            mg.addWidget(val, row, 1)
+            self.m_check[key] = cb
+            self.m_val[key] = val
+        self.m_hint = _hint(t("m_hint"))
+        mg.addWidget(self.m_hint, len(J.METRICS), 0, 1, 2)
+        mg.setColumnStretch(1, 1)
+        lay.addWidget(mb)
         lay.addStretch(1)
         return w
 
@@ -703,6 +833,14 @@ class MainUI:
         self.tracks_lay.setContentsMargins(0, 0, 0, 0)
         self.tracks_lay.setSpacing(0)
         lay.addWidget(self.tracks_box)
+        self.b_ext = ctl_button("fa6s.plus", t("ext_add"), 14, self.add_external_dialog)
+        self.ext_head = self._section(t("ext_tracks"), self.b_ext)
+        lay.addWidget(self.ext_head)
+        self.ext_box = QWidget()
+        self.ext_lay = QVBoxLayout(self.ext_box)
+        self.ext_lay.setContentsMargins(0, 0, 0, 0)
+        self.ext_lay.setSpacing(0)
+        lay.addWidget(self.ext_box)
         self.tr_hint = _hint()
         self.tr_hint.setContentsMargins(12, 8, 12, 8)
         lay.addWidget(self.tr_hint)
@@ -727,12 +865,21 @@ class MainUI:
             it = self.tracks_lay.takeAt(0)
             if it.widget() is not None:
                 it.widget().deleteLater()
+        while self.ext_lay.count():
+            it = self.ext_lay.takeAt(0)
+            if it.widget() is not None:
+                it.widget().deleteLater()
         jobs = self.selected_jobs()
-        if len(jobs) != 1 or jobs[0].info is None or jobs[0].info.error:
+        one = len(jobs) == 1 and jobs[0].info is not None and not jobs[0].info.error
+        self.ext_head.setVisible(one)
+        self.ext_box.setVisible(one)
+        if not one:
             self.tr_hint.setText(t("tr_pick_one"))
             return
         j = jobs[0]
-        ed = j.status in EDITABLE_ and j is not self.current
+        ed = j.status in EDITABLE_ and not self._busy(j)
+        self.b_ext.setEnabled(ed)
+        self._fill_ext(j, ed)
         self.tr_hint.setText(t("tr_hint"))
         pl = J.plan(j)
         out_audio = {s.index: c for s, c in pl["audio"]}
@@ -847,6 +994,84 @@ class MainUI:
             self.tracks_lay.addWidget(body)
         self._compact(self.tracks_box, 8)
 
+    def _fill_ext(self, j, ed: bool):
+        """1.4: the external tracks of the task: language, delay, codec; ✕ takes one away."""
+        from .edit_tabs import LANGS
+        pl = J.plan(j)
+        used = {J.ext_no(s): c for s, c in pl["audio"] + pl["subs"] if J.ext_no(s) is not None}
+        c = E.container(j.settings.get("container", "mkv"))
+        for n, e in enumerate(j.ext):
+            audio = e.get("kind") == "audio"
+            info = J.file_info(j, e["path"])
+            bad = info is not None and (info.error or not info.of(e.get("kind", "audio")))
+            rm = ctl_button("fa6s.xmark", t("ext_remove"), 13, lambda _c=False, k=n: self._ext_remove(k))
+            rm.setEnabled(ed)
+            lang = QComboBox()
+            lang.setObjectName("extLang")
+            for code in LANGS:
+                lang.addItem(f"{code} — {t('lang_' + code)}", code)
+            cur = e.get("lang") or "und"
+            if lang.findData(cur) < 0:
+                lang.addItem(cur, cur)
+            lang.setCurrentIndex(lang.findData(cur))
+            lang.setEnabled(ed)
+            lang.currentIndexChanged.connect(lambda _i, b=lang, k=n: self._ext_opt(k, "lang", b.currentData()))
+            head = QWidget()
+            hl = QHBoxLayout(head)
+            hl.setContentsMargins(0, 0, 0, 0)
+            hl.addWidget(lang)
+            hl.addWidget(rm)
+            mark = "🔊" if audio else "💬"
+            text = f"{mark} {os.path.basename(e['path'])}"
+            if info is None:
+                text += " …"
+            elif bad:
+                text += " — " + t("ext_bad")
+            elif n not in used:
+                text += " — " + t("sub_drop")
+            self.ext_lay.addWidget(self._section(text, head))
+            body = QWidget()
+            g = QGridLayout(body)
+            g.setContentsMargins(12, 4, 12, 8)
+            g.setHorizontalSpacing(8)
+            g.setVerticalSpacing(4)
+            dl = QSpinBox()
+            dl.setObjectName("extDelay")
+            dl.setRange(-600000, 600000)
+            dl.setSingleStep(10)
+            dl.setSuffix(" " + t("ms"))
+            dl.setKeyboardTracking(False)
+            dl.setToolTip(t("ext_delay_tip"))
+            dl.setValue(int(e.get("delay", 0) or 0))
+            dl.setEnabled(ed)
+            dl.valueChanged.connect(lambda x, k=n: self._ext_opt(k, "delay", int(x)))
+            g.addWidget(QLabel(t("a_delay")), 0, 0)
+            g.addWidget(dl, 0, 1)
+            if audio:
+                codec = QComboBox()
+                codec.setObjectName("extCodec")
+                codec.addItem(t("tr_default") + (f" ({self._a_label(used.get(n))})" if n in used else ""), "")
+                codec.addItem(t("a_copy"), "copy")
+                for a in E.AUDIO:
+                    codec.addItem(a.label.split(" (")[0], a.id)
+                    if not c.takes_audio(E.A_CODEC.get(a.id, a.id)):
+                        codec.model().item(codec.count() - 1).setEnabled(False)
+                codec.setCurrentIndex(max(0, codec.findData(e.get("codec", ""))))
+                codec.setEnabled(ed)
+                codec.currentIndexChanged.connect(lambda _i, b=codec, k=n: self._ext_opt(k, "codec", b.currentData()))
+                g.addWidget(QLabel(t("codec") + ":"), 1, 0)
+                g.addWidget(codec, 1, 1)
+            dft = QCheckBox(t("ext_default"))
+            dft.setChecked(bool(e.get("default")))
+            dft.setEnabled(ed)
+            dft.toggled.connect(lambda on, k=n: self._ext_opt(k, "default", bool(on)))
+            g.addWidget(dft, 2, 1)
+            g.setColumnStretch(1, 1)
+            self.ext_lay.addWidget(body)
+        if not j.ext:
+            self.ext_lay.addWidget(_hint(t("ext_hint")))
+        self._compact(self.ext_box, 8)
+
     def _track_keep(self, idx: int, on: bool):
         jobs = self.selected_jobs(editable=True)
         if len(jobs) != 1:
@@ -923,6 +1148,13 @@ class MainUI:
         lay.setSpacing(6)
         self.b_tasks = ctl_button("fa6s.table-list", t("show_tasks"), 15, self._toggle_tasks)
         lay.addWidget(self.b_tasks)
+        self.b_view_cards = ctl_button("fa6s.grip", t("view_cards"), 14, lambda: self.set_task_view("cards"))
+        self.b_view_rows = ctl_button("fa6s.list", t("view_rows"), 14, lambda: self.set_task_view("rows"))
+        for b in (self.b_view_cards, self.b_view_rows):
+            b.setCheckable(True)
+            lay.addWidget(b)
+        self.b_view_cards.setChecked(self.cfg.get("task_view", "cards") == "cards")
+        self.b_view_rows.setChecked(self.cfg.get("task_view", "cards") == "rows")
         lay.addStretch(1)
         tr = self.trim_tab
         tr.b_mute.setVisible(True)
@@ -1061,6 +1293,11 @@ class MainUI:
         sp.addWidget(self.v_speed_lab)
         g.addWidget(QLabel(t("speed")), 3, 0)
         g.addLayout(sp, 3, 1, 1, 2)
+        self.v_2pass = QCheckBox(t("two_pass"))                         # 1.4
+        self.v_2pass.toggled.connect(lambda on: self._set("video", "passes", 2 if on else 1))
+        self.v_2pass_hint = _hint()
+        g.addWidget(self.v_2pass, 4, 0, 1, 2)
+        g.addWidget(self.v_2pass_hint, 5, 0, 1, 3)
         lay.addWidget(box)
         self.codec_hint = _hint()
         lay.addWidget(self.codec_hint)
@@ -1083,7 +1320,50 @@ class MainUI:
         meta.toggled.connect(lambda on: self._set(None, "meta", bool(on)))
         lay.addWidget(meta)
         lay.addWidget(_hint(t("fmt_hint")))
+        sp = dict(st.get("split") or {})                                # 1.4: the result in parts
+        box = QGroupBox(t("split"))
+        sg = QGridLayout(box)
+        mode = QComboBox()
+        mode.setObjectName("splitMode")
+        for key in ("off", "size", "time"):
+            mode.addItem(t("split_" + key), key)
+        mode.setCurrentIndex(max(0, mode.findData(sp.get("mode", "off"))))
+        size = QComboBox()
+        size.setObjectName("splitSize")
+        size.setEditable(True)
+        for mb_ in (100, 350, 700, 1400, 2000, 4095, 4480, 8500, 23000):
+            size.addItem(f"{mb_} MB", mb_)
+        size.setEditText(f"{sp.get('size_mb', 700)} MB")
+        mins = QSpinBox()
+        mins.setObjectName("splitMinutes")
+        mins.setRange(1, 600)
+        mins.setSuffix(" " + t("minutes"))
+        mins.setValue(int(sp.get("minutes", 20) or 20))
+
+        def upd():
+            m = mode.currentData()
+            size.setEnabled(m == "size")
+            mins.setEnabled(m == "time")
+            try:
+                mb_v = float(size.currentText().split()[0].replace(",", "."))
+            except (ValueError, IndexError):
+                mb_v = float(sp.get("size_mb", 700) or 700)
+            self._set(None, "split", {"mode": m, "size_mb": max(1, int(mb_v)), "minutes": int(mins.value())})
+        mode.currentIndexChanged.connect(lambda _i: upd())
+        size.currentTextChanged.connect(lambda _x: upd() if mode.currentData() == "size" else None)
+        mins.valueChanged.connect(lambda _x: upd() if mode.currentData() == "time" else None)
+        size.setEnabled(mode.currentData() == "size")
+        mins.setEnabled(mode.currentData() == "time")
+        sg.addWidget(mode, 0, 0, 1, 2)
+        sg.addWidget(QLabel(t("split_size")), 1, 0)
+        sg.addWidget(size, 1, 1)
+        sg.addWidget(QLabel(t("split_time")), 2, 0)
+        sg.addWidget(mins, 2, 1)
+        sg.addWidget(_hint(t("split_hint")), 3, 0, 1, 2)
+        box.setEnabled(c.id != "gif")
+        lay.addWidget(box)
         d = SmallDialog(c.label, body, self)
+        self._format_dlg = d
         d.exec()
 
     def history_dialog(self):
@@ -1138,8 +1418,9 @@ class MainUI:
         self.trim_tab.bar.clear_media()
         if j is None or j.info is None or j.info.error:
             return
-        self._media_src = j.src
-        self.media.request(j.src, j.info.duration, j.info.video is not None, bool(j.info.of("audio")))
+        src = J.media_src(j)
+        self._media_src = src
+        self.media.request(src, J.src_duration(j), j.info.video is not None, bool(j.info.of("audio")))
 
     def _on_strip(self, path: str, pngs: list):
         if path == getattr(self, "_media_src", ""):

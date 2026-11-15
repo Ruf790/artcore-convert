@@ -186,7 +186,7 @@ class TrimTab(QWidget):
     def set_job(self, job: J.Job | None, editable: bool):
         same = job is self.job
         self.job, self.editable = job, editable
-        ok = job is not None and job.info is not None and not job.info.error and job.info.duration > 0
+        ok = job is not None and job.info is not None and not job.info.error and J.src_duration(job) > 0
         for w in (self.b_in, self.b_out, self.e_in, self.e_out, self.b_add, self.b_replace, self.r_keep, self.r_cut,
                   self.list, self.b_del, self.b_clear):
             w.setEnabled(ok and editable)
@@ -208,7 +208,7 @@ class TrimTab(QWidget):
                                           else "\n⚠ " + t("trm_no_mpv")))
         v = job.info.video
         self.fps = v.fps if v is not None and v.fps else 25.0
-        self.bar.dur = job.info.duration
+        self.bar.dur = J.src_duration(job)
         if not same:
             self.bar.mark_in = self.bar.mark_out = None
             self.e_in.clear()
@@ -241,7 +241,7 @@ class TrimTab(QWidget):
             self.summary.setText(t("trm_none"))
             return
         total = J.out_duration(j)
-        text = t("trm_total", J.fmt_tc(total, False), J.fmt_tc(j.info.duration, False), len(segs))
+        text = t("trm_total", J.fmt_tc(total, False), J.fmt_tc(J.src_duration(j), False), len(segs))
         warn = [t(w) for w in dict.fromkeys(J.plan(j)["warnings"]) if w.startswith("w_trim")]
         self.summary.setText(text + "".join("\n⚠ " + w for w in warn))
 
@@ -308,14 +308,15 @@ class TrimTab(QWidget):
         if j is None or j.info is None or j.info.error:
             return
         if isinstance(self.preview, mpvview.FramePreview):
-            if self.preview.path != j.src:
-                self.preview.load(j.src, j.info.duration, self.fps)
+            if self.preview.path != J.media_src(j):
+                self.preview.load(J.media_src(j), J.src_duration(j), self.fps)
         else:
-            self.preview.load(j.src)
+            self.preview.load(J.preview_src(j))
 
     def position(self) -> float | None:
         """Where the preview stands (seconds of the source), None if it shows nothing of this task."""
-        if self.preview is None or self.job is None or self.preview.path != self.job.src:
+        if self.preview is None or self.job is None or \
+                self.preview.path not in (J.preview_src(self.job), J.media_src(self.job)):
             return None
         return self.bar.pos
 
@@ -397,7 +398,7 @@ class TrimTab(QWidget):
     def _marks(self) -> tuple[float, float] | None:
         a = J.parse_tc(self.e_in.text())
         b = J.parse_tc(self.e_out.text())
-        dur = self.job.info.duration if self.job and self.job.info else 0.0
+        dur = J.src_duration(self.job) if self.job and self.job.info else 0.0
         if a is None and b is None:
             return None
         a = a or 0.0

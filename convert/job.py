@@ -244,6 +244,30 @@ def src_duration(job: Job) -> float:
     return sum(_dur(i) for _p, i in sources(job)) if job.info is not None else 0.0
 
 
+def media_src(job: Job) -> str:
+    """What ffmpeg reads for the strip, the loudness and the still frames: src, or for a joined task a
+    concat list of all its files (ff.inp reads it)."""
+    if not job.joins:
+        return job.src
+    files = [p for p, i in sources(job) if i is not None and not i.error]
+    import hashlib
+    key = hashlib.sha1("\n".join(files).encode("utf-8")).hexdigest()[:12]
+    d = os.path.join(tempfile.gettempdir(), "ArtCoreConvert")
+    os.makedirs(d, exist_ok=True)
+    path = os.path.join(d, f"join_{key}.ffconcat")
+    if not os.path.isfile(path):
+        _concat_list(path, files, [(k, None, None) for k in range(len(files))])
+    return path
+
+
+def preview_src(job: Job) -> str:
+    """What mpv plays on the Trim tab: src, or the joined files one after another (an EDL)."""
+    if not job.joins:
+        return job.src
+    files = [p for p, i in sources(job) if i is not None and not i.error]
+    return "edl://" + ";".join(f"%{len(p.encode('utf-8'))}%{p}" for p in files)
+
+
 def ext_streams(job: Job) -> list[tuple[int, Stream]]:
     """[(its number in job.ext, the stream)] — the first stream of the chosen kind in every external file."""
     out = []
@@ -1299,6 +1323,29 @@ def split_args(job: Job, ffmpeg: str, src: str, times: list[float] | None = None
     return args + [split_pattern(src)]
 
 
+def estimate_size_times(job: Job, av: E.Available) -> list[float]:
+    """For «Copy the ffmpeg command» only: the cut times of a split by size from the planned bit rate
+    (the real ones are read from the finished file)."""
+    sp = job.settings.get("split") or {}
+    dur = out_duration(job)
+    v = job.settings.get("video", {})
+    p = plan(job)
+    a = sum(audio_kbps(cd, F.layout_channels(job.acfg(s).get("channels", "keep"), s.channels, 8), job.acfg(s)) or
+            (s.bitrate // 1000 if cd == "copy" else 0) for s, cd in p["audio"])
+    if v.get("rc") == "size" and dur > 0:
+        kbps = float(v.get("size_mb", 0)) * 8 * 1024 * 1024 / 1000 / dur
+    elif v.get("rc") == "bitrate":
+        kbps = float(v.get("bitrate", 0)) + a
+    else:
+        kbps = (job.info.bitrate / 1000) if job.info and job.info.bitrate else 8000
+    step = float(sp.get("size_mb", 700) or 700) * 8 * 1024 * 1024 * 0.97 / 1000 / max(1.0, kbps)
+    out, x = [], step
+    while x < dur - 1:
+        out.append(round(x, 3))
+        x += step
+    return out
+
+
 def cut_times(packets: list[tuple[float, int, bool]], limit: int) -> list[float]:
     """Where to cut for parts of at most `limit` bytes: packets [(time, size, a keyframe of the video)] in time
     order → the keyframe times to cut at (2 % and 64 KiB of every part are left for the container)."""
@@ -1380,9 +1427,10 @@ def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
     return out
 
 
-def out_name(job: Job, cfg: dict) -> str:
+def out_name(job: Job, cfg: dict, taken=()) -> str:
     """Where the result goes: next to the source or into the chosen folder, name + suffix, never over the
-    source; an existing file gets « (2)» unless overwrite is on."""
+    source; an existing file gets « (2)» unless overwrite is on. taken: results of tasks running now (1.4)."""
+    taken = {os.path.normcase(os.path.abspath(x)) for x in taken}
     ext = "." + E.container(job.settings.get("container", "mkv")).ext
     if job.dest:                                         # chosen in «Save as…» (overwrite was asked there)
         path = os.path.splitext(job.dest)[0] + ext
@@ -1395,10 +1443,12 @@ def out_name(job: Job, cfg: dict) -> str:
     if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(job.src)):
         base += "_convert"
         path = base + ext
-    if cfg.get("overwrite"):
+    def used(x):
+        return os.path.normcase(os.path.abspath(x)) in taken
+    if cfg.get("overwrite") and not used(path):
         return path
     n = 2
-    while os.path.exists(path):
+    while (os.path.exists(path) and not cfg.get("overwrite")) or used(path):
         path = f"{base} ({n}){ext}"
         n += 1
     return path
