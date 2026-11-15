@@ -145,7 +145,8 @@ def test_vbv_caps_the_bit_rate(clip, tmp_path, av):
     assert args[args.index("-maxrate") + 1] == "1000k" and args[args.index("-bufsize") + 1] == "1500k"
     assert args[args.index("-b:v") + 1] == "1000k"
     kbps = int(pj["format"]["size"]) * 8 / float(pj["format"]["duration"]) / 1000
-    assert not astreams(pj) and kbps < 1000 * 1.1                    # held to the format's highest rate
+    dur = float(pj["format"]["duration"])
+    assert not astreams(pj) and kbps < (1000 + 1500 / dur) * 1.05     # max rate × time + one full buffer
 
 
 # ── the extension, codecs, sound limits, the frame, the length ─
