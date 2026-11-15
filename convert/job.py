@@ -57,6 +57,19 @@ PRESETS = {      # built-in; quality 0 = the encoder's own default
     "h264_mp4": {"container": "mp4", "video": {"encoder": "auto_h264", "bits": "8"},
                  "audio": {"codec": "aac"}, "subs": "first"},
     "av1_hw":   {"container": "mkv", "video": {"encoder": "auto_av1", "bits": "10"}},
+    # 1.7: NVENC of the RTX 40 / 50 tuned (other cards: the same codec on their own encoder, untuned)
+    "rtx_av1_q":    {"container": "mkv", "video": {"encoder": "auto_av1", "bits": "10", "quality": 30},
+                     "venc": {"nvenc_av1": {"preset": "p7", "tune": "hq", "multipass": "fullres", "lookahead": 32,
+                                            "spatial_aq": True, "temporal_aq": True, "aq_strength": 8,
+                                            "b_ref_mode": "middle"}}},
+    "rtx_av1_fast": {"container": "mkv", "video": {"encoder": "auto_av1", "bits": "10", "quality": 32},
+                     "venc": {"nvenc_av1": {"preset": "p4", "tune": "hq", "multipass": "qres", "lookahead": 16,
+                                            "spatial_aq": True, "temporal_aq": True, "b_ref_mode": "middle",
+                                            "split_encode": "forced"}}},
+    "rtx_hevc_q":   {"container": "mkv", "video": {"encoder": "auto_hevc", "bits": "10", "quality": 24},
+                     "venc": {"nvenc_hevc": {"preset": "p7", "tune": "hq", "multipass": "fullres", "lookahead": 32,
+                                             "spatial_aq": True, "temporal_aq": True, "aq_strength": 8,
+                                             "b_ref_mode": "middle"}}},
     "phone":    {"container": "mp4", "video": {"encoder": "auto_h264", "bits": "8", "height": 1080},
                  "audio": {"codec": "aac", "channels": "stereo", "tracks": "first"}, "subs": "none"},
     "small":    {"container": "mkv", "video": {"encoder": "auto_hevc", "bits": "10", "height": 720, "quality": 30},
@@ -170,7 +183,7 @@ class Job:
         j.dest = str(d.get("dest") or "")
         j.log_path = str(d.get("log") or "")
         cf = d.get("crop_found")
-        j.crop_found = [int(x) for x in cf][:4] if isinstance(cf, list) and len(cf) in (0, 4) else None
+        j.crop_found = [int(x) for x in cf][:4] if isinstance(cf, list) and len(cf) == 4 else None  # 1.7: [] looked again
         j.meta = d.get("meta") if isinstance(d.get("meta"), dict) else {}
         ch = d.get("chapters")
         j.chapters = [[float(c[0]), str(c[1])] for c in ch if isinstance(c, (list, tuple)) and len(c) >= 2] \
@@ -1618,3 +1631,59 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
     elif sp.get("mode") == "time" and sp.get("minutes"):
         bits.append(tr("split_short_time", sp["minutes"]))
     return " · ".join(bits)
+
+
+# ── 1.7: apply one task's settings to others ──────────────────
+APPLY_PARTS = ("settings", "tracks", "trim")
+
+
+def _kind_order(info: MediaInfo | None) -> dict[int, tuple[str, int]]:
+    """stream index → (kind, its place among the streams of that kind)."""
+    out, seen = {}, {}
+    for s in (info.streams if info is not None and not info.error else []):
+        k = seen.get(s.kind, 0)
+        out[s.index] = (s.kind, k)
+        seen[s.kind] = k + 1
+    return out
+
+
+def apply_from(src: Job, dst: Job, parts=("settings", "tracks")) -> list[str]:
+    """Copy src's settings onto dst: «settings» (codec, quality, size, filters, container, sound, split — the whole
+    profile), «tracks» (which audio / subtitle tracks are kept and how: matched by kind and place, the 2nd audio to
+    the 2nd audio; their language / title / default too), «trim» (the pieces, cut to dst's length). Returns the parts
+    that changed."""
+    done = []
+    if src is dst:
+        return done
+    if "settings" in parts:
+        st = copy.deepcopy(src.settings)
+        if st != dst.settings:
+            dst.settings, dst.preset = st, src.preset
+            done.append("settings")
+    if "tracks" in parts and src.info is not None and dst.info is not None and not dst.info.error:
+        a, b = _kind_order(src.info), _kind_order(dst.info)
+        where = {v: k for k, v in b.items()}
+        tracks, smeta = {}, {}
+        for key, val in src.tracks.items():
+            to = where.get(a.get(int(key)) if key.isdigit() else None)
+            if to is not None:
+                tracks[str(to)] = copy.deepcopy(val)
+        for key, val in (src.meta.get("streams") or {}).items():
+            to = where.get(a.get(int(key)) if str(key).isdigit() else None)
+            if to is not None:
+                smeta[str(to)] = copy.deepcopy(val)
+        old = (dst.tracks, dst.meta.get("streams"))
+        dst.tracks = tracks
+        if smeta:
+            dst.meta["streams"] = smeta
+        else:
+            dst.meta.pop("streams", None)
+        if (dst.tracks, dst.meta.get("streams")) != old:
+            done.append("tracks")
+    if "trim" in parts:
+        end = src_duration(dst) or 0.0
+        pcs = [[a, min(b, end) if end else b] for a, b in src.trim if not end or a < end - 0.05]
+        if (pcs, src.trim_cut) != (dst.trim, dst.trim_cut):
+            dst.trim, dst.trim_cut = pcs, src.trim_cut
+            done.append("trim")
+    return done

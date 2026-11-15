@@ -1,4 +1,4 @@
-"""The strip under the preview (as in XviD4PSP 8): thumbnails of the film over its loudness curve, the trim
+"""The strip under the preview: thumbnails of the film over its loudness curve, the trim
 pieces, the In / Out marks and the play head; a click or drag seeks. The thumbnails and the curve are made in
 the background by ffmpeg (MediaWorker), the newest file wins."""
 from __future__ import annotations

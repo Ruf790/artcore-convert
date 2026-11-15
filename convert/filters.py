@@ -1,4 +1,4 @@
-"""1.3: the video and sound filters of the Streams tab (as the filter rows of XviD4PSP 8): their settings,
+"""1.3: the video and sound filters of the Streams tab (rows ☑ · name · value · ⚙): their settings,
 the ffmpeg filter chain they make, how they change the frame size, and the automatic crop.
 
 The settings live in settings["filters"] = {name: {"on": bool, …}}. Three rows keep using the 1.0 keys, so old
@@ -196,20 +196,43 @@ def crop_values(job) -> tuple[int, int, int, int]:
 CROP_RE = re.compile(r"crop=(\d+):(\d+):(\d+):(\d+)")
 
 
-def detect_crop(ffmpeg: str, src_path: str, duration: float, width: int, height: int, points: int = 8,
+def bars_of(res: list[tuple[int, int, int, int]], width: int, height: int, share: float = 0.8) -> tuple[int, int, int, int]:
+    """1.7: the bars of the film from cropdetect's answers at several moments: on each side the widest bar that
+    at least <share> of the moments have. A dark scene (bars look wider) or a full-frame title (no bars) at a
+    moment or two no longer undoes the crop — before, one such moment left all the bars in."""
+    if not res:
+        return 0, 0, 0, 0
+    sides = [[x for _w, _h, x, _y in res], [y for _w, _h, _x, y in res],
+             [max(0, width - x - w) for w, _h, x, _y in res], [max(0, height - y - h) for _w, h, _x, y in res]]
+    k = int(len(res) * (1.0 - share))                 # moments that may show less bar than the answer
+    out = []
+    for vals in sides:
+        v = sorted(vals)[min(k, len(vals) - 1)]
+        out.append(v if v >= 4 else 0)                # a pixel or two of noise is no bar
+    l, t, r, b = out
+    if l + r > width - 16:
+        l = r = 0
+    if t + b > height - 16:
+        t = b = 0
+    return l // 2 * 2, t // 2 * 2, r // 2 * 2, b // 2 * 2
+
+
+def detect_crop(ffmpeg: str, src_path: str, duration: float, width: int, height: int, points: int = 0,
                 run=None) -> tuple[int, int, int, int] | None:
-    """cropdetect at several moments of the film (5 % … 95 %); the bars every moment has. None: nothing found
-    (no bars, or the file could not be read)."""
+    """cropdetect at several moments of the film (5 % … 95 %; 12 in a film, 3 in a short clip), 40 frames each.
+    1.7: grey or noisy bars (up to ~20 % grey, as encoders and AI upscalers leave them) are found too — then only
+    when they are even (top ≈ bottom or left ≈ right), so a dark picture is not cut. None: the file could not be read."""
     if run is None:
         from .ff import run
     if not width or not height:
         return None
     dur = max(0.0, duration)
-    moments = [dur * (0.05 + 0.9 * i / max(1, points - 1)) for i in range(points)] if dur > 6 else [0.0]
+    n = points or (12 if dur > 60 else 6 if dur > 6 else 3)
+    moments = [dur * (0.05 + 0.9 * i / max(1, n - 1)) for i in range(n)] if dur > 1.5 else [0.0]
 
-    def one(at: float):
+    def one(at: float, limit: str):
         args = [ffmpeg, "-hide_banner", "-nostdin", "-ss", f"{at:.2f}", "-i", src_path, "-map", "0:v:0", "-an",
-                "-sn", "-dn", "-frames:v", "24", "-vf", "cropdetect=limit=0.094:round=2:reset=0", "-f", "null", "-"]
+                "-sn", "-dn", "-frames:v", "40", "-vf", f"cropdetect=limit={limit}:round=2:reset=0", "-f", "null", "-"]
         try:
             r = run(args, 60)
         except Exception:
@@ -217,19 +240,21 @@ def detect_crop(ffmpeg: str, src_path: str, duration: float, width: int, height:
         found = CROP_RE.findall(r.stderr or "")
         return tuple(int(x) for x in found[-1]) if found else None
 
-    with concurrent.futures.ThreadPoolExecutor(4) as ex:
-        res = [x for x in ex.map(one, moments) if x]
+    def at_limit(limit: str):
+        with concurrent.futures.ThreadPoolExecutor(4) as ex:
+            return [x for x in ex.map(lambda m: one(m, limit), moments) if x]
+    res = at_limit("0.094")
     if not res:
         return None
-    # the picture of every moment fits in: the smallest bars
-    x0 = min(x for _w, _h, x, _y in res)
-    y0 = min(y for _w, _h, _x, y in res)
-    x1 = max(x + w for w, _h, x, _y in res)
-    y1 = max(y + h for _w, h, _x, y in res)
-    l, t, r, b = x0, y0, max(0, width - x1), max(0, height - y1)
-    l, t, r, b = (v if v >= 4 else 0 for v in (l, t, r, b))          # a pixel or two of noise is no bar
-    out = (l // 2 * 2, t // 2 * 2, r // 2 * 2, b // 2 * 2)
-    return out if any(out) else (0, 0, 0, 0)
+    out = bars_of(res, width, height)
+    for limit in ("0.14", "0.2"):                     # nothing at the usual black: grey / noisy bars
+        if any(out):
+            break
+        l, t, r, b = bars_of(at_limit(limit), width, height, 0.75)
+        even_tb = t and b and abs(t - b) <= max(8, (t + b) // 8)
+        even_lr = l and r and abs(l - r) <= max(8, (l + r) // 8)
+        out = (l if even_lr else 0, t if even_tb else 0, r if even_lr else 0, b if even_tb else 0)
+    return out
 
 
 # ── geometry: the frame through the chain ─────────────────────

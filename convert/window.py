@@ -1,4 +1,4 @@
-"""The main window (laid out after XviD4PSP 8 in ui_main.py): the tasks, their settings, running the queue.
+"""The main window (laid out in ui_main.py): the tasks, their settings, running the queue.
 The settings widgets edit the selected tasks (or, with nothing selected, the settings of new ones)."""
 from __future__ import annotations
 
@@ -513,7 +513,7 @@ class MainWindow(MainUI, QMainWindow):
         return out
 
     def add_incoming(self, paths: list[str], target_uid: int = 0, ask: bool = True) -> int:
-        """1.6: files dropped or opened (Ctrl+O) as XviD4PSP takes them: a film becomes a task; a sound or a
+        """1.6: files dropped or opened (Ctrl+O): a film becomes a task; a sound or a
         subtitle file is attached to a film — to the card (or the picture) it fell on, to the film whose name it
         starts with (film.mkv ← film.rus.ac3, film.eng.srt), else to the selected film after asking — and only
         without a film it becomes a task of its own (sound) or is left out (subtitles). Returns the tasks added."""
@@ -522,6 +522,25 @@ class MainWindow(MainUI, QMainWindow):
         videos = [f for f in files if not f.lower().endswith(extra_ext)]
         extras = [f for f in files if f.lower().endswith(extra_ext)]
         n = self.add_paths(videos) if videos else 0
+        new = list(self.jobs[-n:]) if n else []
+        try:
+            return self._incoming_extras(n, extras, target_uid, ask)
+        finally:
+            if new and self.cfg.get("auto_ext", True):     # 1.7: film.*.ac3 / .srt … beside each new film
+                got = 0
+                for j in new:
+                    have = {os.path.normcase(e["path"]) for e in j.ext}
+                    found = [f for f in self.beside(j.src) if os.path.normcase(f) not in have]
+                    if found:
+                        self._attach(j, found)
+                        got += len(found)
+                if got:
+                    self._toast(t("ext_found", got))
+                    cur = self.selected_jobs()
+                    if len(cur) == 1 and cur[0] in new:
+                        self._fill_tracks()
+
+    def _incoming_extras(self, n: int, extras: list[str], target_uid: int, ask: bool) -> int:
         if not extras:
             return n
         ok = [j for j in self.jobs if j.status in EDITABLE + ("probe",) and not self._busy(j) and
@@ -564,6 +583,24 @@ class MainWindow(MainUI, QMainWindow):
         if len(tasks) < len(rest):
             self._toast(t("ext_subs_alone"))
         return n + (self.add_paths(tasks) if tasks else 0)
+
+    @staticmethod
+    def beside(src: str) -> list[str]:
+        """1.7: the sound and subtitle files beside a film whose names start with the film's (film.rus.ac3,
+        film_eng.srt, «film [Commentary].mka»), sorted."""
+        d = os.path.dirname(os.path.abspath(src))
+        base = os.path.splitext(os.path.basename(src))[0].lower()
+        try:
+            names = sorted(os.listdir(d), key=str.lower)
+        except OSError:
+            return []
+        out = []
+        for f in names:
+            low = f.lower()
+            if low.endswith(J.EXT_AUDIO + J.EXT_SUBS) and low.startswith(base) and len(low) > len(base) \
+                    and low[len(base)] in "._- [(" and os.path.isfile(os.path.join(d, f)):
+                out.append(os.path.join(d, f))
+        return out
 
     def _film_for(self, path: str, jobs: list) -> J.Job | None:
         """The film whose file name the extra file starts with, in its folder (the longest name wins)."""
@@ -812,6 +849,8 @@ class MainWindow(MainUI, QMainWindow):
             ed = [x for x in jobs if x.status in EDITABLE and not self._busy(x)]
             if len(ed) > 1:
                 m.addAction(style.icon("fa6s.object-group"), t("join_selected"), self.join_selected)
+            if j.info is not None and not j.info.error and len(self.jobs) > 1:
+                m.addAction(style.icon("fa6s.clone"), t("apply_to") + "…", lambda: self.apply_dialog(j))
             if len(jobs) == 1 and j in ed:
                 m.addAction(style.icon("fa6s.link"), t("join_add") + "…", lambda: self.join_add_dialog())
                 if j.joins:
@@ -922,6 +961,61 @@ class MainWindow(MainUI, QMainWindow):
         return n
 
     # ── 1.4: joining files, external tracks ───────────────────
+    def apply_dialog(self, src: J.Job | None = None, parts=None, scope: str = "", ask: bool = True) -> int:
+        """1.7: this task's settings onto the other selected tasks (or every waiting one): the profile and filters,
+        the choice of tracks, the trim. Returns how many tasks changed."""
+        if src is None:
+            cur = self._job_of(self.view.currentItem())
+            sel = self.selected_jobs()
+            src = cur if cur in sel else (sel[0] if sel else None)
+        if src is None or src.info is None or src.info.error:
+            self._toast(t("tr_pick_one"))
+            return 0
+        sel = [x for x in self.selected_jobs(editable=True) if x is not src and not self._busy(x)]
+        every = [x for x in self.jobs if x is not src and x.status in EDITABLE and not self._busy(x)]
+        if ask:
+            from PySide6.QtWidgets import QCheckBox, QDialog, QDialogButtonBox, QLabel, QRadioButton, QVBoxLayout
+            d = QDialog(self)
+            d.setWindowTitle(t("apply_to"))
+            lay = QVBoxLayout(d)
+            lay.addWidget(QLabel(t("apply_from", src.name)))
+            boxes = {}
+            for key in J.APPLY_PARTS:
+                cb = QCheckBox(t("apply_" + key))
+                cb.setChecked(key != "trim")
+                lay.addWidget(cb)
+                boxes[key] = cb
+            r_sel = QRadioButton(t("apply_sel", len(sel)))
+            r_all = QRadioButton(t("apply_all", len(every)))
+            r_sel.setEnabled(bool(sel))
+            (r_sel if sel else r_all).setChecked(True)
+            lay.addSpacing(6)
+            lay.addWidget(r_sel)
+            lay.addWidget(r_all)
+            bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+            bb.accepted.connect(d.accept)
+            bb.rejected.connect(d.reject)
+            lay.addWidget(bb)
+            self._apply_dlg = d
+            if d.exec() != QDialog.Accepted:
+                return 0
+            parts = [k for k, cb in boxes.items() if cb.isChecked()]
+            scope = "sel" if r_sel.isChecked() else "all"
+        parts = parts or ["settings", "tracks"]
+        targets = sel if (scope or "sel") == "sel" and sel else every
+        n = 0
+        for x in targets:
+            if J.apply_from(src, x, parts):
+                n += 1
+                if x.status in ("done", "error", "stop", "skip") and x.info is not None and not x.info.error:
+                    x.status, x.error, x.progress = "wait", "", 0.0
+                self._refresh(x)
+        if n:
+            self._queue_changed()
+            self._select_changed()
+        self._toast(t("applied_n", n))
+        return n
+
     def join_selected(self):
         """The selected tasks become one: the first one takes the others' files after its own."""
         jobs = [j for j in self.selected_jobs(editable=True) if not self._busy(j)]
@@ -1047,6 +1141,10 @@ class MainWindow(MainUI, QMainWindow):
 
     # ── settings tabs ─────────────────────────────────────────
     def _select_changed(self):
+        if getattr(self, "cmp_view", None) is not None and self.b_compare.isChecked():
+            cur = self.selected_jobs()
+            if len(cur) != 1 or cur[0].uid != getattr(self, "_cmp", (0,))[0]:
+                self.toggle_compare(False)                 # 1.7: another task: back to its picture
         jobs = self.selected_jobs()
         self._load_settings()
         if jobs:
@@ -2072,7 +2170,7 @@ class MainWindow(MainUI, QMainWindow):
         profile = J.describe(j.settings, self.av if self.av_ready else None, t)
         started = (slot.started if slot else 0) or (time.time() - (j.elapsed or 0))
         text = ""
-        try:                                              # 1.6: the log as XviD4PSP writes it
+        try:                                              # 1.6: the log in sections
             from . import xlog
             text = xlog.build(j, J, lines, slot.kinds if slot else [], started=started, ended=time.time(),
                               profile=profile, peak_mem=slot.peak if slot else 0,
@@ -2086,13 +2184,18 @@ class MainWindow(MainUI, QMainWindow):
                          lines, j.settings, bool(self.cfg.get("log_next_to_output")), started, text=text)
         if path:
             j.log_path = path
+            lw = getattr(self, "_logwin", None)
+            try:
+                if lw is not None and lw.isVisible():
+                    lw.reload()
+            except RuntimeError:
+                pass
 
     def open_log(self, j: J.Job | None):
+        """1.7: in the log window, not in Notepad."""
         if j is None or not j.log_path or not os.path.isfile(j.log_path):
             return
-        from PySide6.QtCore import QUrl
-        from PySide6.QtGui import QDesktopServices
-        QDesktopServices.openUrl(QUrl.fromLocalFile(j.log_path))
+        self.history_dialog(j.log_path)
 
     def _queue_done(self):
         self.running = False
@@ -2253,12 +2356,12 @@ class MainWindow(MainUI, QMainWindow):
     # ── menu, settings, updates ───────────────────────────────
     def settings_dialog(self):
         from .dialogs import SettingsDialog
-        lang, theme = self.cfg.get("language"), (self.cfg.get("theme", "dark"), self.cfg.get("look", "xvid"))
+        lang, theme = self.cfg.get("language"), (self.cfg.get("theme", "dark"), self.cfg.get("look", "classic"))
         if SettingsDialog(self.cfg, self).exec():
             config.save(self.cfg)
             for j in self.jobs:
                 self._refresh(j)
-            if lang != self.cfg.get("language") or theme != (self.cfg.get("theme", "dark"), self.cfg.get("look", "xvid")):
+            if lang != self.cfg.get("language") or theme != (self.cfg.get("theme", "dark"), self.cfg.get("look", "classic")):
                 QMessageBox.information(self, APP_TITLE, t("lang_restart"))
 
     def encoders_dialog(self):

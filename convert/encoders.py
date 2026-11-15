@@ -356,7 +356,7 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
         if bits >= 10 and str(v.get("chroma", "420")) == "420":
             out += ["-profile:v", "2"]                       # 4:2:2 / 4:4:4: libvpx picks profile 1 / 3
     elif e.family in ("mpeg4", "mpeg2video"):            # Xvid / FFmpeg MPEG-4 / MPEG-2: q = qscale 1..31
-        if e.id == "xvid":
+        if e.id == "classic":
             out += ["-me_quality", XVID_ME[sp]]
         out += ["-q:v", str(q)] if rc == "quality" or kbps <= 0 else \
             ["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{max(kbps * 2, 1835)}k"]

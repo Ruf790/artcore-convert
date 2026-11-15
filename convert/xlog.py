@@ -1,4 +1,4 @@
-"""1.6: the conversion log in the manner of XviD4PSP 8 — the source and its streams, what the result is to be
+"""1.6: the conversion log in sections — the source and its streams, what the result is to be
 (video / audio / subtitles, the filters, the encoder and its settings), each ffmpeg run with its output, the
 statistics of the streams and the end: completed / failed / stopped, the time, the memory, the sizes."""
 from __future__ import annotations
@@ -32,7 +32,7 @@ _RE_FRAMES = re.compile(r"frame\s+([IPB]):\s*(\d+),?\s+Avg QP:\s*([\d.]+)\s+(?:k
 _RE_PROGRESS = re.compile(r"^(frame=|size=)")
 _RE_OPTIONS = re.compile(rb"(x26[45][^\x00]{0,120}?)options: ([\x20-\x7e]{20,4000})")
 
-PHASE_TITLE = {"main": "ENCODING", "pass1": "PASS 1 (ANALYSIS)", "vidstab": "STABILIZATION (ANALYSIS)",
+PHASE_TITLE = {"main": "MAIN PASS", "pass1": "PASS 1 (ANALYSIS)", "vidstab": "STABILIZATION (ANALYSIS)",
                "metrics": "QUALITY METRICS", "split": "SPLITTING", "pre": "PRE PASS", "post": "POST PASS"}
 
 
@@ -41,7 +41,7 @@ def stamp(when: float) -> str:
 
 
 def dur(sec: float) -> str:
-    """«1h 50m 30s 656ms» as XviD4PSP writes it."""
+    """«1h 50m 30s 656ms»."""
     sec = max(0.0, float(sec or 0))
     ms = int(round(sec * 1000))
     h, ms = divmod(ms, 3600000)
@@ -187,7 +187,7 @@ def phases(lines: list[str], kinds: list[tuple[str, float]]) -> list[dict]:
 
 
 def stats(lines: list[str]) -> list[str]:
-    """What ffmpeg (-loglevel verbose) and the encoder said at the end, as XviD4PSP's statistics."""
+    """What ffmpeg (-loglevel verbose) and the encoder said at the end, as statistics."""
     out: list[str] = []
     frames = []
     for ln in lines:

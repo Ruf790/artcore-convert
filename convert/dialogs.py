@@ -38,7 +38,7 @@ def _hint(text: str) -> QLabel:
 
 class SettingsDialog(QDialog):
     CHECKS = [("grp_start", ("single_window", "keep_queue", "check_updates", "notify")),
-              ("grp_encode", ("hw_decode", "overwrite")),
+              ("grp_encode", ("hw_decode", "overwrite", "auto_ext")),
               ("grp_logs", ("save_logs", "log_next_to_output"))]
 
     def __init__(self, cfg: dict, parent=None):
@@ -61,9 +61,9 @@ class SettingsDialog(QDialog):
         self.theme.setCurrentIndex(max(0, self.theme.findData(cfg.get("theme", "dark"))))
         form.addRow(t("theme"), self.theme)
         self.look = QComboBox()
-        for key in ("xvid", "modern"):
+        for key in ("classic", "modern"):
             self.look.addItem(t("look_" + key), key)
-        self.look.setCurrentIndex(max(0, self.look.findData(cfg.get("look", "xvid"))))
+        self.look.setCurrentIndex(max(0, self.look.findData(cfg.get("look", "classic"))))
         form.addRow(t("look"), self.look)
         self.suffix = QLineEdit(cfg.get("out_suffix", "_convert"))
         self.suffix.setPlaceholderText(t("suffix_empty"))

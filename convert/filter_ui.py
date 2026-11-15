@@ -1,4 +1,4 @@
-"""1.3: the filter rows of the Streams tab (XviD4PSP 8: ☑ · name · value · ⚙), the small settings window of
+"""1.3: the filter rows of the Streams tab (☑ · name · value · ⚙), the small settings window of
 each filter, and the frame drawn over the picture (the crop, the logo to remove — drawn with the mouse)."""
 from __future__ import annotations
 

@@ -1,4 +1,4 @@
-"""1.2: the XviD4PSP 8 layout — task cards, the side tabs, the Streams tab (video copy / off, every track's own
+"""1.2: the layout — task cards, the side tabs, the Streams tab (video copy / off, every track's own
 codec and volume, the stream choice), Save as, the format / history windows, the strip under the picture."""
 import os
 
@@ -124,12 +124,12 @@ def test_windows_open(qapp, media, data_dir, monkeypatch):
     w = _win(qapp)
     _one(qapp, w, os.path.join(media, "dts.mkv"))
     w.format_dialog()
-    w.history_dialog()
-    d, hist, view = w._history
-    assert hist.topLevelItemCount() == 1 and "Source:" in view.toPlainText()
+    d = w.history_dialog()                                  # 1.7: the log window, not modal
+    assert d.isVisible() and d.hist.topLevelItemCount() == 1 and "Source:" in d.view.toPlainText()
+    d.close()
     w.codec_dialog.exec()
     w.res_dialog.exec()
-    assert shown[:2] == ["MKV (Matroska)", "История конвертаций"] and len(shown) == 4
+    assert shown[:1] == ["MKV (Matroska)"] and len(shown) == 3
     monkeypatch.setattr("convert.window.QFileDialog.getSaveFileName", lambda *a, **k: ("/tmp/zz/out.mkv", ""))
     w.save_as()
     assert w.jobs[0].dest == "/tmp/zz/out.mkv"

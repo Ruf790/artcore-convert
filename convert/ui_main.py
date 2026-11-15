@@ -1,4 +1,4 @@
-"""The main window's look, after XviD4PSP 8: a menu; a top bar with the task buttons, Start, the tabs
+"""The main window's look: a menu; a top bar with the task buttons, Start, the tabs
 (Info · Metadata · Chapters · Trim · Streams · Status) and the container with its preset; the tasks as cards
 on the left; the picture with the film strip and the loudness in the middle (the log while Status is open);
 the open tab on the right; the player buttons, the frame counter and the stream choice at the bottom.
@@ -7,7 +7,7 @@ from __future__ import annotations
 
 import os
 
-from PySide6.QtCore import QRect, QSize, Qt, Signal
+from PySide6.QtCore import QRect, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QFont, QIcon, QKeySequence, QPainter, QPen
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QButtonGroup, QCheckBox, QComboBox, QDialog,
                                QFormLayout, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QHeaderView, QLabel,
@@ -96,7 +96,7 @@ def _scroll(inner: QWidget) -> QScrollArea:
 
 
 class SmallDialog(QDialog):
-    """A settings window opened from a ⚙ button (XviD4PSP opens the codec / format options this way)."""
+    """A settings window opened from a ⚙ button (the codec / format options open this way)."""
 
     def __init__(self, title: str, body: QWidget, parent=None, width: int = 520):
         super().__init__(parent)
@@ -113,7 +113,7 @@ class SmallDialog(QDialog):
 
 class TaskCard(QStyledItemDelegate):
     """A task as a card: the thumbnail, the name, duration and size, a progress line, the state and the result
-    size (XviD4PSP 8's task list)."""
+    size (the task list)."""
     H = 96
 
     def __init__(self, win):
@@ -150,7 +150,7 @@ class TaskCard(QStyledItemDelegate):
                          style.icon("fa6s.music", style.MUTED).pixmap(32, 32))
         fg = QColor(style.CARD_SEL_FG) if sel else QColor(style.TEXT)
         mut = QColor(style.CARD_SEL_MUT) if sel else QColor(style.MUTED)
-        light_sel = sel and QColor(style.CARD_SEL).lightness() > 160      # XviD4PSP: light blue, dark text
+        light_sel = sel and QColor(style.CARD_SEL).lightness() > 160      # classic: light blue, dark text
         x0, x1 = thumb.right() + 8, r.right() - 6
         fm = p.fontMetrics()
         f = QFont(option.font)
@@ -327,6 +327,7 @@ class MainUI:
         A(m, "fa6s.arrow-down", t("move_down"), lambda: self.move_selected(1))
         m.addSeparator()
         A(m, "fa6s.object-group", t("join_selected"), self.join_selected)
+        A(m, "fa6s.clone", t("apply_to") + "…", lambda: self.apply_dialog())
         A(m, "fa6s.link", t("join_add") + "…", self.join_add_dialog)
         A(m, "fa6s.plus", t("ext_add") + "…", self.add_external_dialog)
         m.addSeparator()
@@ -431,7 +432,7 @@ class MainUI:
         self.prio.setCurrentIndex(config.PRIORITIES.index(self.cfg.get("priority", "below")))
         self.prio.currentIndexChanged.connect(self._prio_changed)
         pl.addWidget(self.prio)
-        self.b_cpu = QToolButton()                       # 1.4: «100% ▾» as in XviD4PSP
+        self.b_cpu = QToolButton()                       # 1.4: «100% ▾»
         self.b_cpu.setObjectName("ctlText")
         self.b_cpu.setPopupMode(QToolButton.InstantPopup)
         self.b_cpu.setToolTip(t("cpu_limit_tip"))
@@ -496,7 +497,7 @@ class MainUI:
         return w
 
     def _apply_task_view(self):
-        """1.4: the task list as cards (thumbnail, progress) or as rows (a table, as XviD4PSP)."""
+        """1.4: the task list as cards (thumbnail, progress) or as rows (a table)."""
         rows = self.cfg.get("task_view", "cards") == "rows"
         self.view.setItemDelegate(self._plain if rows else self._card)
         self.view.setHeaderHidden(not rows)
@@ -1126,8 +1127,27 @@ class MainUI:
             dl.setValue(int(e.get("delay", 0) or 0))
             dl.setEnabled(ed)
             dl.valueChanged.connect(lambda x, k=n: self._ext_opt(k, "delay", int(x)))
+            dl.valueChanged.connect(lambda x, p=e["path"]: self._listen_delay(p, int(x)))
             g.addWidget(QLabel(t("a_delay")), 0, 0)
-            g.addWidget(dl, 0, 1)
+            if audio:                                     # 1.7: hear it with the picture at this delay
+                drow = QHBoxLayout()
+                drow.addWidget(dl, 1)
+                hear = QToolButton()
+                hear.setObjectName("ctlText")
+                hear.setProperty("listen", e["path"])
+                hear.setCheckable(True)
+                hear.setIcon(style.icon("fa6s.headphones"))
+                hear.setText(" " + t("ext_listen"))
+                hear.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+                hear.setToolTip(t("ext_listen_tip"))
+                on = self._listening() == e["path"]
+                hear.setChecked(on)
+                hear.setEnabled(not bad and info is not None)
+                hear.toggled.connect(lambda c, p=e["path"], b=dl: self.listen_ext(p, b.value(), c))
+                drow.addWidget(hear)
+                g.addLayout(drow, 0, 1)
+            else:
+                g.addWidget(dl, 0, 1)
             if audio:
                 codec = QComboBox()
                 codec.setObjectName("extCodec")
@@ -1153,6 +1173,89 @@ class MainUI:
         if not j.ext:
             self.ext_lay.addWidget(_hint(t("ext_hint")))
         self._compact(self.ext_box, 8)
+
+    # 1.7: before / after with a curtain
+    def toggle_compare(self, on: bool | None = None, at: float | None = None):
+        from . import beforeafter as BA
+        tt = self.trim_tab
+        view = getattr(self, "cmp_view", None)
+        shown = view is not None and tt.stage_lay.currentWidget() is view
+        if on is None:
+            on = not shown
+        if not on:
+            if view is not None and shown:
+                tt.stage_lay.setCurrentWidget(tt.preview if tt.preview is not None else tt.placeholder)
+            self.b_compare.setChecked(False)
+            return
+        jobs = self.selected_jobs()
+        j = jobs[0] if len(jobs) == 1 else None
+        if j is None or j.info is None or j.info.error or j.info.video is None:
+            self._toast(t("tr_pick_one"))
+            self.b_compare.setChecked(False)
+            return
+        if not self.av_ready:
+            self.b_compare.setChecked(False)
+            return
+        if self.center.currentIndex() != 0:
+            self.show_side("streams")
+        if view is None:
+            view = BA.CompareView(tt.stage)
+            tt.stage_lay.addWidget(view)
+            self.cmp_view = view
+            self.cmp_grab = BA.Grabber(self)
+            self.cmp_grab.done.connect(self._cmp_done)
+            self.cmp_grab.status.connect(view.set_busy)
+            view.closed.connect(lambda: self.toggle_compare(False))
+            view.moved.connect(lambda s: self.toggle_compare(True, s))
+        if self.cmp_grab.busy:
+            return
+        if at is None:
+            pos = tt.position()
+            at = pos if pos is not None else 0.0
+        dur = J.src_duration(j)
+        at = max(0.0, min(at, max(0.0, dur - 0.1)))
+        self._cmp = (j.uid, at)
+        done = j.status == "done" and len(j.parts or [j.out]) == 1 and j.out and os.path.isfile(j.out)
+        view.label_b = t("cmp_result") if done else t("cmp_piece")
+        view.set_busy(t("cmp_grabbing"))
+        tt.stage_lay.setCurrentWidget(view)
+        view.setFocus()
+        self.b_compare.setChecked(True)
+        if tt.preview is not None:
+            tt.preview.pause()
+        self.cmp_grab.grab(j, self.av, at, True, bool(self.cfg.get("hw_decode", True)))
+
+    def _cmp_done(self, a: str, b: str, err: str):
+        view = getattr(self, "cmp_view", None)
+        if view is None:
+            return
+        uid, at = getattr(self, "_cmp", (0, 0.0))
+        view.set_frames(a, b, at, err)
+
+    # 1.7: an outside sound track heard with the picture
+    def _listening(self) -> str:
+        pv = getattr(self.trim_tab, "preview", None)
+        return getattr(pv, "listening", "") if pv is not None else ""
+
+    def listen_ext(self, path: str, delay_ms: int, on: bool = True) -> bool:
+        tt = self.trim_tab
+        if not on:
+            if tt.preview is not None:
+                tt.preview.stop_listen()
+            return False
+        if self.center.currentIndex() != 0:
+            self.show_side("streams")
+        if tt.preview is None:
+            tt._load_preview()
+        ok = tt.preview is not None and tt.preview.listen(path, delay_ms / 1000.0)
+        if not ok:
+            self._toast(t("ext_listen_no"))
+            QTimer.singleShot(0, self._fill_tracks)
+        return bool(ok)
+
+    def _listen_delay(self, path: str, delay_ms: int):
+        if self._listening() == path:
+            self.trim_tab.preview.set_delay(delay_ms / 1000.0)
 
     def _track_keep(self, idx: int, on: bool):
         jobs = self.selected_jobs(editable=True)
@@ -1242,6 +1345,9 @@ class MainUI:
         tr = self.trim_tab
         tr.b_mute.setVisible(True)
         lay.addWidget(tr.transport)
+        self.b_compare = ctl_button("fa6s.table-columns", t("cmp_tip") + " (Ctrl+B)", 15, lambda: self.toggle_compare())
+        self.b_compare.setCheckable(True)
+        lay.addWidget(self.b_compare)
         lay.addStretch(1)
         self.bottom_right = QStackedWidget()
         sw = QWidget()
@@ -1387,7 +1493,7 @@ class MainUI:
         self.codec_dialog = SmallDialog(t("video_settings"), body, self, 600)
 
     def format_dialog(self):
-        """What the chosen container holds, the subtitles and the metadata (XviD4PSP: Format options)."""
+        """What the chosen container holds, the subtitles and the metadata (Format options)."""
         st = self._shown_settings()
         c = E.container(st.get("container", "mkv"))
         body = QWidget()
@@ -1460,52 +1566,26 @@ class MainUI:
         self._format_dlg = d
         d.exec()
 
-    def history_dialog(self):
-        """The conversion logs (Log → History): the list on the left, the chosen log on the right."""
-        body = QWidget()
-        lay = QHBoxLayout(body)
-        sp = QSplitter(Qt.Horizontal)
-        hist = QTreeWidget()
-        hist.setObjectName("playlist")
-        hist.setColumnCount(3)
-        hist.setHeaderLabels([t("log_when"), t("col_file"), t("col_state")])
-        hist.setRootIsDecorated(False)
-        hh = hist.header()
-        hh.setSectionResizeMode(0, QHeaderView.ResizeToContents)
-        hh.setSectionResizeMode(1, QHeaderView.Stretch)
-        hh.setSectionResizeMode(2, QHeaderView.ResizeToContents)
-        view = QPlainTextEdit()
-        view.setReadOnly(True)
-        view.setLineWrapMode(QPlainTextEdit.NoWrap)
-        view.setStyleSheet("font-family: Consolas, 'DejaVu Sans Mono', monospace; font-size: 8.5pt;")
-        import time as _time
-        from PySide6.QtWidgets import QTreeWidgetItem
-        for h in logs.history():
-            it = QTreeWidgetItem(hist, [_time.strftime("%d.%m %H:%M", _time.localtime(h.get("time", 0))),
-                                        os.path.basename(h.get("src", "")), t("s_" + h.get("status", "done"))])
-            it.setData(0, Qt.UserRole, h.get("log", ""))
-            it.setToolTip(1, h.get("src", "") + ("\n→ " + h["out"] if h.get("out") else ""))
-            it.setForeground(2, QColor(style.OK if h.get("status") == "done" else style.ERR if h.get("status") == "error"
-                                       else style.MUTED))
-
-        def show(cur, _p=None):
-            path = cur.data(0, Qt.UserRole) if cur is not None else ""
-            try:
-                with open(path, encoding="utf-8", errors="replace") as f:
-                    view.setPlainText(f.read())
-            except OSError:
-                view.setPlainText("")
-        hist.currentItemChanged.connect(show)
-        sp.addWidget(hist)
-        sp.addWidget(view)
-        sp.setSizes([360, 700])
-        lay.addWidget(sp)
-        d = SmallDialog(t("log_history"), body, self, 1000)
-        d.resize(1100, 640)
-        self._history = (d, hist, view)
-        if hist.topLevelItemCount():
-            hist.setCurrentItem(hist.topLevelItem(0))
-        d.exec()
+    def history_dialog(self, path: str = ""):
+        """1.7: the log window (Log → History, Ctrl+L): the history and the chosen log, coloured, with find."""
+        from .logview import LogWindow
+        d = getattr(self, "_logwin", None)
+        try:
+            if d is not None:
+                d.isVisible()
+        except RuntimeError:
+            d = None
+        if d is None:
+            d = LogWindow(self)
+            self._logwin = d
+        else:
+            d.reload()
+        if path:
+            d.select(path)
+        d.show()
+        d.raise_()
+        d.activateWindow()
+        return d
 
     # ── strip & loudness under the picture ────────────────────
     def _want_media(self, j):
@@ -1541,6 +1621,7 @@ class MainUI:
         sc("Space", self.toggle_pause)
         sc("Escape", self.view.clearSelection)
         sc("Ctrl+I", lambda: self.show_side("info"))
+        sc("Ctrl+B", lambda: self.toggle_compare())
         sc("Ctrl+T", lambda: self.show_side("trim"))
 
     def _delete_key(self):

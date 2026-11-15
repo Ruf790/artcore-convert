@@ -18,9 +18,9 @@ PALETTES = {
                   PROG_TEXT="#1c2027", OK="#2f9e44", ERR="#e03131", WARN="#d48806", RUN="#1c7ed6",
                   RUN_TEXT="#0b5ed7"),
 }
-# 1.6: the look — "xvid": flat, square, compact rows like XviD4PSP 8 (our buttons and icons stay);
+# 1.6: the look — "classic": flat, square, compact rows (our buttons and icons stay);
 # "modern": the rounded look of 1.0–1.5
-XVID = {
+CLASSIC = {
     "dark": dict(ACCENT="#2f8de4", ACCENT2="#2f8de4", BG="#1e1e1e", PANEL="#252526", PANEL2="#2d2d30",
                  BORDER="#3f3f46", TEXT="#e4e4e4", MUTED="#9d9d9d", ALT="#2a2a2c",
                  SEL="rgba(47,141,228,90)", HOVER="rgba(255,255,255,24)", PRESSED="rgba(255,255,255,40)",
@@ -36,24 +36,24 @@ XVID = {
 }
 MODERN = dict(SECTION="", SECTION2="", FIELD="", BTN="", BTN_HOT="", MENU_SEL="", MENU_SEL_FG="#ffffff",
               CARD_SEL_FG="#ffffff", CARD_SEL_MUT="#e6ecff")
-LOOK = "xvid"
+LOOK = "classic"
 THEME = "dark"
 IS_DARK = True
 SECTION = SECTION2 = FIELD = BTN = BTN_HOT = CARD_SEL = CARD_SEL_FG = CARD_SEL_MUT = MENU_SEL = MENU_SEL_FG = ""
 
 
 def set_look(name: str) -> str:
-    """xvid | modern. Call before set_theme."""
+    """classic | modern. Call before set_theme."""
     global LOOK
-    LOOK = name if name in ("xvid", "modern") else "xvid"
+    LOOK = name if name in ("classic", "modern") else "classic"
     return LOOK
 
 
 def palette() -> dict:
-    """The colours in use: the theme, and for the XviD4PSP look its own greys and blues on top."""
+    """The colours in use: the theme, and for the classic look its own greys and blues on top."""
     pal = dict(PALETTES[THEME])
-    if LOOK == "xvid":
-        pal.update(XVID[THEME])
+    if LOOK == "classic":
+        pal.update(CLASSIC[THEME])
     else:
         pal.update(MODERN, CARD_SEL=pal["ACCENT"], SECTION=pal["PANEL2"], SECTION2=pal["PANEL2"],
                    FIELD=pal["PANEL2"], BTN=pal["PANEL2"], BTN_HOT=pal["PANEL2"], MENU_SEL=pal["ACCENT"])
@@ -110,8 +110,8 @@ def _icon_png(name: str, color: str, file: str, px: int = 12) -> str:
 
 
 def section_css() -> str:
-    """The grey header of a block (a track, the filters …) — XviD4PSP draws them as a light bar."""
-    if LOOK == "xvid":
+    """The grey header of a block (a track, the filters …) — a light bar in the classic look."""
+    if LOOK == "classic":
         return (f"QFrame#section {{ background: qlineargradient(x1:0, y1:0, x2:0, y2:1, stop:0 {SECTION}, "
                 f"stop:1 {SECTION2}); border-top: 1px solid {BORDER}; border-bottom: 1px solid {BORDER}; }}")
     return (f"QFrame#section {{ background: {PANEL2}; border-top: 1px solid {BORDER};"
@@ -120,7 +120,7 @@ def section_css() -> str:
 
 def stylesheet() -> str:
     pal = palette()
-    qss = QSS + (XVID_QSS if LOOK == "xvid" else "")
+    qss = QSS + (CLASSIC_QSS if LOOK == "classic" else "")
     tag = f"{LOOK}_{THEME}"
     return (qss.format(**pal)
             .replace("%DOWN%", _icon_png("fa6s.chevron-down", pal["MUTED"], f"artcore_convert_down_{tag}.png", 9))
@@ -355,9 +355,9 @@ QScrollBar::handle:horizontal {{ background: {SCROLL}; border-radius: 4px; min-w
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal {{ width: 0; }}
 """
 
-# 1.6: the XviD4PSP 8 look on top of the rules above — square corners, thin grey frames, white fields,
+# 1.6: the classic look on top of the rules above — square corners, thin grey frames, white fields,
 # grey buttons that turn light blue under the mouse, blue segmented tabs, compact rows
-XVID_QSS = """
+CLASSIC_QSS = """
 QWidget {{ font-size: 9pt; }}
 QMenu {{ border-radius: 0; padding: 2px; }}
 QMenu::item {{ padding: 5px 24px 5px 10px; border-radius: 0; }}

@@ -168,6 +168,8 @@ class MpvView(QWidget):
                                  sub_auto="no", demuxer_max_bytes="150MiB", demuxer_max_back_bytes="150MiB", **extra)
         self.seeking = False
         self._steps = 0                          # frame steps asked while a seek still runs
+        self.listening = ""                      # 1.7: an outside sound file played with the picture
+        self._aid0 = None
         for name in ("time-pos", "duration", "pause", "seeking"):
             self.player.observe_property(name, lambda n, v: self._bridge.prop.emit(n, v))
         self.ctx = None
@@ -211,6 +213,12 @@ class MpvView(QWidget):
             return
         self.path = path
         self.pos = 0.0
+        if self.listening:
+            try:
+                self.player.audio_delay = 0.0
+            except Exception:
+                pass
+        self.listening, self._aid0 = "", None
         self.player.pause = True
         self.player.play(path)
 
@@ -257,6 +265,42 @@ class MpvView(QWidget):
         if not self.dead:
             self.player.mute = bool(on)
 
+    # ── 1.7: hear an outside sound track with the picture, at a delay ──
+    def listen(self, path: str, delay: float) -> bool:
+        """Play the film with <path> as its sound, <delay> seconds later (− earlier) than the picture."""
+        if not self.path or self.dead:
+            return False
+        try:
+            if self.listening != path:
+                if self._aid0 is None:
+                    self._aid0 = self.player.aid
+                self.player.command("audio-add", path, "select")
+                self.listening = path
+            self.player.audio_delay = float(delay)
+            self.player.mute = False
+            self.player.pause = False
+            return True
+        except Exception:
+            return False
+
+    def set_delay(self, delay: float):
+        if self.listening and not self.dead:
+            try:
+                self.player.audio_delay = float(delay)
+            except Exception:
+                pass
+
+    def stop_listen(self):
+        if not self.listening or self.dead:
+            return
+        try:
+            self.player.pause = True
+            self.player.audio_delay = 0.0
+            self.player.aid = self._aid0 if self._aid0 not in (None, False) else "auto"
+        except Exception:
+            pass
+        self.listening, self._aid0 = "", None
+
     def shutdown(self):
         if self.dead:
             return
@@ -270,6 +314,17 @@ class MpvView(QWidget):
 
 
 class FramePreview(QWidget):
+    listening = ""
+
+    def listen(self, path: str, delay: float) -> bool:          # 1.7: stills only: no sound to hear
+        return False
+
+    def set_delay(self, delay: float):
+        pass
+
+    def stop_listen(self):
+        pass
+
     """No libmpv: a still frame from ffmpeg at the asked moment (the newest request wins)."""
     position = Signal(float)
     duration = Signal(float)

@@ -70,7 +70,7 @@ def save(src: str, out: str, status: str, error: str, elapsed: float, size: int,
     ]
     if settings is not None:
         head.append("Settings: " + json.dumps(settings, ensure_ascii=False))
-    if not text:                    # 1.6: xlog.build writes it as XviD4PSP does; this is the plain fallback
+    if not text:                    # 1.6: xlog.build writes the full log; this is the plain fallback
         text = "\n".join(head) + "\n\n$ " + command + "\n\n" + "\n".join(lines) + "\n"
     try:
         with open(path, "w", encoding="utf-8") as f:

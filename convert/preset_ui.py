@@ -39,7 +39,7 @@ def fam_label(f: str) -> str:
 
 # ── the preset of the format ─────────────────────────────────
 class FormatDialog(QDialog):
-    """XviD4PSP's «Preset of the format»: the list of presets (built in, own) on the left, the chosen one on the
+    """The «Preset of the format» window: the list of presets (built in, own) on the left, the chosen one on the
     right. Built-in ones are read only (Copy makes an own one); own ones are kept in formats.json and can be
     created, renamed, deleted, exported to a file and imported from one. «Use» puts the shown preset into the
     selected tasks (or the settings of new files)."""

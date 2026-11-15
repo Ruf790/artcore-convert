@@ -1,4 +1,4 @@
-"""1.5: presets of the format (XviD4PSP's «Preset of the format»), the container options (Format options) and
+"""1.5: presets of the format («Preset of the format»), the container options (Format options) and
 the device presets.
 
 A preset of the format is a dict kept in the task settings as settings["fmt"] (a copy, so a saved queue or a
