@@ -414,7 +414,7 @@ def main() -> int:
     app.setApplicationName(APP_TITLE)
     app.setStyle("Fusion")
     from . import style
-    style.set_look(cfg.get("look", "xvid"))
+    style.set_look(cfg.get("look", "classic"))
     style.set_theme(cfg.get("theme", "dark"))
     app.setStyleSheet(style.stylesheet())
     app.setWindowIcon(style.app_icon())

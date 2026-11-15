@@ -10,7 +10,7 @@ import sys
 DEFAULTS = {
     "language":      "ru",
     "theme":         "dark",        # dark | light | auto (as Windows apps)
-    "look":          "xvid",        # 1.6: xvid (flat, like XviD4PSP 8) | modern (rounded, 1.0–1.5)
+    "look":          "classic",     # 1.6: classic (flat, square, compact) | modern (rounded, 1.0–1.5)
     "single_window": True,          # files opened from Explorer go to the running converter
     "check_updates": True,
     "last_update_check": 0,
@@ -34,6 +34,7 @@ DEFAULTS = {
     "notify":        True,          # a tray message when the queue is done (window not active)
     "save_logs":     True,          # a log file of every conversion in <data>\logs (the Log tab)
     "log_next_to_output": False,    # and a copy next to the result (name.log)
+    "auto_ext":      True,          # 1.7: a film added → its film.*.ac3 / .srt / .ass … beside it attached
     "encoders":      {},            # cache of the hardware test: {ffmpeg version: {encoder: ok}}
     # 1.4
     "cpu_limit":     100,           # % of the processor ffmpeg may use (threads + the cores it runs on)
@@ -103,8 +104,8 @@ def load() -> dict:
         cfg["language"] = "ru"
     if cfg.get("theme") not in ("dark", "light", "auto"):
         cfg["theme"] = "dark"
-    if cfg.get("look") not in ("xvid", "modern"):
-        cfg["look"] = "xvid"
+    if cfg.get("look") not in ("classic", "modern"):
+        cfg["look"] = "classic"
     if cfg.get("out_mode") not in ("source", "folder"):
         cfg["out_mode"] = "source"
     if cfg.get("priority") not in PRIORITIES:

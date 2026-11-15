@@ -90,7 +90,7 @@ class TrimTab(QWidget):
         lay.setSpacing(8)
         self.hint = _hint()
         lay.addWidget(self.hint)
-        # the picture, the strip under it and the player buttons are placed by the window (XviD4PSP 8: the
+        # the picture, the strip under it and the player buttons are placed by the window (the
         # preview in the middle, the buttons in the bottom bar); this widget itself holds the trim controls
         self.stage = Stage(self)
         self.stage.setMinimumHeight(160)

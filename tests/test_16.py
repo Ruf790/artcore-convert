@@ -1,5 +1,5 @@
-"""1.6: the XviD4PSP look, the track cards that fold like an accordion, sound and subtitle files dropped or
-opened attach to their film, external AC3 cut keeps its codec, and the log as XviD4PSP writes it."""
+"""1.6: the classic look, the track cards that fold like an accordion, sound and subtitle files dropped or
+opened attach to their film, external AC3 cut keeps its codec, and the log in sections."""
 import os
 
 import pytest
@@ -48,22 +48,22 @@ def test_look_xvid_and_modern(qapp):
     from convert import style
     try:
         for theme in ("light", "dark"):
-            style.set_look("xvid")
+            style.set_look("classic")
             style.set_theme(theme)
             qss = style.stylesheet()
             assert "QTabBar#segTabs::tab:selected" in qss and "border-radius: 2px" in qss
             assert style.CARD_SEL and style.SECTION and "gradient" in style.section_css()
             assert "%DOWN%" not in qss and "%UP%" not in qss
-        assert style.CARD_SEL == style.XVID["dark"]["CARD_SEL"]
+        assert style.CARD_SEL == style.CLASSIC["dark"]["CARD_SEL"]
         style.set_look("modern")
         style.set_theme("dark")
         qss = style.stylesheet()
         assert "QTabBar#segTabs::tab:first" not in qss and style.CARD_SEL == style.ACCENT
-        assert style.set_look("bogus") == "xvid"
+        assert style.set_look("bogus") == "classic"
         cfg = config.load()
-        assert cfg.get("look") == "xvid"
+        assert cfg.get("look") == "classic"
     finally:
-        style.set_look("xvid")
+        style.set_look("classic")
         style.set_theme("dark")
 
 
