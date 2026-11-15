@@ -59,7 +59,7 @@ def test_build_args(media, av):
     a = J.build_args(j, "ffmpeg", "/out.mkv", av)
     s = " ".join(a)
     assert "-c:v libx265" in s and "-crf 24" in s and "yuv420p10le" in s and "main10" in s
-    assert "scale=-2:720" in s and "-c:a:0 ac3 -ac:a:0 2 -b:a:0 224k" in s and "-f matroska" in s
+    assert "scale=1280:720:flags=lanczos" in s and "-c:a:0 ac3 -ac:a:0 2 -b:a:0 224k" in s and "-f matroska" in s
     assert a[-1] == "/out.mkv" and "-progress" in a and "-map_chapters" in a
     j = _job(media, "Movie (2017).mkv", video={"encoder": "x264", "height": 2160})
     assert "scale=" not in " ".join(J.build_args(j, "ffmpeg", "/o.mkv", av))      # never upscale
@@ -179,3 +179,19 @@ def test_cache_keeps_reasons(monkeypatch):
     monkeypatch.setattr(E, "ffmpeg_encoders", lambda: {e.ffname for e in E.VIDEO})
     back = E.detect(cache)                                    # from the cache: no test encodes
     assert back.ok["nvenc_hevc"] and back.reasons["amf_hevc"] == "no_amd"
+
+
+def test_logs_keep_the_newest(data_dir, monkeypatch, tmp_path):
+    from convert import logs
+    monkeypatch.setattr(logs, "KEEP", 2)
+    out = tmp_path / "o.mkv"
+    out.write_bytes(b"x")
+    paths = [logs.save("/films/a?.mkv", str(out), "done", "", 61.5, 1, "HEVC", "ffmpeg -i a", ["line"], {"x": 1},
+                       next_to_output=True, when=1_700_000_000 + i) for i in range(3)]
+    assert all(paths) and not os.path.exists(paths[0]) and os.path.isfile(paths[2])
+    assert [h["log"] for h in logs.history()] == [paths[2], paths[1]]
+    text = open(paths[2], encoding="utf-8").read()
+    assert "Time:     0:01:01" in text and "$ ffmpeg -i a" in text and "a_" in os.path.basename(paths[2])
+    assert (tmp_path / "o.log").is_file()
+    logs.clear()
+    assert logs.history() == [] and not os.path.exists(paths[2])

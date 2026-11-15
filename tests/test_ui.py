@@ -50,8 +50,9 @@ def test_queue_and_settings(qapp, media, data_dir, tmp_path):
     for j in others[:2]:
         w.items[j.uid].setSelected(True)
     pump(qapp, 0.2)
-    w.v_h.setCurrentIndex(w.v_h.findData(720))
-    assert all(j.settings["video"]["height"] == 720 for j in [movie] + others[:2])
+    w.v_res.setCurrentIndex(w.v_res.findData("1280x720"))
+    assert all((j.settings["video"]["width"], j.settings["video"]["height"]) == (1280, 720)
+               for j in [movie] + others[:2])
     # a preset on the selection
     w.preset_box.setCurrentIndex(w.preset_box.findData("remux_mkv"))
     w._preset_picked()

@@ -20,6 +20,7 @@ from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winin
 from . import encoders as E
 from . import job as J
 from . import probe as P
+from . import logs
 from .edit_tabs import ChaptersTab, MetaTab, TrimTab
 from .i18n import t
 from .runner import Runner
@@ -166,6 +167,8 @@ class MainWindow(QMainWindow):
         self._last_stat: dict = {}
         self._gpu: dict = {}
         self._gpu_busy = False
+        self._run_log: list[str] = []            # every ffmpeg line of the task being encoded (its log file)
+        self._run_started = 0.0
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -439,12 +442,36 @@ class MainWindow(QMainWindow):
 
         box = QGroupBox(t("grp_picture"))
         f = QFormLayout(box)
-        self.v_h = QComboBox()
-        self.v_h.addItem(t("as_source"), 0)
-        for h in (2160, 1440, 1080, 720, 576, 480):
-            self.v_h.addItem(f"{h}p", h)
-        self.v_h.currentIndexChanged.connect(lambda: self._set("video", "height", self.v_h.currentData()))
-        f.addRow(t("resolution"), self.v_h)
+        self.v_res = QComboBox()
+        self.v_res.setMaxVisibleItems(16)
+        self.v_res.currentIndexChanged.connect(self._res_picked)
+        f.addRow(t("resolution"), self.v_res)
+        row = QHBoxLayout()
+        self.v_w = QSpinBox()
+        self.v_hh = QSpinBox()
+        for sb in (self.v_w, self.v_hh):
+            sb.setRange(0, 8192)
+            sb.setSingleStep(2)
+            sb.setSpecialValueText(t("auto"))
+            sb.setKeyboardTracking(False)
+            sb.valueChanged.connect(self._res_typed)
+        row.addWidget(self.v_w)
+        row.addWidget(QLabel("×"))
+        row.addWidget(self.v_hh)
+        row.addStretch(1)
+        f.addRow(t("res_custom"), row)
+        self.v_fit = QComboBox()
+        for key in ("fit", "pad", "stretch"):
+            self.v_fit.addItem(t("fit_" + key), key)
+        self.v_fit.currentIndexChanged.connect(lambda: self._set("video", "fit", self.v_fit.currentData()))
+        f.addRow(t("res_fit"), self.v_fit)
+        self.v_up = QCheckBox(t("res_upscale"))
+        self.v_up.toggled.connect(lambda on: self._set("video", "upscale", bool(on)))
+        f.addRow("", self.v_up)
+        self.v_res_hint = QLabel()
+        self.v_res_hint.setObjectName("hint")
+        self.v_res_hint.setWordWrap(True)
+        f.addRow("", self.v_res_hint)
         self.v_fps = QComboBox()
         self.v_fps.addItem(t("as_source"), 0)
         for x in (60, 50, 30, 25, 24):
@@ -582,6 +609,8 @@ class MainWindow(QMainWindow):
         top.addWidget(ctl_button("fa6s.copy", t("log_copy"), 13,
                                  lambda: QApplication.clipboard().setText(self.log.toPlainText())))
         top.addWidget(ctl_button("fa6s.eraser", t("log_clear"), 13, lambda: self.log.clear()))
+        top.addWidget(ctl_button("fa6s.folder-open", t("logs_folder"), 13,
+                                 lambda: winint.show_in_explorer(logs.logs_dir())))
         lay.addLayout(top)
         self.log = QPlainTextEdit()
         self.log.setReadOnly(True)
@@ -948,6 +977,8 @@ class MainWindow(QMainWindow):
             if any(x.status in ("wait", "probe") for x in jobs):
                 m.addAction(style.icon("fa6s.forward"), t("skip"), lambda: self._skip(jobs))
             m.addAction(style.icon("fa6s.terminal"), t("copy_cmd"), lambda: self._copy_cmd(j))
+            if j.log_path and os.path.isfile(j.log_path):
+                m.addAction(style.icon("fa6s.file-lines"), t("open_log"), lambda: self.open_log(j))
             m.addSeparator()
             m.addAction(style.icon("fa6s.trash-can"), t("remove") + "\tDel", self.remove_selected)
         m.addAction(style.icon("fa6s.broom"), t("clear_done"), self.clear_done)
@@ -1054,7 +1085,8 @@ class MainWindow(QMainWindow):
             self._queue_changed()
         else:
             config.save(self.cfg)
-        if (section, key) in (("video", "encoder"), ("video", "rc"), ("video", "mode"), (None, "container")):
+        if (section, key) in (("video", "encoder"), ("video", "rc"), ("video", "mode"), (None, "container"),
+                              ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale")):
             self._load_settings()
             if key == "container":
                 self._fill_tracks()
@@ -1095,14 +1127,19 @@ class MainWindow(QMainWindow):
             self.v_br.setEnabled(rc == "bitrate")
             self.v_size.setEnabled(rc == "size")
             self.v_speed.setValue(int(v.get("speed", 5)))
-            sel(self.v_h, int(v.get("height", 0) or 0))
+            self._fill_res(v)
+            self.v_w.setValue(int(v.get("width", 0) or 0))
+            self.v_hh.setValue(int(v.get("height", 0) or 0))
+            sel(self.v_fit, v.get("fit", "fit"))
+            self.v_up.setChecked(bool(v.get("upscale")))
             sel(self.v_fps, int(v.get("fps", 0) or 0))
             sel(self.v_deint, v.get("deint", "auto"))
             self.v_meta.setChecked(bool(st.get("meta", True)))
             cont = E.container(st.get("container", "mkv"))
             enc_on = v.get("mode", "encode") != "copy" and not cont.audio_only
             self.v_mode.setEnabled(not cont.audio_only and cont.id != "gif")
-            for wdg in (self.v_enc, self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_h,
+            for wdg in (self.v_enc, self.v_bits, self.rc_q, self.rc_b, self.rc_s, self.v_speed, self.v_res, self.v_w,
+                        self.v_hh, self.v_fit, self.v_up,
                         self.v_fps, self.v_deint):
                 wdg.setEnabled(enc_on)
             if enc_on and not enc.rc:
@@ -1124,6 +1161,13 @@ class MainWindow(QMainWindow):
                     item.setToolTip("" if fits else t("not_in_container", cont.id.upper()))
             self._speed_label()
             self._enc_hint(enc if enc_on else None, v, cont)
+            jobs_r = self.selected_jobs()
+            jr = jobs_r[0] if jobs_r and jobs_r[0].info is not None and jobs_r[0].info.video is not None else None
+            if jr is not None and enc_on:
+                ow, oh = J.out_size(jr, enc)
+                self.v_res_hint.setText(t("res_result", jr.info.video.width, jr.info.video.height, ow, oh))
+            else:
+                self.v_res_hint.setText("")
             jobs = self.selected_jobs()
             dur = J.out_duration(jobs[0]) if jobs and jobs[0].info else 0.0
             self.v_size_hint.setText(t("size_hint", E.target_kbps(float(v.get("size_mb", 0)), dur, 0)) if dur else "")
@@ -1139,6 +1183,58 @@ class MainWindow(QMainWindow):
                 self.tabs.widget(tab).setEnabled(not locked)
         finally:
             self._loading = False
+
+    def _fill_res(self, v: dict):
+        """The resolution list: as the source, the usual frames, the current own size, «own size…»."""
+        w, h = int(v.get("width", 0) or 0), int(v.get("height", 0) or 0)
+        if h and not w:
+            w = J._even(h * 16 / 9)
+        cur = f"{w}x{h}" if w and h else "0x0"
+        b = self.v_res
+        b.blockSignals(True)
+        b.clear()
+        b.addItem(t("as_source"), "0x0")
+        b.insertSeparator(b.count())
+        for rw, rh in J.RESOLUTIONS:
+            b.addItem(t(f"res_{rw}x{rh}"), f"{rw}x{rh}")
+        if b.findData(cur) < 0:
+            b.addItem(f"{w}×{h}", cur)
+        b.insertSeparator(b.count())
+        b.addItem(t("res_own"), "custom")
+        b.setCurrentIndex(max(0, b.findData(cur)))
+        b.blockSignals(False)
+
+    def _res_picked(self):
+        data = self.v_res.currentData()
+        if self._loading or not data:
+            return
+        if data == "custom":
+            self._load_settings()                     # back to the current entry until a size is typed
+            self.v_w.setFocus()
+            self.v_w.selectAll()
+            return
+        w, h = (int(x) for x in data.split("x"))
+        self._put("video", "width", w)
+        self._set("video", "height", h)
+
+    def _res_typed(self):
+        if self._loading:
+            return
+        self._put("video", "width", int(self.v_w.value()))
+        self._set("video", "height", int(self.v_hh.value()))
+
+    def _put(self, section: str, key: str, value):
+        """Write one value like _set, without the refresh (the next _set does it)."""
+        if self._loading:
+            return
+        jobs = self.selected_jobs(editable=True)
+        targets = [j.settings for j in jobs]
+        if not jobs and not self.selected_jobs():
+            if not self.cfg.get("defaults"):
+                self.cfg["defaults"] = J.merged(self.new_settings())
+            targets = [self.cfg["defaults"]]
+        for st in targets:
+            st.setdefault(section, {})[key] = value
 
     def _fill_encoders(self):
         cur = self.v_enc.currentData()
@@ -1430,6 +1526,8 @@ class MainWindow(QMainWindow):
         self.st_name.setText(f"{j.name}  →  {os.path.basename(out)}")
         self.st["encoder"].setText(self._enc_text(j))
         self._last_stat = {}
+        self._run_log = []
+        self._run_started = time.time()
         self.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"))
         self._update_buttons()
         self._queue_changed()
@@ -1464,6 +1562,7 @@ class MainWindow(QMainWindow):
 
     def _on_log(self, line: str):
         self.log.appendPlainText(line)
+        self._run_log.append(line)
 
     def _on_finished(self, ok: bool, err: str):
         j = self.current
@@ -1487,6 +1586,7 @@ class MainWindow(QMainWindow):
             else:
                 j.status, j.error, j.out = "error", err, ""
                 self.log.appendPlainText("✗ " + err)
+            self._save_log(j)
             self._refresh(j)
             sel = self.selected_jobs()
             if sel and sel[0] is j:
@@ -1496,6 +1596,26 @@ class MainWindow(QMainWindow):
         self._queue_changed()
         if self.running:
             QTimer.singleShot(200, self._next)
+
+    def _save_log(self, j: J.Job):
+        """The conversion's log file (Settings → keep logs): what, into what, the result, all of ffmpeg."""
+        lines, self._run_log = self._run_log, []
+        if not self.cfg.get("save_logs", True):
+            return
+        cmd = lines[0][2:] if lines and lines[0].startswith("$ ") else ""
+        path = logs.save(j.src, j.out, j.status, j.error, j.elapsed, j.out_size,
+                         J.describe(j.settings, self.av if self.av_ready else None, t), cmd,
+                         lines[1:] if cmd else lines, j.settings,
+                         bool(self.cfg.get("log_next_to_output")), self._run_started or None)
+        if path:
+            j.log_path = path
+
+    def open_log(self, j: J.Job | None):
+        if j is None or not j.log_path or not os.path.isfile(j.log_path):
+            return
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(j.log_path))
 
     def _queue_done(self):
         self.running = False
