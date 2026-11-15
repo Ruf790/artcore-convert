@@ -83,13 +83,20 @@ def test_build_args(media, av):
 @pytest.mark.parametrize("enc", E.VIDEO, ids=lambda e: e.id)
 def test_every_encoder_args(enc):
     """Every encoder in every mode makes sense: its speed preset, the rate control, 10 bit where it can."""
+    if enc.id == "gif":                                       # the palette filters do the work
+        assert E.video_args(enc, {"rc": "quality"}, 8) == []
+        return
+    if enc.id == "prores":                                    # quality = profile, always 10 bit 4:2:2
+        a = E.video_args(enc, {"rc": "bitrate", "quality": 4}, 10)
+        assert a[a.index("-profile:v") + 1] == "3" and "yuv422p10le" in a and "-b:v" not in a
+        return
     for rc in ("quality", "bitrate", "size"):
         for speed in (1, 4, 7):
             a = E.video_args(enc, {"rc": rc, "quality": enc.q_default, "bitrate": 5000, "size_mb": 700,
                                    "speed": speed}, max(enc.bits), 3600)
             assert "-pix_fmt" in a
             if rc == "quality":
-                assert any(x in a for x in ("-cq", "-crf", "-qp_i", "-global_quality"))
+                assert any(x in a for x in ("-cq", "-crf", "-qp_i", "-global_quality", "-q:v"))
             else:
                 assert "-b:v" in a
     if 10 in enc.bits:
@@ -130,7 +137,8 @@ def test_out_name(tmp_path):
 def test_presets_and_queue_roundtrip():
     for key in J.PRESETS:
         st = J.preset_settings(key)
-        assert st["video"]["mode"] in ("encode", "copy") and st["container"] in ("mkv", "mp4")
+        assert st["video"]["mode"] in ("encode", "copy") and st["container"] in E.CONT
+        assert J.fit_container(J.merged(st)) == st, key                 # every preset fits its container
         assert J.describe(st)
     j = J.Job("/x/a.mkv", J.preset_settings("phone"), preset="phone", tracks={"1": {"keep": False}})
     j.status = "run"

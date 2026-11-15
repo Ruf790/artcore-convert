@@ -1,13 +1,16 @@
 @echo off
-rem ArtCore Convert: FFmpeg + the .exe (PyInstaller) + the installer (Inno Setup)
+rem ArtCore Convert: FFmpeg + libmpv + the .exe (PyInstaller) + the installer (Inno Setup)
 rem Needs: Python 3.12/3.13 64-bit (python.org), Inno Setup 6.3+ (jrsoftware.org)
 cd /d "%~dp0"
 
 python -m pip install --upgrade pip
-python -m pip install -r requirements.txt pyinstaller pillow || goto :err
+python -m pip install -r requirements.txt pyinstaller pillow py7zr || goto :err
 
 if not exist ffmpeg\bin\ffmpeg.exe (
   python tools\fetch_ffmpeg.py || goto :err
+)
+if not exist libmpv\libmpv-2.dll (
+  python tools\fetch_libmpv.py || goto :err
 )
 python tools\make_icon.py || goto :err
 
@@ -15,6 +18,8 @@ python -m PyInstaller --noconfirm --clean --windowed ^
   --name ArtCoreConvert ^
   --icon assets\icon.ico ^
   --version-file version_info.txt ^
+  --add-binary "libmpv\libmpv-2.dll;." ^
+  --hidden-import mpv ^
   --collect-data qtawesome ^
   --exclude-module PySide6.QtQml ^
   --exclude-module PySide6.QtQuick ^

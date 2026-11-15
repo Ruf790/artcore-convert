@@ -6,6 +6,7 @@ import os
 import sys
 
 from PySide6.QtCore import QEvent, QObject, QTimer
+from PySide6.QtGui import QSurfaceFormat
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 from PySide6.QtWidgets import QApplication, QWidget
 
@@ -26,6 +27,15 @@ def _send_to_running(paths: list[str]) -> bool:
     return True
 
 
+def _surface_format() -> None:
+    """libmpv's OpenGL renderer (the Trim preview) wants a 3.3+ core context, as in ArtCore Player."""
+    f = QSurfaceFormat()
+    f.setVersion(3, 3)
+    f.setProfile(QSurfaceFormat.CoreProfile)
+    f.setSwapInterval(1)
+    QSurfaceFormat.setDefaultFormat(f)
+
+
 class TitleBars(QObject):
     """Every window and dialog gets a title bar in the colours of the theme when it is first shown."""
 
@@ -39,8 +49,9 @@ class TitleBars(QObject):
 
 
 def selftest() -> int:
-    """CI: the built exe finds its ffmpeg / ffprobe, checks the encoders, builds the window and converts a
-    short test clip (x264 + AAC to MP4, x265 10 bit + copy to MKV) through the real queue. Result in %TEMP%."""
+    """CI: the built exe finds its ffmpeg / ffprobe and libmpv, checks the encoders, builds the window and
+    converts a short test clip through the real queue: x264 + AAC to MP4, x265 10 bit + copy to MKV, and (1.1)
+    a trimmed VP9 WebM with edited tags and chapters, Xvid AVI, GIF and MP3. Result in %TEMP%."""
     import tempfile
     import time
     import traceback
@@ -60,7 +71,9 @@ def selftest() -> int:
         av = E.detect()
         lines.append("encoders: " + ", ".join(f"{e.ffname}={'ok' if av.ok.get(e.id) else 'no'}" for e in E.VIDEO))
         need = {"libx264", "libx265", "libsvtav1", "aac", "ac3", "eac3", "libopus", "flac", "libmp3lame",
-                "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_amf", "hevc_amf", "h264_qsv", "hevc_qsv"}
+                "h264_nvenc", "hevc_nvenc", "av1_nvenc", "h264_amf", "hevc_amf", "h264_qsv", "hevc_qsv",
+                "libvpx-vp9", "mpeg4", "mpeg2video", "prores_ks", "gif", "libvorbis", "mp2", "alac", "pcm_s16le",
+                "pcm_s24le"}
         missing = need - av.audio
         if missing:
             raise RuntimeError(f"this ffmpeg build lacks {sorted(missing)}")
@@ -75,6 +88,26 @@ def selftest() -> int:
                     "-preset", "ultrafast", "-c:a", "ac3", "-ac", "6", src], 60)
         if r.returncode != 0:
             raise RuntimeError("making the test clip failed: " + r.stderr[-300:])
+        lines.append("libxvid: " + ("yes" if "libxvid" in av.audio else "no (FFmpeg's mpeg4 is used for Xvid)"))
+        # libmpv: loads and plays (no picture needed here: the offscreen platform has no OpenGL)
+        from . import mpvview
+        mod = mpvview.load_mpv()
+        if mod is None:
+            raise RuntimeError("libmpv: " + mpvview.mpv_error())
+        m = mod.MPV(vo="null", ao="null", pause=True, config=False, terminal=False, ytdl=False, hr_seek="yes")
+        lines.append(f"libmpv {m.mpv_version}, ffmpeg {m.ffmpeg_version}")
+        m.play(src)
+        t0 = time.monotonic()
+        while not m.duration and time.monotonic() - t0 < 20:
+            time.sleep(0.05)
+        m.command("seek", 1.0, "absolute+exact")
+        t0 = time.monotonic()
+        while abs((m.time_pos or 0) - 1.0) > 0.05 and time.monotonic() - t0 < 20:
+            time.sleep(0.05)
+        lines.append(f"  mpv: duration {m.duration}, after seek {m.time_pos}")
+        if not m.duration or abs((m.time_pos or 0) - 1.0) > 0.05:
+            raise RuntimeError("libmpv did not open / seek the clip")
+        m.terminate()
         cfg = config.load()
         cfg.update(check_updates=False, keep_queue=False, out_mode="folder", out_dir=os.path.join(tmp, "out"),
                    overwrite=True, on_done="nothing", notify=False)
@@ -93,7 +126,28 @@ def selftest() -> int:
         j2 = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"encoder": "x265", "bits": "10"},
                                                 "audio": {"codec": "copy"}}))
         win._append(j2)                          # … so add the second task directly
+        j3 = J.Job(src=src, settings=J.fit_container(J.merged({"container": "webm", "video": {"speed": 1}})))
+        j3.trim = [[0.2, 0.8], [1.2, 1.8]]
+        j3.meta = {"tags": {"title": "Selftest"}, "streams": {"1": {"lang": "rus"}}}
+        j3.chapters = [[0.0, "A"], [0.6, "B"]]
+        jobs_11 = [j3] + [J.Job(src=src, settings=J.fit_container(J.merged(st))) for st in (
+            {"container": "avi", "video": {"encoder": "auto_mpeg4"}},
+            {"container": "gif"},
+            {"container": "mp3"},
+            {"container": "mov", "video": {"encoder": "prores", "quality": 1}})]
+        for j in jobs_11:
+            win._append(j)
         win._queue_changed()
+        win.view.setCurrentItem(win.items[j3.uid])
+        t0 = time.monotonic()
+        while any(j.status == "probe" for j in win.jobs) and time.monotonic() - t0 < 30:
+            app.processEvents()
+            time.sleep(0.02)
+        for i in range(win.tabs.count()):                        # every tab shows the task (Trim, Metadata …)
+            win.tabs.setCurrentIndex(i)
+            app.processEvents()
+        if win.trim_tab.job is not j3 or not win.meta_tab.tags.topLevelItemCount():
+            raise RuntimeError("the Trim / Metadata tabs did not take the task")
         win.start_queue()
         t0 = time.monotonic()
         while time.monotonic() - t0 < 120 and any(j.status not in ("done", "error") for j in win.jobs):
@@ -104,9 +158,20 @@ def selftest() -> int:
             if j.status != "done":
                 raise RuntimeError(f"conversion failed: {j.error}")
             info = probe.probe(j.out)
-            lines.append("  " + probe.summary(info) + " · " + probe.video_line(info.video))
+            lines.append("  " + probe.summary(info) + (" · " + probe.video_line(info.video) if info.video else ""))
         if probe.probe(j2.out).video.bits != 10:
             raise RuntimeError("x265 10 bit came out 8 bit")
+        r3 = probe.probe(j3.out)
+        want = {"video": "vp9", "dur": 1.2, "title": "Selftest", "chapters": ["A", "B"], "lang": "rus"}
+        got = {"video": r3.video.codec, "dur": round(r3.duration, 1), "title": r3.tags.get("title"),
+               "chapters": [c[2] for c in r3.chapter_list], "lang": r3.of("audio")[0].lang}
+        if abs(got["dur"] - want["dur"]) <= 0.2:
+            got["dur"] = want["dur"]
+        if got != want:
+            raise RuntimeError(f"the trimmed WebM: {got} != {want}")
+        kinds = [(probe.probe(j.out).video.codec if probe.probe(j.out).video else "-") for j in jobs_11[1:]]
+        if kinds != ["mpeg4", "gif", "-", "prores"]:
+            raise RuntimeError(f"AVI / GIF / MP3 / MOV: {kinds}")
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -125,6 +190,7 @@ def main() -> int:
     cfg = config.load()
     set_lang(cfg.get("language", "ru"))
     winint.init_process(APP_ID)
+    _surface_format()
     app = QApplication(sys.argv)
     app.setApplicationName(APP_TITLE)
     app.setStyle("Fusion")

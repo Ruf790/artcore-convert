@@ -22,6 +22,7 @@ class VEnc:
     q_default: int = 23
     q_range: tuple = (1, 51)
     hw: bool = True
+    rc: bool = True             # takes bit rate / file size (ProRes, GIF: quality only)
 
 
 VIDEO = [
@@ -37,10 +38,20 @@ VIDEO = [
     VEnc("x264", "libx264", "h264", "cpu", "H.264 — x264 (процессор)", (8,), 20, (0, 51), False),
     VEnc("x265", "libx265", "hevc", "cpu", "HEVC — x265 (процессор)", (8, 10), 22, (0, 51), False),
     VEnc("svtav1", "libsvtav1", "av1", "cpu", "AV1 — SVT-AV1 (процессор)", (8, 10), 30, (1, 63), False),
+    VEnc("vp9", "libvpx-vp9", "vp9", "cpu", "VP9 — libvpx (процессор)", (8, 10), 32, (0, 63), False),
+    VEnc("xvid", "libxvid", "mpeg4", "cpu", "MPEG-4 ASP — Xvid (процессор)", (8,), 4, (1, 31), False),
+    VEnc("mpeg4", "mpeg4", "mpeg4", "cpu", "MPEG-4 ASP — FFmpeg (процессор)", (8,), 4, (1, 31), False),
+    VEnc("mpeg2", "mpeg2video", "mpeg2video", "cpu", "MPEG-2 (процессор)", (8,), 4, (1, 31), False),
+    VEnc("prores", "prores_ks", "prores", "cpu", "ProRes 422 (процессор)", (10,), 4, (1, 4), False, False),
+    VEnc("gif", "gif", "gif", "cpu", "GIF", (8,), 0, (0, 0), False, False),
 ]
 BY_ID = {e.id: e for e in VIDEO}
-FAMILIES = ("hevc", "h264", "av1")
-FAMILY_LABEL = {"h264": "H.264", "hevc": "HEVC", "av1": "AV1"}
+FAMILIES = ("hevc", "h264", "av1", "mpeg4")          # these have an «auto» entry (more than one encoder)
+FAMILY_LABEL = {"h264": "H.264", "hevc": "HEVC", "av1": "AV1", "vp9": "VP9", "mpeg4": "MPEG-4 ASP",
+                "mpeg2video": "MPEG-2", "prores": "ProRes", "gif": "GIF"}
+CPU_LABEL = {"x264": "x264", "x265": "x265", "svtav1": "SVT-AV1", "vp9": "libvpx", "xvid": "Xvid", "mpeg4": "FFmpeg",
+             "mpeg2": "FFmpeg", "prores": "FFmpeg", "gif": "FFmpeg"}
+PRORES_PROFILES = ("Proxy", "LT", "422", "HQ")
 # "auto_<family>": the best encoder of that family this PC has — GPU first, then the CPU one
 AUTO_ORDER = ("nvidia", "amd", "intel", "cpu")
 VENDOR_LABEL = {"nvidia": "NVIDIA NVENC", "amd": "AMD AMF", "intel": "Intel Quick Sync", "cpu": "CPU"}
@@ -192,9 +203,13 @@ AMF_QUALITY = ("speed", "speed", "balanced", "balanced", "balanced", "quality", 
 QSV_PRESETS = ("veryfast", "faster", "fast", "medium", "slow", "slower", "veryslow")
 X_PRESETS = ("superfast", "veryfast", "faster", "fast", "medium", "slow", "slower")
 SVT_PRESETS = ("12", "10", "8", "7", "6", "5", "4")
+VPX_CPU = ("5", "4", "3", "2", "2", "1", "0")
+XVID_ME = ("1", "2", "3", "4", "5", "6", "6")
 
 
 def pix_fmt(e: VEnc, bits: int) -> str:
+    if e.id == "prores":
+        return "yuv422p10le"
     if bits >= 10 and 10 in e.bits:
         return "p010le" if e.hw else "yuv420p10le"
     return "nv12" if e.vendor in ("amd", "intel") else "yuv420p"
@@ -211,6 +226,10 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
     if rc == "size" and duration > 0:
         kbps = target_kbps(float(v.get("size_mb", 0) or 0), duration, int(v.get("audio_kbps", 0) or 0))
     out: list[str] = []
+    if e.id == "gif":                                      # the palette filters do it all
+        return out
+    if e.id == "prores":                                   # the «quality» is the profile: 1 Proxy … 4 HQ
+        return ["-profile:v", str(q - 1), "-vendor", "apl0", "-pix_fmt", pix_fmt(e, bits)]
     if e.vendor == "nvidia":
         out += ["-preset", NV_PRESETS[sp], "-tune", "hq"]
         if rc == "quality" or kbps <= 0:
@@ -237,6 +256,19 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
     elif e.id == "svtav1":
         out += ["-preset", SVT_PRESETS[sp]]
         out += ["-crf", str(q)] if rc == "quality" or kbps <= 0 else ["-b:v", f"{kbps}k"]
+    elif e.id == "vp9":
+        out += ["-deadline", "good", "-cpu-used", VPX_CPU[sp], "-row-mt", "1"]
+        out += ["-crf", str(q), "-b:v", "0"] if rc == "quality" or kbps <= 0 else \
+            ["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{kbps * 2}k"]
+        if bits >= 10:
+            out += ["-profile:v", "2"]
+    elif e.family in ("mpeg4", "mpeg2video"):            # Xvid / FFmpeg MPEG-4 / MPEG-2: q = qscale 1..31
+        if e.id == "xvid":
+            out += ["-me_quality", XVID_ME[sp]]
+        out += ["-q:v", str(q)] if rc == "quality" or kbps <= 0 else \
+            ["-b:v", f"{kbps}k", "-maxrate", f"{kbps * 3 // 2}k", "-bufsize", f"{max(kbps * 2, 1835)}k"]
+        if e.family == "mpeg2video":
+            out += ["-bf", "2"]
     else:                                                  # x264 / x265
         out += ["-preset", X_PRESETS[sp]]
         if rc == "quality" or kbps <= 0:
@@ -246,6 +278,8 @@ def video_args(e: VEnc, v: dict, bits: int, duration: float = 0.0) -> list[str]:
         if e.id == "x265":
             out += ["-x265-params", "log-level=error"]
     out += ["-pix_fmt", pix_fmt(e, bits)]
+    if e.family not in ("h264", "hevc"):
+        return out
     if bits >= 10 and 10 in e.bits and e.family == "hevc":
         out += ["-profile:v", "main10"]
     elif e.family == "h264":
@@ -278,26 +312,90 @@ AUDIO = [
     AEnc("opus", "libopus", "Opus", 8, (160, 384)),
     AEnc("flac", "flac", "FLAC (без потерь)", 8, (0, 0)),
     AEnc("mp3", "libmp3lame", "MP3", 2, (256, 256)),
+    AEnc("vorbis", "libvorbis", "Vorbis", 8, (192, 448)),
+    AEnc("mp2", "mp2", "MP2", 2, (224, 224)),
+    AEnc("alac", "alac", "ALAC (без потерь)", 8, (0, 0)),
+    AEnc("pcm16", "pcm_s16le", "PCM 16 bit (WAV)", 8, (0, 0)),
+    AEnc("pcm24", "pcm_s24le", "PCM 24 bit (WAV)", 8, (0, 0)),
 ]
 A_BY_ID = {a.id: a for a in AUDIO}
-# what each container takes as it is (otherwise "auto" re-encodes to AAC)
-CONTAINER_AUDIO = {
-    "mkv": None,                                            # everything
-    "mp4": {"aac", "ac3", "eac3", "mp3", "opus", "flac", "alac"},
-}
-CONTAINER_VIDEO = {
-    "mkv": None,
-    "mp4": {"h264", "hevc", "av1", "vp9", "mpeg4", "mpeg2video"},
-}
-CONTAINER_SUBS = {
-    "mkv": None,
-    "mp4": {"mov_text"},                                    # text subtitles are converted to mov_text
-}
+# our audio id → the codec name ffprobe gives the result (to know what a container takes)
+A_CODEC = {"aac": "aac", "ac3": "ac3", "eac3": "eac3", "opus": "opus", "flac": "flac", "mp3": "mp3",
+           "vorbis": "vorbis", "mp2": "mp2", "alac": "alac", "pcm16": "pcm_s16le", "pcm24": "pcm_s24le"}
+
+
+@dataclass(frozen=True)
+class Container:
+    id: str
+    label: str
+    fmt: str                        # -f
+    video: frozenset | None         # codec names it takes (None = any); empty = audio only
+    audio: frozenset | None
+    a_default: str                  # what «auto» encodes to when the source audio doesn't fit
+    subs: str                       # any | mov_text | webvtt | none
+    v_default: str = "auto_hevc"    # the encoder to switch to when the chosen one doesn't fit
+    one_audio: bool = False         # a single audio track (MP3, FLAC, WAV …)
+    chapters: bool = True
+
+    @property
+    def audio_only(self) -> bool:
+        return self.video is not None and not self.video
+
+    @property
+    def ext(self) -> str:
+        return self.id
+
+    def takes_video(self, codec: str) -> bool:
+        if codec == "gif" or self.id == "gif":            # GIF only in .gif, and .gif only GIF
+            return codec == "gif" and self.id == "gif"
+        return self.video is None or codec in self.video
+
+    def takes_audio(self, codec: str) -> bool:
+        return self.audio is None or codec in self.audio
+
+
+_fs = frozenset
+_PCM = _fs({"pcm_s16le", "pcm_s24le", "pcm_s32le", "pcm_f32le", "pcm_u8"})
+CONTAINERS = [
+    Container("mkv", "MKV (Matroska)", "matroska", None, None, "aac", "any"),
+    Container("mp4", "MP4", "mp4", _fs({"h264", "hevc", "av1", "vp9", "mpeg4", "mpeg2video"}),
+              _fs({"aac", "ac3", "eac3", "mp3", "opus", "flac", "alac"}), "aac", "mov_text"),
+    Container("mov", "MOV (QuickTime)", "mov", _fs({"h264", "hevc", "prores", "mpeg4", "mpeg2video", "mjpeg", "av1"}),
+              _fs({"aac", "ac3", "eac3", "alac", "mp3"}) | _PCM, "aac", "mov_text"),
+    Container("webm", "WebM", "webm", _fs({"vp9", "av1", "vp8"}), _fs({"opus", "vorbis"}), "opus", "webvtt", "vp9"),
+    Container("avi", "AVI", "avi", _fs({"mpeg4", "h264", "mpeg2video", "mjpeg", "msmpeg4v3"}),
+              _fs({"mp3", "ac3", "mp2", "pcm_s16le"}), "mp3", "none", "auto_mpeg4", chapters=False),
+    Container("ts", "TS (MPEG-TS)", "mpegts", _fs({"h264", "hevc", "mpeg2video", "av1"}),
+              _fs({"aac", "ac3", "eac3", "mp2", "mp3", "opus", "dts", "truehd"}), "aac", "none", chapters=False),
+    Container("m2ts", "M2TS (Blu-ray)", "mpegts", _fs({"h264", "hevc", "mpeg2video"}),
+              _fs({"ac3", "eac3", "dts", "truehd", "aac", "mp2"}), "ac3", "none", chapters=False),
+    Container("gif", "GIF", "gif", _fs({"gif"}), _fs(), "", "none", "gif", chapters=False),
+    # audio only
+    Container("mka", "MKA (Matroska Audio)", "matroska", _fs(), None, "aac", "none"),
+    Container("mp3", "MP3", "mp3", _fs(), _fs({"mp3"}), "mp3", "none", one_audio=True),
+    Container("m4a", "M4A (AAC / ALAC)", "mp4", _fs(), _fs({"aac", "alac"}), "aac", "none", one_audio=True),
+    Container("flac", "FLAC", "flac", _fs(), _fs({"flac"}), "flac", "none", one_audio=True, chapters=False),
+    Container("opus", "Opus", "opus", _fs(), _fs({"opus"}), "opus", "none", one_audio=True, chapters=False),
+    Container("ogg", "OGG (Vorbis)", "ogg", _fs(), _fs({"vorbis", "opus", "flac"}), "vorbis", "none", one_audio=True,
+              chapters=False),
+    Container("wav", "WAV", "wav", _fs(), _PCM, "pcm16", "none", one_audio=True, chapters=False),
+    Container("ac3", "AC-3 (Dolby Digital)", "ac3", _fs(), _fs({"ac3"}), "ac3", "none", one_audio=True, chapters=False),
+]
+CONT = {c.id: c for c in CONTAINERS}
+
+
+def container(cid: str) -> Container:
+    return CONT.get(cid) or CONT["mkv"]
+
+
+# 1.0 names, used by tests and the Tracks tab
+CONTAINER_AUDIO = {c.id: (None if c.audio is None else set(c.audio)) for c in CONTAINERS}
+CONTAINER_VIDEO = {c.id: (None if c.video is None else set(c.video)) for c in CONTAINERS}
 TEXT_SUBS = {"subrip", "ass", "ssa", "mov_text", "webvtt", "text"}
 
 
 # ── self-check without the hardware ──────────────────────────
-GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params"}
+GENERIC = {"b:v", "maxrate", "bufsize", "pix_fmt", "global_quality", "profile:v", "x265-params", "q:v", "bf"}
 
 
 def check_options(e: VEnc) -> list[str]:
