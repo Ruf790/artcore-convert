@@ -32,6 +32,7 @@ DEFAULT_SETTINGS = {
               "fps": 0, "deint": "auto"},
     "audio": {"codec": "auto", "kbps": 0, "channels": "keep", "normalize": False, "tracks": "all"},
     "subs": "all",
+    "lang": "",          # «Select streams»: only the audio / subtitles of this language ("" = any)
     "meta": True,
 }
 
@@ -132,6 +133,15 @@ class Job:
 
     def track(self, s: Stream) -> dict:
         return self.tracks.get(str(s.index), {})
+
+    def acfg(self, s: Stream) -> dict:
+        """The audio settings of one track: the common ones with this track's own (Streams tab) laid over."""
+        out = dict(self.settings.get("audio", {}))
+        t = self.track(s)
+        for k in ("kbps", "channels", "normalize"):
+            if k in t:
+                out[k] = t[k]
+        return out
 
     def smeta(self, s: Stream) -> dict:
         """The user's edits of a stream's language / title / default / forced (Metadata tab)."""
@@ -305,7 +315,7 @@ def fit_container(st: dict) -> dict:
 def multi_encode(job: Job) -> bool:
     """Several pieces with the video encoded: they are joined by the concat filter."""
     c = E.container(job.settings.get("container", "mkv"))
-    return len(segments(job)) > 1 and job.settings.get("video", {}).get("mode") != "copy" and \
+    return len(segments(job)) > 1 and job.settings.get("video", {}).get("mode", "encode") == "encode" and \
         not c.audio_only and job.info is not None and job.info.video is not None
 
 
@@ -320,7 +330,7 @@ def plan(job: Job) -> dict:
     w = out["warnings"]
     v = info.of("video")
     vcfg = st.get("video", {})
-    if v and not c.audio_only:
+    if v and not c.audio_only and vcfg.get("mode") != "none":
         out["video"] = [v[0]]
         if vcfg.get("mode") == "copy":
             if not c.takes_video(v[0].codec):
@@ -335,7 +345,10 @@ def plan(job: Job) -> dict:
     recut = bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy"
     out["same_rate"] = set()
     a_cfg = st.get("audio", {})
+    lang = (st.get("lang") or "").lower()
     audios = info.of("audio")
+    if lang:                                                      # «any language» or only this one
+        audios = [s for s in audios if (s.lang or "").lower() == lang] or audios[:1]
     if a_cfg.get("tracks") == "first":
         audios = audios[:1]
     if c.audio is not None and not c.audio:                       # GIF: no sound
@@ -350,8 +363,9 @@ def plan(job: Job) -> dict:
             w.append("w_one_audio")
             break
         codec = t.get("codec") or a_cfg.get("codec", "auto")
+        tc = job.acfg(s)
         if codec == "auto":
-            changes = a_cfg.get("channels", "keep") != "keep" or a_cfg.get("normalize")
+            changes = tc.get("channels", "keep") != "keep" or tc.get("normalize")
             codec = "copy" if c.takes_audio(s.codec) and not changes else c.a_default
         if codec == "copy" and not c.takes_audio(s.codec):
             codec = c.a_default
@@ -367,6 +381,8 @@ def plan(job: Job) -> dict:
             w.append("w_trim_audio")
         out["audio"].append((s, codec))
     subs = info.of("subtitle")
+    if lang:
+        subs = [s for s in subs if (s.lang or "").lower() == lang]
     mode = st.get("subs", "all")
     if mode == "none":
         subs = []
@@ -603,8 +619,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         else:
             bits = out_bits(job, enc)
             dur = out_duration(job)
-            a_total = sum(audio_kbps(cd, a.channels if a_cfg.get("channels") == "keep" else
-                                     (2 if a_cfg.get("channels") == "stereo" else 6), a_cfg) or
+            a_total = sum(audio_kbps(cd, a.channels if job.acfg(a).get("channels", "keep") == "keep" else
+                                     (2 if job.acfg(a).get("channels") == "stereo" else 6), job.acfg(a)) or
                           (a.bitrate // 1000 if cd == "copy" else 0) for a, cd in p["audio"])
             vv = dict(v)
             vv["audio_kbps"] = a_total
@@ -645,6 +661,7 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         args[vi:vi] = ["-map", "[vout]"]
     # audio
     for n, (s, codec) in enumerate(p["audio"]):
+        a_cfg = job.acfg(s)
         norm = a_cfg.get("normalize") and codec != "copy"
         if joined:
             if norm:
@@ -757,6 +774,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
     bits = []
     if c.audio_only:
         pass
+    elif v.get("mode") == "none":
+        bits.append(tr("v_none"))
     elif v.get("mode") == "copy":
         bits.append(tr("v_copy"))
     else:

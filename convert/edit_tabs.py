@@ -2,16 +2,18 @@
 title and flags of every track) and Chapters. Each one edits a single task; `changed` tells the window."""
 from __future__ import annotations
 
-from PySide6.QtCore import QRectF, QSize, Qt, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (QAbstractItemView, QButtonGroup, QComboBox, QDoubleSpinBox, QGroupBox,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QRadioButton, QSizePolicy,
-                               QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget)
+                               QStackedLayout, QStyledItemDelegate, QToolButton, QTreeWidget, QTreeWidgetItem,
+                               QVBoxLayout, QWidget)
 
 from . import encoders as E
 from . import job as J
 from . import mpvview, style
 from .i18n import t
+from .timeline import Timeline
 
 
 def _btn(icon: str, tip: str, slot=None, text: str = "", size: int = 15) -> QToolButton:
@@ -56,74 +58,26 @@ def _tree(headers: list[str], read_only: tuple = ()) -> QTreeWidget:
 
 
 # ══ Trim ══════════════════════════════════════════════════════
-class TrimBar(QWidget):
-    """The time line: the pieces that go out in the accent colour, the cut-out parts dimmed, In / Out marks,
-    the play head. A click or drag seeks."""
-    seek = Signal(float)
+class Stage(QWidget):
+    """The black area of the picture; tells the trim controller when it becomes visible."""
 
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.dur = 0.0
-        self.pos = 0.0
-        self.keep: list[tuple[float, float]] = []      # what goes out (J.segments); [] = all
-        self.mark_in: float | None = None
-        self.mark_out: float | None = None
-        self.setMinimumHeight(34)
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        self.setCursor(Qt.PointingHandCursor)
+    def __init__(self, owner):
+        super().__init__()
+        self.owner = owner
 
-    def _x(self, sec: float) -> float:
-        return 6 + (self.width() - 12) * (sec / self.dur if self.dur > 0 else 0.0)
+    def showEvent(self, e):
+        super().showEvent(e)
+        self.owner.stage_shown(True)
 
-    def _t(self, x: float) -> float:
-        return max(0.0, min(self.dur, (x - 6) / max(1, self.width() - 12) * self.dur)) if self.dur > 0 else 0.0
-
-    def paintEvent(self, _e):
-        p = QPainter(self)
-        p.setRenderHint(QPainter.Antialiasing)
-        h = self.height()
-        track = QRectF(6, h / 2 - 7, self.width() - 12, 14)
-        p.setPen(Qt.NoPen)
-        p.setBrush(QColor(style.PANEL2))
-        p.drawRoundedRect(track, 5, 5)
-        acc = QColor(style.ACCENT)
-        if self.dur > 0:
-            if self.keep:
-                for a, b in self.keep:
-                    p.setBrush(acc)
-                    p.drawRoundedRect(QRectF(self._x(a), track.top(), max(2.0, self._x(b) - self._x(a)), 14), 4, 4)
-            else:
-                acc.setAlpha(110)
-                p.setBrush(acc)
-                p.drawRoundedRect(track, 5, 5)
-            if self.mark_in is not None:
-                x0 = self._x(self.mark_in)
-                x1 = self._x(self.mark_out) if self.mark_out is not None and self.mark_out > self.mark_in else None
-                if x1 is not None:
-                    c = QColor(style.WARN)
-                    c.setAlpha(120)
-                    p.setBrush(c)
-                    p.drawRect(QRectF(x0, track.top() - 3, x1 - x0, 20))
-            for m in (self.mark_in, self.mark_out):
-                if m is not None:
-                    p.setPen(QPen(QColor(style.WARN), 2))
-                    p.drawLine(int(self._x(m)), 3, int(self._x(m)), h - 3)
-            p.setPen(QPen(QColor(style.STRONG), 2))
-            x = int(self._x(self.pos))
-            p.drawLine(x, 1, x, h - 1)
-        p.end()
-
-    def mousePressEvent(self, e):
-        if e.button() == Qt.LeftButton and self.dur > 0:
-            self.seek.emit(self._t(e.position().x()))
-
-    def mouseMoveEvent(self, e):
-        if e.buttons() & Qt.LeftButton and self.dur > 0:
-            self.seek.emit(self._t(e.position().x()))
+    def hideEvent(self, e):
+        super().hideEvent(e)
+        self.owner.stage_shown(False)
 
 
 class TrimTab(QWidget):
     changed = Signal()
+    media_wanted = Signal(object)        # a new task is shown: its strip and loudness are needed
+    position_changed = Signal(float)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -136,17 +90,24 @@ class TrimTab(QWidget):
         lay.setSpacing(8)
         self.hint = _hint()
         lay.addWidget(self.hint)
-        self.stage = QWidget()
-        self.stage.setMinimumHeight(200)
+        # the picture, the strip under it and the player buttons are placed by the window (XviD4PSP 8: the
+        # preview in the middle, the buttons in the bottom bar); this widget itself holds the trim controls
+        self.stage = Stage(self)
+        self.stage.setMinimumHeight(160)
         self.stage.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.stage.setStyleSheet("background: #000; border-radius: 8px;")
-        self.stage_lay = QVBoxLayout(self.stage)
+        self.stage.setStyleSheet("background: #000;")
+        self.stage_lay = QStackedLayout(self.stage)
         self.stage_lay.setContentsMargins(0, 0, 0, 0)
-        lay.addWidget(self.stage, 3)
-        self.bar = TrimBar()
+        self.placeholder = QLabel(t("trm_placeholder"))
+        self.placeholder.setAlignment(Qt.AlignCenter)
+        self.placeholder.setWordWrap(True)
+        self.placeholder.setStyleSheet("color: #8a8f99; font-size: 11pt; background: #000;")
+        self.stage_lay.addWidget(self.placeholder)
+        self.bar = Timeline()
         self.bar.seek.connect(lambda s: self._seek(s, exact=False))
-        lay.addWidget(self.bar)
-        row = QHBoxLayout()
+        self.transport = QWidget()
+        row = QHBoxLayout(self.transport)
+        row.setContentsMargins(0, 0, 0, 0)
         row.setSpacing(2)
         self.b_back = _btn("fa6s.backward", t("trm_back5") + " (Shift+←)", lambda: self._jump(-5))
         self.b_prev = _btn("fa6s.backward-step", t("trm_prev_frame") + " (←)", lambda: self._step(-1))
@@ -156,14 +117,14 @@ class TrimTab(QWidget):
         for b in (self.b_back, self.b_prev, self.b_play, self.b_next, self.b_fwd):
             row.addWidget(b)
         row.addSpacing(10)
-        self.time = QLabel("0:00.000 / 0:00.000")
+        self.time = QLabel("0 / 0  0:00.000")
         self.time.setStyleSheet("font-family: Consolas, 'DejaVu Sans Mono', monospace;")
         row.addWidget(self.time)
         row.addStretch(1)
         self.b_mute = _btn("fa6s.volume-high", t("trm_mute"), self._toggle_mute)
         self.muted = False
         row.addWidget(self.b_mute)
-        lay.addLayout(row)
+        self.b_back.setIcon(style.icon("fa6s.backward-fast", style.ICON))
         # In / Out
         g = QHBoxLayout()
         g.setSpacing(6)
@@ -190,11 +151,14 @@ class TrimTab(QWidget):
         self.mode_grp.addButton(self.r_cut)
         self.r_keep.setChecked(True)
         self.r_cut.toggled.connect(self._mode_changed)
-        mode.addWidget(self.b_add)
-        mode.addWidget(self.b_replace)
-        mode.addStretch(1)
+        acts = QHBoxLayout()
+        acts.addWidget(self.b_add)
+        acts.addWidget(self.b_replace)
+        acts.addStretch(1)
+        lay.addLayout(acts)
         mode.addWidget(self.r_keep)
         mode.addWidget(self.r_cut)
+        mode.addStretch(1)
         lay.addLayout(mode)
         body = QHBoxLayout()
         self.list = _tree(["#", t("trm_from"), t("trm_to"), t("trm_len")], (0, 1, 2, 3))
@@ -235,9 +199,12 @@ class TrimTab(QWidget):
             self.summary.setText("")
             if self.preview is not None:
                 self.preview.unload()
-            self.bar.update()
+            self.stage_lay.setCurrentWidget(self.placeholder)
+            self.bar.clear_media()
+            self._media_for = None
+            self.time.setText("0 / 0  0:00.000")
             return
-        self.hint.setText(t("trm_hint") + ("" if mpvview.load_mpv() is not None or not self.isVisible()
+        self.hint.setText(t("trm_hint") + ("" if mpvview.load_mpv() is not None
                                           else "\n⚠ " + t("trm_no_mpv")))
         v = job.info.video
         self.fps = v.fps if v is not None and v.fps else 25.0
@@ -253,7 +220,10 @@ class TrimTab(QWidget):
         self.r_keep.blockSignals(False)
         self.r_cut.blockSignals(False)
         self._fill()
-        if self.isVisible():
+        if getattr(self, "_media_for", None) is not job:
+            self._media_for = job
+            self.media_wanted.emit(job)
+        if self.stage.isVisible():
             self._load_preview()
 
     def _fill(self):
@@ -283,14 +253,11 @@ class TrimTab(QWidget):
         self.changed.emit()
 
     # ── preview ───────────────────────────────────────────────
-    def showEvent(self, e):
-        super().showEvent(e)
-        if self.job is not None:
+    def stage_shown(self, on: bool):
+        """The window shows / hides the picture (the Status tab puts the log there)."""
+        if on and self.job is not None and self.job.info is not None and not self.job.info.error:
             self._load_preview()
-
-    def hideEvent(self, e):
-        super().hideEvent(e)
-        if self.preview is not None:
+        elif not on and self.preview is not None:
             self.preview.pause()
 
     def _make_preview(self, frames_only: bool = False):
@@ -308,9 +275,11 @@ class TrimTab(QWidget):
             p = mpvview.FramePreview(self.stage)
         self.preview = p
         self.stage_lay.addWidget(p)
+        self.stage_lay.setCurrentWidget(p)
         p.position.connect(self._on_pos)
         p.duration.connect(lambda d: (setattr(self.bar, "dur", d or self.bar.dur), self._on_pos(self.bar.pos)))
         p.paused.connect(lambda on: self.b_play.setIcon(style.icon("fa6s.play" if on else "fa6s.pause", style.ICON)))
+        p.position.connect(self.position_changed)
         if isinstance(p, mpvview.FramePreview):
             for b in (self.b_play, self.b_mute):
                 b.setVisible(False)
@@ -320,7 +289,7 @@ class TrimTab(QWidget):
     def _gl_check(self):
         """No OpenGL 3.3 here (old driver, remote desktop): libmpv can't draw — still frames instead."""
         p = self.preview
-        if isinstance(p, mpvview.MpvView) and p.ctx is None and self.isVisible():
+        if isinstance(p, mpvview.MpvView) and p.ctx is None and self.stage.isVisible():
             p.shutdown()
             p.setParent(None)
             p.deleteLater()
@@ -331,6 +300,7 @@ class TrimTab(QWidget):
 
     def _load_preview(self):
         self._make_preview()
+        self.stage_lay.setCurrentWidget(self.preview)
         if isinstance(self.preview, mpvview.MpvView) and self.preview.ctx is None:
             from PySide6.QtCore import QTimer
             QTimer.singleShot(3000, self._gl_check)
@@ -352,7 +322,9 @@ class TrimTab(QWidget):
     def _on_pos(self, s: float):
         self.bar.pos = s
         self.bar.update()
-        self.time.setText(f"{J.fmt_tc(s)} / {J.fmt_tc(self.bar.dur)}")
+        frame = int(round(s * self.fps)) + 1
+        total = max(1, int(round(self.bar.dur * self.fps)))
+        self.time.setText(f"{min(frame, total)}/{total}  {J.fmt_tc(s)}")
 
     def _seek(self, s: float, exact: bool = True):
         if self.preview is None:

@@ -48,7 +48,7 @@ def test_containers_in_the_video_tab(qapp, media, data_dir):
     assert not aac.isEnabled()
     assert "W" in w.items[j.uid].text(3).upper() and "Opus" not in w.items[j.uid].text(3)
     w.v_cont.setCurrentIndex(w.v_cont.findData("mp3"))
-    assert not w.v_enc.isEnabled() and not w.v_mode.isEnabled()
+    assert not w.v_enc.isEnabled() and not w.v_on.isEnabled()
     assert w.items[j.uid].text(3).endswith("MP3")
     w.v_cont.setCurrentIndex(w.v_cont.findData("mov"))
     w.v_enc.setCurrentIndex(w.v_enc.findData("prores"))
@@ -64,7 +64,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     j = _one(qapp, w, os.path.join(media, "Movie (2017).mkv"))
     j.settings["video"].update(encoder="x264", speed=1, height=360)
     tr = w.trim_tab
-    w.tabs.setCurrentWidget(tr)
+    w.show_side("trim")
     assert pump(qapp, 15, lambda: tr.preview is not None and tr.bar.dur > 0)
     if mpvview.load_mpv() is not None:
         assert isinstance(tr.preview, mpvview.MpvView), mpvview.mpv_error()
@@ -95,7 +95,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     assert len(j.trim) == 1 and "⚠" in tr.summary.text()
     # metadata: the title, a sound track's language and default flag
     mt = w.meta_tab
-    w.tabs.setCurrentIndex(w.tabs.indexOf(w.meta_tab.parentWidget().parentWidget()))
+    w.show_side("meta")
     title = next(mt.tags.topLevelItem(i) for i in range(mt.tags.topLevelItemCount())
                  if mt.tags.topLevelItem(i).text(0) == "title")
     assert title.text(1) == "Test movie"
@@ -112,7 +112,7 @@ def test_trim_meta_chapters(qapp, media, data_dir, tmp_path):
     assert j.meta["streams"]["1"]["lang"] == "ukr" and j.meta["streams"]["2"]["title"] == "English"
     # chapters: the source's «Two» (at 1 s) fell into the cut-out second → moved to its end (1.0 of the result)
     ch = w.chap_tab
-    w.tabs.setCurrentWidget(ch)
+    w.show_side("chapters")
     assert [ch.view.topLevelItem(i).text(2) for i in range(ch.view.topLevelItemCount())] == ["One", "Two"]
     assert ch.view.topLevelItem(1).text(1) == "0:01.000" and j.chapters is None
     ch.view.topLevelItem(1).setText(2, "Вторая")

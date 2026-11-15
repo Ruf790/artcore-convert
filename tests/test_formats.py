@@ -252,3 +252,19 @@ def test_resolution_encode(qapp, media, tmp_path, av):
     j = _job(media, "dts.mkv", video={"encoder": "x264", "speed": 1, "width": 1280, "height": 720, "upscale": True})
     info, _ = _encode(qapp, j, av, tmp_path, "up")
     assert (info.video.width, info.video.height) == (1280, 720)
+
+
+def test_per_track_audio_and_language(media, av):
+    j = _job(media, "Movie (2017).mkv", video={"mode": "copy"}, audio={"codec": "ac3", "kbps": 448})
+    j.tracks = {"2": {"codec": "opus", "kbps": 96, "channels": "stereo", "normalize": True}}
+    a = " ".join(J.build_args(j, "ffmpeg", "/o.mkv", av))
+    assert "-c:a:0 ac3" in a and "-b:a:0 448k" in a and "-filter:a:0" not in a
+    assert "-c:a:1 libopus" in a and "-b:a:1 96k" in a and "-filter:a:1 loudnorm" in a
+    j = _job(media, "Movie (2017).mkv", lang="eng")
+    p = J.plan(j)
+    assert [s.lang for s, _ in p["audio"]] == ["eng"] and not p["subs"]          # the Russian subtitles too
+    j = _job(media, "Movie (2017).mkv", lang="rus")
+    p = J.plan(j)
+    assert [s.lang for s, _ in p["audio"]] == ["rus"] and len(p["subs"]) == 1
+    j = _job(media, "Movie (2017).mkv", lang="jpn")                               # none: the first audio stays
+    assert len(J.plan(j)["audio"]) == 1

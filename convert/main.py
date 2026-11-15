@@ -143,11 +143,19 @@ def selftest() -> int:
         while any(j.status == "probe" for j in win.jobs) and time.monotonic() - t0 < 30:
             app.processEvents()
             time.sleep(0.02)
-        for i in range(win.tabs.count()):                        # every tab shows the task (Trim, Metadata …)
-            win.tabs.setCurrentIndex(i)
+        for i in range(win.side_bar.count()):                    # every side tab shows the task (Trim, Metadata …)
+            win.side_bar.setCurrentIndex(i)
             app.processEvents()
         if win.trim_tab.job is not j3 or not win.meta_tab.tags.topLevelItemCount():
             raise RuntimeError("the Trim / Metadata tabs did not take the task")
+        win.show_side("streams")
+        t0 = time.monotonic()
+        while not (win.trim_tab.bar.frames and win.trim_tab.bar.peaks) and time.monotonic() - t0 < 30:
+            app.processEvents()
+            time.sleep(0.02)
+        lines.append(f"strip: {len(win.trim_tab.bar.frames)} frames, loudness: {len(win.trim_tab.bar.peaks)} points")
+        if not win.trim_tab.bar.peaks:
+            raise RuntimeError("no loudness curve under the picture")
         win.start_queue()
         t0 = time.monotonic()
         while time.monotonic() - t0 < 120 and any(j.status not in ("done", "error") for j in win.jobs):

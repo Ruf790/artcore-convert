@@ -269,6 +269,10 @@ QSlider::handle:horizontal {{ background: {HANDLE}; width: 12px; height: 12px; m
 QDoubleSpinBox, QSpinBox {{ background: {PANEL2}; border: 1px solid {BORDER}; border-radius: 8px; padding: 4px 6px; }}
 QGroupBox {{ border: 1px solid {BORDER}; border-radius: 10px; margin-top: 12px; padding: 12px 10px 8px 10px; }}
 QGroupBox::title {{ subcontrol-origin: margin; left: 12px; padding: 0 4px; color: {MUTED}; }}
+QMenuBar {{ background: {BG}; color: {TEXT}; border-bottom: 1px solid {BORDER}; }}
+QMenuBar::item {{ background: transparent; padding: 4px 10px; }}
+QMenuBar::item:selected {{ background: {HOVER}; border-radius: 6px; }}
+QTabBar#segTabs::tab {{ padding: 6px 9px; }}
 QTabWidget::pane {{ border: 1px solid {BORDER}; border-radius: 10px; top: -1px; }}
 QTabBar::tab {{ background: transparent; padding: 7px 10px; color: {MUTED}; border: none; }}
 QTabBar::tab:selected {{ color: {STRONG}; border-bottom: 2px solid {ACCENT}; }}
