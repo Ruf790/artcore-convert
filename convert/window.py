@@ -60,6 +60,9 @@ class Slot:
         self.started = 0.0
         self.stat: dict = {}
         self.stage = "main"
+        self.kinds: list[tuple[str, float]] = []     # 1.6: what each «$ command» of the log was, and when
+        self.peak = 0                                # 1.6: the most memory its ffmpeg took (bytes)
+        self._mem_at = 0.0
         self.runner.progress.connect(lambda d, s=self: win._on_progress(d, s))
         self.runner.log.connect(lambda line, s=self: win._on_log(line, s))
         self.runner.finished.connect(lambda ok, err, s=self: win._on_finished(ok, err, s))
@@ -487,7 +490,7 @@ class MainWindow(MainUI, QMainWindow):
                                                 f"{t('audio_files')} ({aexts});;{t('all_files')} (*)")
         if files:
             self.cfg["last_dir"] = os.path.dirname(files[0])
-            self.add_paths(files)
+            self.add_incoming(files)
 
     def add_folder_dialog(self):
         d = QFileDialog.getExistingDirectory(self, t("add_folder"), self.cfg.get("last_dir", ""))
@@ -508,6 +511,84 @@ class MainWindow(MainUI, QMainWindow):
             elif os.path.isfile(p):
                 out.append(p)
         return out
+
+    def add_incoming(self, paths: list[str], target_uid: int = 0, ask: bool = True) -> int:
+        """1.6: files dropped or opened (Ctrl+O) as XviD4PSP takes them: a film becomes a task; a sound or a
+        subtitle file is attached to a film — to the card (or the picture) it fell on, to the film whose name it
+        starts with (film.mkv ← film.rus.ac3, film.eng.srt), else to the selected film after asking — and only
+        without a film it becomes a task of its own (sound) or is left out (subtitles). Returns the tasks added."""
+        files = self.expand(paths)
+        extra_ext = J.EXT_AUDIO + J.EXT_SUBS
+        videos = [f for f in files if not f.lower().endswith(extra_ext)]
+        extras = [f for f in files if f.lower().endswith(extra_ext)]
+        n = self.add_paths(videos) if videos else 0
+        if not extras:
+            return n
+        ok = [j for j in self.jobs if j.status in EDITABLE + ("probe",) and not self._busy(j) and
+              (j.info is None or (not j.info.error and j.info.video is not None))]
+        target = next((j for j in ok if j.uid == target_uid), None) if target_uid else None
+        attached: dict[int, list[str]] = {}
+        rest = []
+        for f in extras:
+            j = target or self._film_for(f, ok)
+            if j is not None:
+                attached.setdefault(j.uid, []).append(f)
+            else:
+                rest.append(f)
+        if rest:
+            sel = [j for j in self.selected_jobs(editable=True) if j in ok]
+            film = sel[0] if len(sel) == 1 else None
+            if film is not None and ask:
+                names = "\n".join(os.path.basename(f) for f in rest[:8]) + ("\n…" if len(rest) > 8 else "")
+                box = QMessageBox(QMessageBox.Question, APP_TITLE, t("ext_ask", os.path.basename(film.src), names), parent=self)
+                b_add = box.addButton(t("ext_ask_add"), QMessageBox.AcceptRole)
+                b_task = box.addButton(t("ext_ask_task"), QMessageBox.NoRole)
+                box.addButton(QMessageBox.Cancel)
+                box.setDefaultButton(b_add)
+                box.exec()
+                if box.clickedButton() is b_add:
+                    attached.setdefault(film.uid, []).extend(rest)
+                    rest = []
+                elif box.clickedButton() is not b_task:
+                    rest = []
+        for uid, fs in attached.items():
+            j = next(x for x in self.jobs if x.uid == uid)
+            self._attach(j, fs)
+        if attached:
+            self._toast(t("ext_attached", sum(len(v) for v in attached.values())))
+            cur = self.selected_jobs()
+            if len(cur) == 1 and cur[0].uid in attached:
+                self._fill_tracks()
+                self._show_info(cur[0])
+        tasks = [f for f in rest if not f.lower().endswith(J.EXT_SUBS)]
+        if len(tasks) < len(rest):
+            self._toast(t("ext_subs_alone"))
+        return n + (self.add_paths(tasks) if tasks else 0)
+
+    def _film_for(self, path: str, jobs: list) -> J.Job | None:
+        """The film whose file name the extra file starts with, in its folder (the longest name wins)."""
+        d = os.path.normcase(os.path.dirname(os.path.abspath(path)))
+        stem = os.path.basename(path).lower()
+        best, size = None, 0
+        for j in jobs:
+            if os.path.normcase(os.path.dirname(os.path.abspath(j.src))) != d:
+                continue
+            base = os.path.splitext(os.path.basename(j.src))[0].lower()
+            if stem.startswith(base) and len(stem) > len(base) and stem[len(base)] in "._- [(" and len(base) > size:
+                best, size = j, len(base)
+        return best
+
+    def _attach(self, j: J.Job, files: list[str]):
+        have = {os.path.normcase(e["path"]) for e in j.ext}
+        for f in files:
+            if not os.path.isfile(f) or os.path.normcase(os.path.abspath(f)) in have:
+                continue
+            j.ext.append(J.clean_ext({"path": os.path.abspath(f), "kind": J.ext_kind(f), "lang": _lang_from_name(f, j.src)}))
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._probe_extra(j)
+        self._refresh(j)
+        self._queue_changed()
 
     def add_paths(self, paths: list[str]) -> int:
         have = {os.path.normcase(os.path.abspath(j.src)) for j in self.jobs if j.status in ("wait", "probe", "run", "pause")}
@@ -1794,6 +1875,7 @@ class MainWindow(MainUI, QMainWindow):
         except OSError:
             pass
         slot.job, slot.stage, slot.stat, slot.log = j, "main", {}, []
+        slot.kinds, slot.peak, slot._mem_at = [], 0, 0.0
         slot.started = time.time()
         j.status, j.out, j.progress, j.error, j.out_size, j.metrics, j.parts = "run", out, 0.0, "", 0, {}, []
         self._refresh(j)
@@ -1828,6 +1910,16 @@ class MainWindow(MainUI, QMainWindow):
     def _on_progress(self, d: dict, slot: Slot | None = None):
         slot = slot or self.slots[0]
         j = slot.job
+        now = time.monotonic()
+        if now - slot._mem_at >= 1.0:                     # 1.6: the peak memory of ffmpeg, for the log
+            slot._mem_at = now
+            pid = slot.runner.proc.processId() if slot.runner.proc is not None else 0
+            if pid:
+                try:
+                    import psutil
+                    slot.peak = max(slot.peak, psutil.Process(int(pid)).memory_info().rss)
+                except Exception:                         # noqa: BLE001
+                    pass
         if j is None:
             return
         slot.stat = d
@@ -1861,11 +1953,17 @@ class MainWindow(MainUI, QMainWindow):
 
     def _on_log(self, line: str, slot: Slot | None = None):
         slot = slot or self.slots[0]
+        from .xlog import NOISE
+        if NOISE.search(line):                               # 1.6: verbose chatter goes to the log file only
+            slot.log.append(line)
+            return
         many = len(self._busy_slots()) > 1
         if many and slot.job is not None:
             self.log.appendPlainText(f"[{self.jobs.index(slot.job) + 1 if slot.job in self.jobs else '?'}] {line}")
         else:
             self.log.appendPlainText(line)
+        if line.startswith("$ "):
+            slot.kinds.append((slot.runner.kind, time.time()))
         slot.log.append(line)
 
     def _on_finished(self, ok: bool, err: str, slot: Slot | None = None):
@@ -1970,11 +2068,22 @@ class MainWindow(MainUI, QMainWindow):
             slot.log = []
         if not self.cfg.get("save_logs", True):
             return
-        cmd = lines[0][2:] if lines and lines[0].startswith("$ ") else ""
-        path = logs.save(j.src, j.out, j.status, j.error, j.elapsed, j.out_size,
-                         J.describe(j.settings, self.av if self.av_ready else None, t), cmd,
-                         lines[1:] if cmd else lines, j.settings,
-                         bool(self.cfg.get("log_next_to_output")), (slot.started if slot else 0) or None)
+        cmd = next((x[2:] for x in reversed(lines) if x.startswith("$ ")), "")
+        profile = J.describe(j.settings, self.av if self.av_ready else None, t)
+        started = (slot.started if slot else 0) or (time.time() - (j.elapsed or 0))
+        text = ""
+        try:                                              # 1.6: the log as XviD4PSP writes it
+            from . import xlog
+            text = xlog.build(j, J, lines, slot.kinds if slot else [], started=started, ended=time.time(),
+                              profile=profile, peak_mem=slot.peak if slot else 0,
+                              out_path=slot.runner.out if slot else "", tr=t)
+        except Exception as e:                            # noqa: BLE001 — fall back to the plain log
+            import traceback
+            self.log.appendPlainText(f"⚠ log: {e}")
+            if os.environ.get("ARTCORE_LOG_DEBUG"):
+                traceback.print_exc()
+        path = logs.save(j.src, j.out, j.status, j.error, j.elapsed, j.out_size, profile, cmd,
+                         lines, j.settings, bool(self.cfg.get("log_next_to_output")), started, text=text)
         if path:
             j.log_path = path
 
@@ -2144,12 +2253,12 @@ class MainWindow(MainUI, QMainWindow):
     # ── menu, settings, updates ───────────────────────────────
     def settings_dialog(self):
         from .dialogs import SettingsDialog
-        lang, theme = self.cfg.get("language"), self.cfg.get("theme", "dark")
+        lang, theme = self.cfg.get("language"), (self.cfg.get("theme", "dark"), self.cfg.get("look", "xvid"))
         if SettingsDialog(self.cfg, self).exec():
             config.save(self.cfg)
             for j in self.jobs:
                 self._refresh(j)
-            if lang != self.cfg.get("language") or theme != self.cfg.get("theme", "dark"):
+            if lang != self.cfg.get("language") or theme != (self.cfg.get("theme", "dark"), self.cfg.get("look", "xvid")):
                 QMessageBox.information(self, APP_TITLE, t("lang_restart"))
 
     def encoders_dialog(self):
@@ -2274,8 +2383,16 @@ class MainWindow(MainUI, QMainWindow):
     def dropEvent(self, e):
         paths = [u.toLocalFile() for u in e.mimeData().urls() if u.isLocalFile()]
         if paths:
-            n = self.add_paths(paths)
-            self._toast(t("added_n", n) if n else t("added_none"))
+            uid = 0                                    # 1.6: dropped on the picture → onto the shown film
+            pv = self.center.widget(0)
+            at = pv.mapFrom(self, e.position().toPoint())
+            if self.center.currentIndex() == 0 and pv.rect().contains(at):
+                sel = self.selected_jobs()
+                uid = sel[0].uid if len(sel) == 1 else 0
+            before = sum(len(j.ext) for j in self.jobs)
+            n = self.add_incoming(paths, uid)
+            if n or sum(len(j.ext) for j in self.jobs) == before:
+                self._toast(t("added_n", n) if n else t("added_none"))
 
     def closeEvent(self, e):
         if self._any_running() and not getattr(self, "_installer", "") and not self._quitting:

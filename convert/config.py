@@ -10,6 +10,7 @@ import sys
 DEFAULTS = {
     "language":      "ru",
     "theme":         "dark",        # dark | light | auto (as Windows apps)
+    "look":          "xvid",        # 1.6: xvid (flat, like XviD4PSP 8) | modern (rounded, 1.0–1.5)
     "single_window": True,          # files opened from Explorer go to the running converter
     "check_updates": True,
     "last_update_check": 0,
@@ -102,6 +103,8 @@ def load() -> dict:
         cfg["language"] = "ru"
     if cfg.get("theme") not in ("dark", "light", "auto"):
         cfg["theme"] = "dark"
+    if cfg.get("look") not in ("xvid", "modern"):
+        cfg["look"] = "xvid"
     if cfg.get("out_mode") not in ("source", "folder"):
         cfg["out_mode"] = "source"
     if cfg.get("priority") not in PRIORITIES:

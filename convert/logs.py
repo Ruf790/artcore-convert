@@ -48,7 +48,8 @@ def _safe(name: str) -> str:
 
 
 def save(src: str, out: str, status: str, error: str, elapsed: float, size: int, profile: str, command: str,
-         lines: list[str], settings: dict | None = None, next_to_output: bool = False, when: float | None = None) -> str:
+         lines: list[str], settings: dict | None = None, next_to_output: bool = False, when: float | None = None,
+         text: str = "") -> str:
     """Write the log of one conversion; returns its path ("" if it could not be written)."""
     when = when or time.time()
     stamp = time.strftime("%Y-%m-%d_%H-%M-%S", time.localtime(when))
@@ -69,7 +70,8 @@ def save(src: str, out: str, status: str, error: str, elapsed: float, size: int,
     ]
     if settings is not None:
         head.append("Settings: " + json.dumps(settings, ensure_ascii=False))
-    text = "\n".join(head) + "\n\n$ " + command + "\n\n" + "\n".join(lines) + "\n"
+    if not text:                    # 1.6: xlog.build writes it as XviD4PSP does; this is the plain fallback
+        text = "\n".join(head) + "\n\n$ " + command + "\n\n" + "\n".join(lines) + "\n"
     try:
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)

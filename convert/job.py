@@ -653,9 +653,10 @@ def plan(job: Job) -> dict:
             break
         codec = job.ext[n].get("codec") or a_cfg.get("codec", "auto")
         tc = job.acfg(s)
-        changes = F.audio_on(tc) or bool(segs)
-        if codec == "auto":
-            codec = "copy" if takes(s.codec) and not changes else adef
+        filtered = F.audio_on(tc)
+        changes = filtered or bool(segs)
+        if codec == "auto":                   # 1.6: only cut → into its own codec (AC3 stays AC3), as the
+            codec = "copy" if takes(s.codec) and not filtered else adef     # source's own tracks do
         if codec != "copy" and not takes(E.A_CODEC.get(codec, codec)):
             codec = adef
             w.append("w_audio_reencoded")
@@ -1134,7 +1135,8 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     transforms = work_file(job, "vidstab", work_dir, "trf") if needs_vidstab(job) else ""
     hw = ["-hwaccel", "auto"] if enc is not None and enc.hw and hw_decode else []
     dec = ["-threads", str(threads)] if threads > 0 else []
-    args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:1"]
+    # 1.6: verbose — the read / decoded / encoded / muxed counts of every stream for the log
+    args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose", "-nostats", "-progress", "pipe:1"]
     if threads > 0:
         args += ["-filter_threads", str(threads), "-filter_complex_threads", str(threads)]
     # inputs: 0 = the source (or the concat list); meta_in = where the file's tags / chapters come from;
