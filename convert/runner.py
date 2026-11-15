@@ -104,6 +104,8 @@ class Runner(QObject):
         self.proc = p
         self.log.emit("$ " + " ".join(_q(a) for a in args))
         p.start()
+        if self.cores and p.waitForStarted(3000):
+            self._apply_cores()                                # the CPU limit from the first frame on
         QTimer.singleShot(300, self._apply_priority)
 
     def _apply_priority(self):

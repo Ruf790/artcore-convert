@@ -1394,7 +1394,9 @@ def size_times(ffprobe: str, path: str, size_mb: float) -> list[float]:
         key = "K" in b[4] and (video or not has_v)
         pk.append((t, size, key))
     pk.sort(key=lambda x: x[0])
-    return cut_times(pk, int(float(size_mb) * 1024 * 1024))
+    # the segment muxer counts from the first frame of the picture (its first keyframe)
+    t0 = next((t for t, _s, k in pk if k), pk[0][0] if pk else 0.0)
+    return [round(x - t0, 3) for x in cut_times(pk, int(float(size_mb) * 1024 * 1024)) if x - t0 > 0.01]
 
 
 def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
@@ -1412,6 +1414,7 @@ def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
     kinds = (("v", p["video"]), ("a", [s for s, _ in p["audio"]]), ("s", [s for s, _ in p["subs"]]))
     for spec, streams in kinds:
         edited_flags = any(("default" in job.smeta(s) or "forced" in job.smeta(s)) for s in streams)
+        ext_default = any(ext_no(s) is not None and job.smeta(s).get("default") for s in streams)
         for n, s in enumerate(streams):
             m = job.smeta(s)
             from_graph = joined and spec in ("v", "a")
@@ -1421,7 +1424,7 @@ def meta_args(job: Job, p: dict, joined: bool, meta_on: bool) -> list[str]:
                 elif from_graph and src_val and meta_on:
                     out += [f"-metadata:s:{spec}:{n}", f"{'language' if key == 'lang' else 'title'}={src_val}"]
             if edited_flags or (from_graph and (s.default or s.forced)):
-                d = m.get("default", s.default)
+                d = m.get("default", False if ext_default else s.default)
                 f = m.get("forced", s.forced)
                 out += [f"-disposition:{spec}:{n}", "+".join(x for x, on in (("default", d), ("forced", f)) if on) or "0"]
     return out
