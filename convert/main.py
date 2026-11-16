@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sys
+import time
 
 from PySide6.QtCore import QEvent, QObject, QTimer
 from PySide6.QtGui import QSurfaceFormat
@@ -228,6 +229,7 @@ def selftest() -> int:
             raise RuntimeError(f"AVI / GIF / MP3 / MOV: {kinds}")
         selftest_14(win, app, src, wide, tmp, lines)
         selftest_15(win, app, src, wide, tmp, lines)
+        selftest_19(win, app, src, tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -251,7 +253,11 @@ def selftest_14(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
     if r.returncode != 0:
         raise RuntimeError("making the external track failed: " + r.stderr[-300:])
     vmaf = "libvmaf" in win.av.filters
-    win.cfg.update(parallel=2, metrics=["psnr", "ssim"] + (["vmaf"] if vmaf else []), show_frame=True)
+    feats = [m for m in J.METRICS if J.metric_ok(m, win.av)]           # 1.9: every metric this ffmpeg has
+    lines.append(f"1.9: metrics here: {feats}; libvmaf features {sorted(win.av.vmaf_feats)}")
+    if vmaf and len(win.av.vmaf_feats) < len(E.VMAF_FEATURES):
+        raise RuntimeError(f"libvmaf lacks features: {sorted(set(E.VMAF_FEATURES) - win.av.vmaf_feats)}")
+    win.cfg.update(parallel=2, metrics=feats, show_frame=True)
     win.set_cpu_limit(50)
     win.show_side("status")
     a = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "speed": 6}}))
@@ -289,6 +295,10 @@ def selftest_14(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
         if not (20 < j.metrics.get("psnr", 0) < 101 and 0.8 < j.metrics.get("ssim", 0) <= 1) or \
                 (vmaf and not 0 < j.metrics.get("vmaf", -1) <= 100):
             raise RuntimeError(f"quality metrics: {j.metrics}")
+        if vmaf and not (15 < j.metrics.get("psnr_hvs", 0) < 101 and 0.8 < j.metrics.get("ms_ssim", 0) <= 1 and
+                         20 < j.metrics.get("ciede", 0) < 100 and 0 <= j.metrics.get("cambi", -1) < 24):
+            raise RuntimeError(f"1.9 quality metrics (libvmaf features): {j.metrics}")
+        lines.append("  " + "; ".join(J.metric_text(k, v) for k, v in j.metrics.items()))
     if len(c.parts) != 3:                                   # 4 s in parts of 1.5 s
         raise RuntimeError(f"the joined task: {len(c.parts)} parts, not 3")
     total = sum(probe.probe(p).duration for p in c.parts)
@@ -399,6 +409,100 @@ def selftest_15(win, app, src: str, wide: str, tmp: str, lines: list) -> None:
     if not all(r["ok"] and r.get("psnr") for r in res):
         raise RuntimeError("1.5 compare: " + "; ".join(r["error"] for r in res))
     win.cfg.update(parallel=1)
+
+
+def _wait(app, cond, secs: float) -> bool:
+    t0 = time.monotonic()
+    while time.monotonic() - t0 < secs:
+        app.processEvents()
+        if cond():
+            return True
+        time.sleep(0.02)
+    return cond()
+
+
+def selftest_19(win, app, src: str, tmp: str, lines: list) -> None:
+    """1.9: the demux stops and leaves no half-written files; the DTS core of a real DTS-HD MA track (when the
+    sample is at hand: a run from the source tree); the queue menu (encode first, join all, remove all)."""
+    from . import ff, probe
+    from . import job as J
+    from .dialogs import DemuxDialog
+    j = J.Job(src=src, settings=J.merged({}))
+    j.info = probe.probe(src)
+    d = DemuxDialog(j, win)
+    folder = os.path.join(tmp, "demux19")
+    d.folder.setText(folder)
+    d._fill()
+    orig = J.demux_args
+    J.demux_args = lambda job, exe, items: [exe, "-readrate", "0.5"] + orig(job, exe, items)[1:]
+    try:
+        d.start()
+        if not _wait(app, lambda: os.path.isdir(folder) and any(os.path.getsize(os.path.join(folder, f)) > 0
+                                                                 for f in os.listdir(folder)), 20):
+            raise RuntimeError("1.9 demux: nothing was being written")
+        d.stop()
+        _wait(app, lambda: not d.running, 20)
+    finally:
+        J.demux_args = orig
+    left = os.listdir(folder) if os.path.isdir(folder) else []
+    lines.append(f"1.9 demux stopped: {d.state.text()!r}, left {left}")
+    if left or d.ok is not False or not d.removed:
+        raise RuntimeError(f"1.9 demux stop: files left {left}")
+    d.start()
+    _wait(app, lambda: not d.running, 60)
+    made = sorted(os.listdir(folder))
+    lines.append(f"  demux: {made}")
+    if not d.ok or len(made) < 2:
+        raise RuntimeError(f"1.9 demux: {d.state.text()}")
+    d.close()
+    sample = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "tests", "data",
+                          "dtshd_ma_51.dts")
+    if os.path.isfile(sample):                         # a real DTS-HD MA 5.1 (24 bit, XLL) in a BDAV m2ts
+        with open(sample, "rb") as f:
+            frames = f.read()
+        raw = os.path.join(tmp, "ma.dts")
+        with open(raw, "wb") as f:
+            f.write(frames * 150)
+        m2ts = os.path.join(tmp, "00800.m2ts")
+        r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=640x360:r=24",
+                    "-i", raw, "-map", "0:v", "-map", "1:a", "-c:v", "libx264", "-preset", "ultrafast", "-c:a", "copy",
+                    "-shortest", "-f", "mpegts", "-mpegts_m2ts_mode", "1", m2ts], 120)
+        if r.returncode != 0:
+            raise RuntimeError("1.9: making the DTS-HD m2ts failed: " + r.stderr[-300:])
+        jd = J.Job(src=m2ts, settings=J.merged({}))
+        jd.info = probe.probe(m2ts)
+        dd = DemuxDialog(jd, win)
+        dd.folder.setText(os.path.join(tmp, "demux19hd"))
+        dd._fill()
+        rows = dd.core_rows()
+        dd.start()
+        _wait(app, lambda: not dd.running, 60)
+        core = [it["path"] for it in dd.done_items if it.get("core")]
+        prof = probe.probe(core[0]).of("audio")[0] if core and os.path.isfile(core[0]) else None
+        lines.append(f"  DTS-HD MA: {[(s.codec, s.profile) for s in jd.info.of('audio')]}, rows {rows}, core "
+                     f"{os.path.getsize(core[0]) if prof else 0} B {prof.profile if prof else '-'} "
+                     f"{prof.channels if prof else 0} ch")
+        if not rows or prof is None or prof.codec != "dts" or "HD" in prof.profile.upper() or prof.channels != 6:
+            raise RuntimeError("1.9: the DTS core of DTS-HD MA did not come out")
+        dd.close()
+    # the queue menu, without encoding
+    win.clear_queue(ask=False)
+    jobs = [J.Job(src=src, settings=J.merged({})) for _ in range(3)]
+    for x in jobs:
+        x.info = probe.probe(src)
+        x.status = "wait"
+        win._append(x)
+    win._queue_changed()
+    win.encode_first(jobs[2])
+    if win.jobs[0] is not jobs[2]:
+        raise RuntimeError("1.9: «Encode first» did not move the task up")
+    n = win.join_all()
+    if n != 3 or len(win.jobs) != 1 or win.jobs[0] is not jobs[2]:
+        raise RuntimeError(f"1.9: «Join all»: {n} files, {len(win.jobs)} tasks")
+    win.clear_queue(ask=False)
+    if win.jobs or not os.path.isfile(src):
+        raise RuntimeError("1.9: «Remove all» left tasks or took the file")
+    lines.append("  queue menu: encode first, join all, remove all — ok")
 
 
 def main() -> int:

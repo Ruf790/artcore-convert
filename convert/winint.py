@@ -71,6 +71,44 @@ def show_in_explorer(path: str) -> None:
             pass
 
 
+PLAYER_APPID = "{CC3B3D27-0C3A-4387-AF84-F55A8919C074}_is1"     # ArtCore Player's setup.iss AppId
+PLAYER_EXE = "ArtCorePlayer.exe"
+
+
+def artcore_player() -> str:
+    """1.9: the path of ArtCorePlayer.exe when ArtCore Player is installed ("" otherwise): its «Open with» entry, its
+    uninstall entry (per user or for all users), the usual folders. ARTCORE_PLAYER overrides it (tests)."""
+    env = os.environ.get("ARTCORE_PLAYER")
+    if env is not None:
+        return env if env and os.path.isfile(env) else ""
+    if not IS_WIN:
+        return ""
+    found: list[str] = []
+    try:
+        import winreg
+        for root in (winreg.HKEY_CURRENT_USER, winreg.HKEY_LOCAL_MACHINE):
+            try:
+                with winreg.OpenKey(root, rf"Software\Classes\Applications\{PLAYER_EXE}\shell\open\command") as k:
+                    cmd = str(winreg.QueryValueEx(k, "")[0])
+                    found.append(cmd.split('"')[1] if cmd.startswith('"') else cmd.split(" ")[0])
+            except OSError:
+                pass
+            for view in (0, getattr(winreg, "KEY_WOW64_64KEY", 0), getattr(winreg, "KEY_WOW64_32KEY", 0)):
+                try:
+                    with winreg.OpenKey(root, rf"Software\Microsoft\Windows\CurrentVersion\Uninstall\{PLAYER_APPID}",
+                                        0, winreg.KEY_READ | view) as k:
+                        found.append(os.path.join(str(winreg.QueryValueEx(k, "InstallLocation")[0]), PLAYER_EXE))
+                except OSError:
+                    pass
+    except ImportError:
+        pass
+    for env_name, sub in (("LOCALAPPDATA", "Programs"), ("ProgramFiles", ""), ("ProgramFiles(x86)", "")):
+        base = os.environ.get(env_name, "")
+        if base:                                      # {autopf}: per user %LOCALAPPDATA%\Programs, else Program Files
+            found.append(os.path.join(base, sub, "ArtCore Player", PLAYER_EXE))
+    return next((p for p in found if p and os.path.isfile(p)), "")
+
+
 def set_priority(pid: int, level: str) -> bool:
     """idle | below | normal | above, for the running ffmpeg (psutil; nice values outside Windows)."""
     try:

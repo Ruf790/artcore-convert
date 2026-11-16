@@ -76,6 +76,7 @@ class Available:
         self.svt_2pass = False                      # 1.4: this ffmpeg's libsvtav1 takes -pass 1 / 2
         self.filters: set[str] = set()              # 1.4: the ffmpeg filters of this build (libvmaf …)
         self.h264_10 = False                        # 1.5: NVENC writes 10 bit H.264 here (RTX 50, FFmpeg 7.1+)
+        self.vmaf_feats: set[str] = set()           # 1.9: libvmaf's extra features here (psnr_hvs, cambi …)
 
     def two_pass(self, e: "VEnc | None") -> bool:
         """1.4: the encoder has a first pass of its own here (x264, x265, VP9, MPEG-4 / 2, SVT-AV1 where the
@@ -228,6 +229,31 @@ def ffmpeg_filters() -> set[str]:
     return {ln.split()[1] for ln in out.splitlines() if len(ln.split()) > 2 and ln.startswith(" ")}
 
 
+VMAF_FEATURES = ("psnr_hvs", "float_ms_ssim", "ciede", "cambi")     # 1.9: libvmaf feature extractors we use
+
+
+def _vmaf_try(feats) -> bool:
+    exe = ff.ffmpeg()
+    src = "color=gray:s=320x240:r=25:d=0.12,format=yuv420p"
+    try:
+        r = ff.run([exe, "-hide_banner", "-nostdin", "-v", "error", "-f", "lavfi", "-i", src, "-f", "lavfi", "-i", src,
+                    "-lavfi", "[0:v][1:v]libvmaf=feature=" + "|".join("name=" + f for f in feats), "-f", "null", "-"],
+                   30)
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+def vmaf_features(filters: set[str] | None = None) -> set[str]:
+    """1.9: which of VMAF_FEATURES this ffmpeg's libvmaf has (an older libvmaf lacks CAMBI, say): all of them in
+    one short run first, one by one only when that fails."""
+    if "libvmaf" not in (ffmpeg_filters() if filters is None else filters) or not ff.ffmpeg():
+        return set()
+    if _vmaf_try(VMAF_FEATURES):
+        return set(VMAF_FEATURES)
+    return {f for f in VMAF_FEATURES if _vmaf_try((f,))}
+
+
 LAST: "Available | None" = None
 
 
@@ -259,6 +285,11 @@ def detect(cache: dict | None = None) -> Available:
     for e in VIDEO:
         av.ok.setdefault(e.id, False)
     av.filters = ffmpeg_filters()
+    if "libvmaf" in av.filters:
+        if isinstance(cached, dict) and isinstance(cached.get("_vmaf"), list):
+            av.vmaf_feats = {f for f in cached["_vmaf"] if f in VMAF_FEATURES}
+        else:
+            av.vmaf_feats = vmaf_features(av.filters)
     if av.ok.get("nvenc_h264"):
         if isinstance(cached, dict) and "_h264_10" in cached:
             av.h264_10 = bool(cached["_h264_10"])
@@ -282,6 +313,7 @@ def cache_entry(av: Available) -> dict:
     d = {e.id: [av.ok.get(e.id, False), av.reasons.get(e.id, ""), av.errors.get(e.id, "")] for e in VIDEO if e.hw}
     d["_svt2pass"] = bool(av.svt_2pass)
     d["_h264_10"] = bool(av.h264_10)
+    d["_vmaf"] = sorted(av.vmaf_feats)
     return {ver: d}
 
 
@@ -397,7 +429,8 @@ def pass_args(e: VEnc, n: int, prefix: str) -> list[str]:
     """1.4: -pass 1 / 2 and where the statistics go (x265 writes them by its own -x265-params)."""
     if e.id == "x265":
         return []
-    return ["-pass", str(n), "-passlogfile", prefix]
+    return ["-pass:v", str(n), "-passlogfile:v", prefix]      # 1.9: «:v» — FFmpeg 8.1+ would apply them to the
+                                                                 # audio encoder too and fail on pass 2
 
 
 def x265_path(p: str) -> str:
