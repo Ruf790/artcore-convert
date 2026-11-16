@@ -851,9 +851,9 @@ STRINGS = {
     "st_frame_none":  ("Здесь появится кадр кодируемого файла", "The frame being encoded appears here"),
     "st_frame_off":   ("Показ кадра выключен", "The frame view is off"),
     "m_hint":         ("Отмеченные метрики считаются по готовому файлу против исходника с теми же фильтрами "
-                       "Это отдельный проход после кодирования.",
+                       "— все за один отдельный проход после кодирования. Наведите на число — что оно значит.",
                        "The ticked metrics are measured on the finished file against the source with the same "
-                       "filters. It is a separate pass after encoding."),
+                       "filters — all in one separate pass after encoding. Point at a number to see what it means."),
     "m_tip_psnr":     ("PSNR, дБ: выше — ближе к исходнику (40+ — почти без потерь)",
                        "PSNR, dB: higher is closer to the source (40+ is near lossless)"),
     "m_tip_ssim":     ("SSIM, 0…1: структурное сходство (0,98+ — отлично)",
@@ -1121,6 +1121,74 @@ STRINGS = {
                        "settings). Quality is against the source at the result's frame; the better one is green."),
     "cmp_no_vmaf":    ("В этой сборке FFmpeg нет libvmaf — только PSNR и SSIM.",
                        "This FFmpeg build has no libvmaf — PSNR and SSIM only."),
+    # ── 1.9: demux ───────────────────────────────────────────
+    "demux_stop":     ("Стоп", "Stop"),
+    "demux_stopping": ("Останавливаю…", "Stopping…"),
+    "demux_stopped":  ("Остановлено. Недописанные файлы удалены: {0}", "Stopped. Half-written files deleted: {0}"),
+    "demux_failed_clean": ("Недописанные файлы удалены: {0}", "Half-written files deleted: {0}"),
+    "demux_ask_stop": ("Извлечение ещё идёт. Остановить его и закрыть окно?\n\nНедописанные файлы будут удалены.",
+                       "Extraction is still running. Stop it and close the window?\n\n"
+                       "The half-written files will be deleted."),
+    "demux_reading":  ("Читаю файл…", "Reading the file…"),
+    "demux_mbs":      ("{0} МБ/с", "{0} MB/s"),
+    "demux_of":       ("{0} из {1}", "{0} of {1}"),
+    "demux_left":     ("осталось {0}", "{0} left"),
+    "demux_core_of":  ("{0} ← из {1}", "{0} ← from {1}"),
+    "demux_core_tip": ("Только ядро — совместимая часть дорожки (DTS 5.1 до 1,5 Мбит/с, AC3), её понимает "
+                       "любой ресивер. Вырезается без перекодирования.",
+                       "The core alone: the compatible part (DTS 5.1 up to 1.5 Mbit/s, AC3) any receiver plays. "
+                       "Cut out without re-encoding."),
+    "demux_empty":    ("пустые, удалены: {0}", "came out empty, deleted: {0}"),
+    # ── 1.9: the task's menu ─────────────────────────────────
+    "open_source":    ("Открыть исходник", "Open the source"),
+    "q_first":        ("Кодировать первым", "Encode first"),
+    "q_first_next":   ("Кодировать следующим", "Encode next"),
+    "q_first_done":   ("Задание — в начале очереди", "The task is at the top of the queue"),
+    "q_first_done_next": ("Задание будет кодироваться следующим", "The task will be encoded next"),
+    "join_all":       ("Склеить все ждущие в одно задание", "Join all waiting into one task"),
+    "q_clear_all":    ("Убрать все из очереди", "Remove all from the queue"),
+    "q_clear_stop":   ("Сейчас идёт кодирование. Остановить его, чтобы очистить очередь?\n\n"
+                       "Недописанный файл результата будет удалён.",
+                       "Encoding is running. Stop it to clear the queue?\n\nThe half-written result will be deleted."),
+    "q_clear_ask":    ("Убрать из очереди все задания ({0})?\n\nФайлы на диске не удаляются — ни исходники, "
+                       "ни готовые результаты.",
+                       "Remove all tasks ({0}) from the queue?\n\nFiles on the disk are not deleted — neither the "
+                       "sources nor the finished results."),
+    # ── 1.9: more quality metrics (libvmaf) and what they mean ─
+    "m_tip_psnr_hvs": ("PSNR-HVS, дБ: PSNR с поправкой на зрение (контраст и маскировка); выше — лучше, 40+ — отлично",
+                       "PSNR-HVS, dB: PSNR weighted the way the eye sees (contrast, masking); higher is better, "
+                       "40+ is excellent"),
+    "m_tip_ms_ssim":  ("MS-SSIM, 0…1: SSIM на нескольких масштабах — и мелкие детали, и крупные формы "
+                       "(0,993+ — отлично). Небыстрая: проход метрик идёт в несколько раз дольше, чем с одним VMAF",
+                       "MS-SSIM, 0…1: SSIM at several scales — fine detail and large shapes alike (0.993+ is excellent). "
+                       "Not fast: the metrics pass takes several times longer than with VMAF alone"),
+    "m_tip_ciede":    ("CIEDE2000: насколько сдвинулись цвета. В скобках ΔE — средняя разница цвета: меньше 1 глаз "
+                       "не видит, 2–3,5 заметно вблизи, больше 5 — цвета явно другие. Самая медленная: проход метрик "
+                       "идёт примерно в 15 раз дольше, чем с одним VMAF — для фильма целиком это часы",
+                       "CIEDE2000: how far the colours moved. ΔE in brackets is the mean colour difference: under 1 "
+                       "the eye can't see it, 2–3.5 shows up close, over 5 the colours are clearly different. The slowest "
+                       "one: the metrics pass takes about 15 times longer than with VMAF alone — hours for a whole film"),
+    "m_tip_cambi":    ("CAMBI, 0…24: бандинг (ступеньки на градиентах неба, стен). 0 — нет, около 5 — начинает "
+                       "мешать, 24 — смотреть нельзя. Ниже — лучше",
+                       "CAMBI, 0…24: banding (steps in gradients of sky, walls). 0 is none, about 5 starts to annoy, "
+                       "24 is unwatchable. Lower is better"),
+    "m_no_feature":   ("В libvmaf этой сборки FFmpeg нет {0}", "This FFmpeg build's libvmaf lacks {0}"),
+    "m_unavailable":  ("Недоступно в этой сборке FFmpeg: {0}", "Not available in this FFmpeg build: {0}"),
+    "m_v_same":       ("неотличимо от исходника", "indistinguishable from the source"),
+    "m_v_great":      ("отлично, разница едва заметна", "excellent, the difference is barely visible"),
+    "m_v_good":       ("хорошо, потери видны только при сравнении", "good, losses show only side by side"),
+    "m_v_fair":       ("приемлемо, потери заметны", "fair, the losses are visible"),
+    "m_v_poor":       ("плохо, сильные потери", "poor, heavy losses"),
+    "m_c_same":       ("цвета неотличимы", "the colours are indistinguishable"),
+    "m_c_close":      ("цвета почти те же, разница видна только вплотную", "nearly the same colours, seen only up close"),
+    "m_c_near":       ("небольшой сдвиг цветов", "a slight colour shift"),
+    "m_c_shift":      ("цвета заметно сдвинуты", "the colours are visibly shifted"),
+    "m_c_off":        ("цвета явно другие", "the colours are clearly different"),
+    "m_b_none":       ("бандинга нет", "no banding"),
+    "m_b_faint":      ("бандинг едва заметен", "banding is barely visible"),
+    "m_b_some":       ("бандинг заметен на градиентах", "banding shows in gradients"),
+    "m_b_bad":        ("бандинг мешает", "banding is annoying"),
+    "m_b_heavy":      ("сильный бандинг", "heavy banding"),
 }
 
 

@@ -969,7 +969,7 @@ def work_file(job: Job, kind: str, work_dir: str | None = None, ext: str = "txt"
     return os.path.join(d, f"job{job.uid}_{os.getpid()}_{kind}.{ext}")
 
 
-WORK_KINDS = (("pieces", "txt"), ("chapters", "txt"), ("vidstab", "trf"), ("frame", "png"))
+WORK_KINDS = (("pieces", "txt"), ("chapters", "txt"), ("vidstab", "trf"), ("frame", "png"), ("vmaf", "json"))
 
 
 def pass_prefix(job: Job, work_dir: str | None = None) -> str:
@@ -1086,7 +1086,22 @@ def hdr10p_passes(job: Job, ffmpeg: str, work_dir: str | None = None) -> list[li
     return out
 
 
-METRICS = ("psnr", "ssim", "vmaf")
+METRICS = ("psnr", "ssim", "vmaf", "psnr_hvs", "ms_ssim", "ciede", "cambi")
+# 1.9: the metrics libvmaf computes in the same pass as VMAF: key → (its feature, the name in its JSON log)
+VMAF_FEATS = {"psnr_hvs": ("psnr_hvs", "psnr_hvs"), "ms_ssim": ("float_ms_ssim", "float_ms_ssim"),
+              "ciede": ("ciede", "ciede2000"), "cambi": ("cambi", "cambi")}
+LIBVMAF = ("vmaf",) + tuple(VMAF_FEATS)
+METRIC_NAMES = {"psnr": "PSNR", "ssim": "SSIM", "vmaf": "VMAF", "psnr_hvs": "PSNR-HVS", "ms_ssim": "MS-SSIM",
+                "ciede": "CIEDE2000", "cambi": "CAMBI"}
+
+
+def metric_ok(m: str, av: E.Available) -> bool:
+    """Can this ffmpeg measure it: PSNR / SSIM always, VMAF with libvmaf, the 1.9 ones with libvmaf's feature."""
+    if m in ("psnr", "ssim"):
+        return True
+    if "libvmaf" not in av.filters:
+        return False
+    return m == "vmaf" or (m in VMAF_FEATS and VMAF_FEATS[m][0] in getattr(av, "vmaf_feats", set()))
 
 
 def can_metrics(job: Job, av: E.Available) -> bool:
@@ -1094,10 +1109,16 @@ def can_metrics(job: Job, av: E.Available) -> bool:
     return enc is not None and enc.id != "gif"
 
 
+def vmaf_log(job: Job, work_dir: str | None = None) -> str:
+    """1.9: libvmaf's JSON log of a task's metrics pass (PSNR-HVS, MS-SSIM, CIEDE2000, CAMBI are read from it)."""
+    return work_file(job, "vmaf", work_dir, "json")
+
+
 def post_passes(job: Job, ffmpeg: str, out_path: str, av: E.Available, metrics=(), work_dir: str | None = None,
                 threads: int = 0) -> list[list[str]]:
-    """1.4: what runs on the finished file — the quality metrics against the filtered source."""
-    want = [m for m in METRICS if m in (metrics or ()) and (m != "vmaf" or "libvmaf" in av.filters)]
+    """1.4: what runs on the finished file — the quality metrics against the filtered source (1.9: all of them
+    in one pass: psnr, ssim and one libvmaf with its extra features)."""
+    want = [m for m in METRICS if m in (metrics or ()) and metric_ok(m, av)]
     if not want or not can_metrics(job, av):
         return []
     return [build_args(job, ffmpeg, out_path, av, False, work_dir, mode="metrics", threads=threads, metrics=want)]
@@ -1108,15 +1129,75 @@ _RE_SSIM = re.compile(r"SSIM .*All:\s*([0-9.]+)")
 _RE_VMAF = re.compile(r"VMAF score[:=]\s*([0-9.]+)")
 
 
-def parse_metrics(lines) -> dict:
-    """The summary lines of psnr / ssim / libvmaf in ffmpeg's log → {"psnr": 41.2, "ssim": 0.987, "vmaf": 95.1}."""
+def parse_metrics(lines, vmaf_json: str = "", want=None) -> dict:
+    """The summary lines of psnr / ssim / libvmaf in ffmpeg's log → {"psnr": 41.2, "ssim": 0.987, "vmaf": 95.1};
+    1.9: and the pooled means of libvmaf's JSON log (psnr_hvs, ms_ssim, ciede, cambi). want: only these keys."""
     out = {}
     for ln in lines:
         for key, rx in (("psnr", _RE_PSNR), ("ssim", _RE_SSIM), ("vmaf", _RE_VMAF)):
             m = rx.search(ln)
             if m:
                 out[key] = 100.0 if m.group(1) == "inf" else float(m.group(1))
-    return out
+    if vmaf_json and os.path.isfile(vmaf_json):
+        import json
+        try:
+            with open(vmaf_json, encoding="utf-8") as f:
+                pooled = (json.load(f) or {}).get("pooled_metrics") or {}
+            for key, (_feat, name) in list(VMAF_FEATS.items()) + [("vmaf", ("", "vmaf"))]:
+                v = (pooled.get(name) or {}).get("mean")
+                if isinstance(v, (int, float)) and key not in out:
+                    out[key] = float(v)
+        except (OSError, ValueError, AttributeError):
+            pass
+    if want is not None:
+        out = {k: v for k, v in out.items() if k in want}
+    return {k: out[k] for k in METRICS if k in out}
+
+
+def ciede_de(score: float) -> float:
+    """libvmaf's CIEDE2000 score is 45 − 20·log10(ΔE): back to the mean colour difference ΔE."""
+    return 10 ** ((45.0 - score) / 20.0)
+
+
+# the bounds of the verdicts: value ≥ bound → that verdict (CIEDE2000 by ΔE and CAMBI: value < bound)
+_SCALES = {"vmaf": (95, 90, 80, 70), "psnr": (45, 40, 35, 30), "psnr_hvs": (45, 40, 35, 30),
+           "ssim": (0.99, 0.98, 0.95, 0.90), "ms_ssim": (0.997, 0.993, 0.98, 0.95),
+           "ciede": (1.0, 2.0, 3.5, 5.0), "cambi": (1.0, 3.0, 5.0, 10.0)}
+_VERDICTS = {"ciede": ("m_c_same", "m_c_close", "m_c_near", "m_c_shift", "m_c_off"),
+             "cambi": ("m_b_none", "m_b_faint", "m_b_some", "m_b_bad", "m_b_heavy")}
+
+
+def metric_level(key: str, v: float) -> int:
+    """0 (as the source) … 4 (poor) — the colour and the words of a metric's result."""
+    bounds = _SCALES.get(key)
+    if not bounds:
+        return 2
+    if key in ("ciede", "cambi"):
+        x = ciede_de(v) if key == "ciede" else v
+        return next((i for i, b in enumerate(bounds) if x < b), 4)
+    return next((i for i, b in enumerate(bounds) if v >= b), 4)
+
+
+def metric_value(key: str, v: float) -> str:
+    """«41.92 dB», «0.9851», «95.20», «47.73 (ΔE 0.73)»."""
+    if key in ("psnr", "psnr_hvs"):
+        return f"{v:.2f} dB"
+    if key in ("ssim", "ms_ssim"):
+        return f"{v:.4f}"
+    if key == "ciede":
+        return f"{v:.2f} (ΔE {ciede_de(v):.2f})"
+    return f"{v:.2f}"
+
+
+def metric_verdict(key: str, v: float) -> str:
+    from .i18n import t
+    keys = _VERDICTS.get(key, ("m_v_same", "m_v_great", "m_v_good", "m_v_fair", "m_v_poor"))
+    return t(keys[metric_level(key, v)])
+
+
+def metric_text(key: str, v: float) -> str:
+    """«VMAF 95.20 — indistinguishable from the source» (the log, the Info tab)."""
+    return f"{METRIC_NAMES.get(key, key.upper())} {metric_value(key, v)} — {metric_verdict(key, v)}"
 
 
 def _sar(s: Stream) -> str:
@@ -1373,14 +1454,23 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                 bits = out_bits(job, enc)
                 fmt = "yuv420p10le" if bits > 8 else "yuv420p"
                 graph[-1] = graph[-1][:-len("[vout]")] + "[vref]"
-                k = len(metrics)
+                names = [m for m in metrics if m in ("psnr", "ssim")]
+                lv = [m for m in metrics if m in LIBVMAF]
+                if lv:                                             # 1.9: one libvmaf for VMAF and its features
+                    opt = f"libvmaf=n_threads={max(1, threads or os.cpu_count() or 4)}"
+                    feats = [VMAF_FEATS[m][0] for m in lv if m in VMAF_FEATS]
+                    if feats:
+                        from .filters import escape_path
+                        opt += ":feature=" + "|".join("name=" + f for f in feats) + \
+                            f":log_fmt=json:log_path={escape_path(vmaf_log(job, work_dir))}"
+                    names.append(opt)
+                k = len(names)
                 same = f"settb=1/1000,setpts=N*1000,format={fmt}"         # frame by frame, not by time stamps
-                graph.append(f"[vref]{same},split={k}" + "".join(f"[r{i}]" for i in range(k)))
+                graph.append(f"[vref]{same},split={k}" + "".join(f"[r{i}]" for i in range(k)) if k > 1
+                             else f"[vref]{same}[r0]")
                 cur = f"[{dist_in}:v:0]{same}[d0]"
                 graph.append(cur)
-                for i, m in enumerate(metrics):
-                    name = {"psnr": "psnr", "ssim": "ssim",
-                            "vmaf": f"libvmaf=n_threads={max(1, threads or os.cpu_count() or 4)}"}[m]
+                for i, name in enumerate(names):
                     graph.append(f"[d{i}][r{i}]{name}[d{i + 1}]")
                 args[args.index(vmap)] = f"[d{k}]"
                 break
@@ -2055,18 +2145,60 @@ def demux_items(job: Job, folder: str, cores: bool = True) -> list[dict]:
         base = os.path.join(folder, f"{stem} - {tag}")
         out.append({"stream": s, "path": f"{base}.{ext}", "args": ["-map", f"0:{s.index}"] + args + ["-f", fmt],
                     "what": P_codec(s)})
-        if cores and s.codec == "dts" and "HD" in (s.profile or "").upper():
-            out.append({"stream": s, "path": f"{base} core.dts", "what": "DTS core",
+        if cores and s.codec == "dts" and dts_hd(job, s):
+            out.append({"stream": s, "path": f"{base} core.dts", "what": "DTS core", "core": True,
                         "args": ["-map", f"0:{s.index}", "-c", "copy", "-bsf:a", "dca_core", "-f", "dts"]})
         if cores and s.codec == "eac3" and (s.channels or 0) > 6:
-            out.append({"stream": s, "path": f"{base} core.ac3", "what": "AC3 core",
+            out.append({"stream": s, "path": f"{base} core.ac3", "what": "AC3 core", "core": True,
                         "args": ["-map", f"0:{s.index}", "-c", "copy", "-bsf:a", "eac3_core", "-f", "ac3"]})
     return out
 
 
+# ── 1.9: is a DTS track DTS-HD (MA / HRA, with a core that dca_core can cut out)? ─
+DTS_EXSS = b"\x64\x58\x20\x25"          # the sync word of DTS-HD's extension substream (XLL, XBR, X96 …)
+_dts_sniffed: dict = {}
+
+
+def dts_hd(job: Job, s: Stream, sniff: bool = True) -> bool:
+    """ffprobe's profile first (DTS-HD MA, DTS-HD HRA, DTS-HD MA + DTS:X …); then a Blu-ray's stream type
+    (0x86 MA, 0x85 HRA) and a bit rate a bare DTS can't have; at last a look at the stream's first frames for
+    the extension substream — a short probe of a busy Blu-ray file can report only «DTS». DTS Express has no core."""
+    if s.codec != "dts":
+        return False
+    p = (s.profile or "").upper()
+    if "EXPRESS" in p:
+        return False
+    if "HD" in p or "XLL" in p or "DTS:X" in p:
+        return True
+    if s.tag in (0x85, 0x86) or s.bitrate > 1_600_000:
+        return True
+    return bool(sniff and dts_sniff(job.src, s.index))
+
+
+def dts_sniff(src: str, index: int, frames: int = 12) -> bool:
+    """The first frames of the track copied out (no decoding): an extension substream in them = DTS-HD."""
+    key = (src, index)
+    if key not in _dts_sniffed:
+        from . import ff
+        exe = ff.ffmpeg()
+        found = False
+        if exe:
+            try:
+                r = ff.run([exe, "-hide_banner", "-nostdin", "-v", "error"] + ff_inp(src) +
+                           ["-map", f"0:{index}", "-c", "copy", "-frames:a", str(frames), "-f", "dts", "-"], 30,
+                           binary=True)
+                found = DTS_EXSS in (r.stdout or b"")
+            except Exception:
+                found = False
+        _dts_sniffed[key] = found
+    return _dts_sniffed[key]
+
+
 def P_codec(s: Stream) -> str:
     from .probe import codec_name
-    return codec_name(s) + (f" ({s.profile})" if s.profile and s.kind == "audio" else "")
+    name = codec_name(s)
+    return name + (f" ({s.profile})" if s.profile and s.kind == "audio" and s.profile.lower() not in name.lower()
+                   else "")
 
 
 def demux_args(job: Job, ffmpeg: str, items: list[dict], chapters_txt: str = "") -> list[str]:

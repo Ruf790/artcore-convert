@@ -193,7 +193,7 @@ def test_copy_command_has_it_all(qapp, films, data_dir):
     w._copy_cmd(j)
     from PySide6.QtWidgets import QApplication
     cmd = QApplication.clipboard().text()
-    for part in ("-pass 1", "-pass 2", "-threads", "concat=n=2", "psnr", "-f segment"):
+    for part in ("-pass:v 1", "-pass:v 2", "-threads", "concat=n=2", "psnr", "-f segment"):
         assert part in cmd, part
     assert cmd.count(" && ") == 3
     w.close()

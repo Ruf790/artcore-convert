@@ -77,7 +77,7 @@ def test_two_pass_hits_the_size(qapp, media, tmp_path, av, enc):
     if enc == "x265":
         assert "pass=1:stats=" in first and "pass=2:stats=" in " ".join(args)
     else:
-        assert "-pass 1" in first and "-pass 2" in " ".join(args) and "-f null" in first
+        assert "-pass:v 1" in first and "-pass:v 2" in " ".join(args) and "-f null" in first
     assert "-an" in pre[0]                                    # the first pass writes no sound
     assert info.video is not None and abs(info.duration - 3) < 0.3
     assert 0.6 < size_mb(out) < 1.35, size_mb(out)            # what was asked, give or take
@@ -93,7 +93,7 @@ def test_two_pass_with_trim_and_filters(qapp, media, tmp_path, av):
     j.settings["filters"]["deshake"] = {"on": True, "method": "vidstab", "strength": 5}
     out = str(tmp_path / "trim2.mkv")
     info, logs, (pre, args, post), r = run_job(qapp, j, out, av)
-    assert len(pre) == 2 and "vidstabdetect" in " ".join(pre[0]) and "-pass 1" in " ".join(pre[1])
+    assert len(pre) == 2 and "vidstabdetect" in " ".join(pre[0]) and "-pass:v 1" in " ".join(pre[1])
     assert "vidstabtransform" in " ".join(pre[1]) and "concat=n=2" in " ".join(pre[1])
     assert info.video.height == 800 and abs(info.duration - 1.8) < 0.25
 
@@ -113,7 +113,7 @@ def test_two_pass_only_for_rate_modes(media, av):
     j = J.Job(movie(media), J.merged({"video": {"encoder": "x264", "rc": "quality", "passes": 2}}))
     j.info = P.probe(j.src)
     assert J.pre_passes(j, "ffmpeg", "o.mkv", av) == []
-    assert "-pass" not in J.build_args(j, "ffmpeg", "o.mkv", av)
+    assert not {"-pass", "-pass:v"} & set(J.build_args(j, "ffmpeg", "o.mkv", av))
     assert "2-pass" not in J.describe(j.settings, av)
     j.settings["video"]["rc"] = "bitrate"
     from convert.i18n import t

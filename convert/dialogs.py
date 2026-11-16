@@ -444,16 +444,17 @@ class DiscDialog(QDialog):
 
 class DemuxDialog(QDialog):
     """1.8: every track of a task into a file of its own, without encoding (.h264 .hevc .ac3 .dts .thd .srt .sup …),
-    the DTS core of DTS-HD and the AC3 core of E-AC3 too, the chapters as a text file."""
+    the DTS core of DTS-HD and the AC3 core of E-AC3 too, the chapters as a text file.
+    1.9: «Stop»; a stopped, failed or closed run leaves no half-written files; the speed and the time left."""
 
     def __init__(self, job, parent=None):
         super().__init__(parent)
-        import os
         from . import job as J
         from .runner import Runner
         self.job = job
+        self.J = J
         self.setWindowTitle(t("demux"))
-        self.setMinimumSize(760, 440)
+        self.setMinimumSize(780, 460)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(18, 14, 18, 14)
         lay.addWidget(_head(t("demux")))
@@ -464,9 +465,9 @@ class DemuxDialog(QDialog):
         self.folder = QLineEdit(os.path.join(os.path.dirname(job.src) if not job.src.lower().endswith(".ffconcat")
                                              else os.path.expanduser("~"), f"{stem} [tracks]"))
         row.addWidget(self.folder, 1)
-        pick = QPushButton("…")
-        pick.clicked.connect(self._pick)
-        row.addWidget(pick)
+        self.b_pick = QPushButton("…")
+        self.b_pick.clicked.connect(lambda: self._pick())
+        row.addWidget(self.b_pick)
         lay.addLayout(row)
         self.cores = QCheckBox(t("demux_cores"))
         self.cores.setChecked(True)
@@ -486,20 +487,47 @@ class DemuxDialog(QDialog):
         self.bar.setRange(0, 1000)
         self.bar.hide()
         lay.addWidget(self.bar)
+        self.rate = _hint("")                     # 1.9: «412 MB/s · 2.1 of 31.6 GB · 1:12 left»
+        self.rate.hide()
+        lay.addWidget(self.rate)
         self.state = _hint("")
+        self.state.setTextFormat(Qt.PlainText)
         lay.addWidget(self.state)
         bb = QDialogButtonBox()
         self.b_go = bb.addButton(t("demux_go"), QDialogButtonBox.AcceptRole)
         self.b_go.setObjectName("primary")
+        self.b_stop = bb.addButton(t("demux_stop"), QDialogButtonBox.ActionRole)
+        self.b_stop.setIcon(style.icon("fa6s.stop"))
+        self.b_stop.hide()
         self.b_close = bb.addButton(QDialogButtonBox.Close)
-        self.b_go.clicked.connect(self.start)
-        self.b_close.clicked.connect(self.reject)
+        self.b_go.clicked.connect(lambda: self.start())
+        self.b_stop.clicked.connect(lambda: self.stop())
+        self.b_close.clicked.connect(lambda: self.reject())
         lay.addWidget(bb)
         self.runner = Runner(self)
-        self.runner.progress.connect(lambda d: self.bar.setValue(int(d.get("frac", 0) * 1000)))
+        self.runner.progress.connect(self._progress)
         self.runner.finished.connect(self._done)
-        self.J = J
+        self.done_items: list[dict] = []
+        self.removed: list[str] = []
+        self._made_folder = False                 # (self.ok appears when a run ends: True / False)
+        self._total = self._src_bytes()
         self._fill()
+
+    @property
+    def running(self) -> bool:
+        return self.runner.running
+
+    def _src_bytes(self) -> int:
+        """How much is read: the file, or every clip of a disc title / joined files."""
+        src = self.job.src
+        files = [p for p, _a, _b in self.J.ffconcat_entries(src)] if src.lower().endswith(".ffconcat") else [src]
+        n = 0
+        for f in files:
+            try:
+                n += os.path.getsize(f)
+            except OSError:
+                pass
+        return n
 
     def _pick(self):
         from PySide6.QtWidgets import QFileDialog
@@ -509,16 +537,29 @@ class DemuxDialog(QDialog):
             self._fill()
 
     def _fill(self):
-        import os
         self.items = self.J.demux_items(self.job, self.folder.text().strip(), self.cores.isChecked())
         self.view.clear()
+        from PySide6.QtGui import QFont
         for n, it in enumerate(self.items):
             s = it["stream"]
-            row = QTreeWidgetItem(self.view, [f"#{s.index} {it['what']}" + (f" · {s.lang}" if s.lang else ""),
+            what = it["what"]
+            if it.get("core"):                    # 1.9: its own, plain row: «#3 DTS core ← DTS-HD MA»
+                what = t("demux_core_of", what, self.J.P_codec(s))
+            row = QTreeWidgetItem(self.view, [f"#{s.index} {what}" + (f" · {s.lang}" if s.lang else ""),
                                               os.path.basename(it["path"])])
             row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
             row.setCheckState(0, Qt.Checked)
             row.setData(0, Qt.UserRole, n)
+            if it.get("core"):
+                f = QFont(row.font(0))
+                f.setBold(True)
+                row.setFont(0, f)
+                row.setToolTip(0, t("demux_core_tip"))
+
+    def core_rows(self) -> list[str]:
+        """The texts of the core rows (tests, screenshots)."""
+        return [self.view.topLevelItem(i).text(0) for i in range(self.view.topLevelItemCount())
+                if self.items[self.view.topLevelItem(i).data(0, Qt.UserRole)].get("core")]
 
     def chosen(self) -> list[dict]:
         out = []
@@ -528,9 +569,19 @@ class DemuxDialog(QDialog):
                 out.append(self.items[row.data(0, Qt.UserRole)])
         return out
 
+    def _set_running(self, on: bool):
+        self.b_go.setEnabled(not on)
+        self.b_stop.setVisible(on)
+        self.b_stop.setEnabled(on)
+        for w in (self.folder, self.b_pick, self.cores, self.chap, self.view):
+            w.setEnabled(not on)
+        self.rate.setVisible(on)
+        if on:
+            self.rate.setText(t("demux_reading"))
+
     def start(self):
-        import os
-        from . import ff
+        if self.running:
+            return
         folder = self.folder.text().strip()
         off = {self.view.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.view.topLevelItemCount())
                if self.view.topLevelItem(i).checkState(0) != Qt.Checked}
@@ -541,36 +592,124 @@ class DemuxDialog(QDialog):
         items = self.chosen() if self.view.topLevelItemCount() else []
         if not items or not folder:
             return
+        self._made_folder = not os.path.isdir(folder)
         try:
             os.makedirs(folder, exist_ok=True)
         except OSError as e:
             self.state.setText("✗ " + str(e))
             return
-        if self.chap.isChecked():
-            txt = self.J.chapters_text(self.job)
-            if txt:
-                stem = os.path.splitext(os.path.basename(self.job.src))[0]
-                with open(os.path.join(folder, f"{stem} - chapters.txt"), "w", encoding="utf-8") as f:
-                    f.write(txt)
         self.done_items = items
+        self.removed = []
+        self.__dict__.pop("ok", None)
         args = self.J.demux_args(self.job, ff.ffmpeg() or "ffmpeg", items)
+        self.bar.setValue(0)
         self.bar.show()
-        self.b_go.setEnabled(False)
+        self._set_running(True)
         self.state.setText(t("demux_running"))
         self.runner.start(args, items[0]["path"], self.J.src_duration(self.job), direct=True)
 
+    def stop(self) -> None:
+        """«Stop»: ffmpeg is killed; _done takes the half-written files away."""
+        if self.running:
+            self.b_stop.setEnabled(False)
+            self.state.setText(t("demux_stopping"))
+            self.runner.cancel()
+
+    def _progress(self, d: dict):
+        frac = float(d.get("frac", 0) or 0)
+        self.bar.setValue(int(frac * 1000))
+        el = float(d.get("elapsed", 0) or 0)
+        if frac <= 0.002 or el < 0.8:
+            return
+        done = frac * self._total
+        mbs = done / el / 1e6 if self._total else 0.0
+        left = el * (1 - frac) / frac
+        from .probe import fmt_size, fmt_time
+        parts = []
+        if mbs > 0:
+            parts.append(t("demux_mbs", f"{mbs:.0f}" if mbs >= 10 else f"{mbs:.1f}"))
+            parts.append(t("demux_of", fmt_size(done), fmt_size(self._total)))
+        if d.get("speed"):
+            parts.append(f"×{float(d['speed']):.0f}" if float(d["speed"]) >= 10 else f"×{float(d['speed']):.1f}")
+        parts.append(t("demux_left", fmt_time(left)))
+        self.rate.setText(" · ".join(parts))
+
+    def _cleanup(self) -> list[str]:
+        """The files of a run that did not finish — each chosen track's (only those, never the source)."""
+        keep = {os.path.normcase(os.path.abspath(p)) for p in [self.job.src] + list(self.job.joins)}
+        gone = []
+        from .runner import _remove
+        for it in self.done_items:
+            p = it["path"]
+            if os.path.normcase(os.path.abspath(p)) in keep or not os.path.exists(p):
+                continue
+            _remove(p)
+            if not os.path.exists(p):
+                gone.append(p)
+        folder = self.folder.text().strip()
+        if self._made_folder and os.path.isdir(folder):
+            try:
+                os.rmdir(folder)                          # only when empty
+            except OSError:
+                pass
+        return gone
+
     def _done(self, ok: bool, err: str):
-        import os
-        self.b_go.setEnabled(True)
+        self._set_running(False)
         self.bar.setValue(1000 if ok else 0)
-        made = [it["path"] for it in getattr(self, "done_items", []) if os.path.isfile(it["path"])]
-        self.state.setText(("✓ " + t("demux_done", len(made), self.folder.text())) if ok else ("✗ " + (err or t("s_stop"))))
         self.ok = ok
+        if not ok:
+            self.removed = self._cleanup()
+            n = len(self.removed)
+            if self.runner.cancelled:
+                self.state.setText("■ " + t("demux_stopped", n))
+            else:
+                self.state.setText("✗ " + (err or t("s_stop")) + "\n" + t("demux_failed_clean", n))
+            return
+        folder = self.folder.text().strip()
+        if self.chap.isChecked():                          # the chapters only after a clean run
+            txt = self.J.chapters_text(self.job)
+            if txt:
+                stem = os.path.splitext(os.path.basename(self.job.src))[0]
+                try:
+                    with open(os.path.join(folder, f"{stem} - chapters.txt"), "w", encoding="utf-8") as f:
+                        f.write(txt)
+                except OSError:
+                    pass
+        made = [it for it in self.done_items if os.path.isfile(it["path"]) and os.path.getsize(it["path"]) > 0]
+        empty = [it for it in self.done_items if it not in made]
+        msg = "✓ " + t("demux_done", len(made), folder)
+        if empty:                                          # 1.9: say which one came out empty (a core, say)
+            msg += "\n⚠ " + t("demux_empty", ", ".join(os.path.basename(it["path"]) for it in empty))
+            for it in empty:
+                try:
+                    os.remove(it["path"])
+                except OSError:
+                    pass
+        self.state.setText(msg)
+
+    def _ask_stop(self) -> bool:
+        from PySide6.QtWidgets import QMessageBox
+        return QMessageBox.question(self, t("demux"), t("demux_ask_stop")) == QMessageBox.Yes
 
     def reject(self):
-        if self.runner.running:
-            self.runner.cancel()
+        if self.running:
+            if not self._ask_stop():
+                return
+            self._kill_and_clean()
         super().reject()
+
+    def _kill_and_clean(self):
+        """Closing while it runs: ffmpeg is stopped and waited for, so its files can be deleted at once."""
+        if not self.running:
+            return
+        proc = self.runner.proc
+        self.runner.cancel()
+        if proc is not None:
+            proc.waitForFinished(5000)
+        if self.running:                                   # no «finished» came: clean up here
+            self.runner.proc = None
+            self._done(False, "")
 
 
 class EstimateDialog(QDialog):

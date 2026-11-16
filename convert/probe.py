@@ -56,6 +56,7 @@ class Stream:
     dv_profile: int = 0             # 1.8: Dolby Vision profile (5, 7, 8 …), 0 = none
     dv_compat: int = 0              # its base layer: 1 = HDR10, 2 = SDR, 4 = HLG, 0 = none (profile 5)
     hdr10plus: bool = False         # 1.8: HDR10+ dynamic metadata in the frames
+    tag: int = 0                    # 1.9: the codec tag (a Blu-ray's stream type: 0x86 = DTS-HD MA, 0x85 = HRA)
 
     def lang_label(self) -> str:
         return self.lang if self.lang and self.lang != "und" else ""
@@ -150,6 +151,10 @@ def parse(path: str, j: dict) -> MediaInfo:
             s.rate = int(_num(st.get("sample_rate")))
         elif kind == "subtitle":
             s.bitmap = s.codec in BITMAP_SUBS
+        try:
+            s.tag = int(st.get("codec_tag") or "0", 16)
+        except (TypeError, ValueError):
+            pass
         try:
             sid = st.get("id")
             s.pid = int(sid, 16) if isinstance(sid, str) and sid.lower().startswith("0x") else int(sid) if sid is not None else -1

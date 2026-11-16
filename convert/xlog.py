@@ -601,7 +601,9 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
                 L += sx
                 L.append(LINE)
     if j.metrics:
-        L.append("Quality metrics: " + ", ".join(f"{k.upper()} {v:.4g}" for k, v in j.metrics.items()))
+        L.append("Quality metrics: " + ", ".join(f"{J.METRIC_NAMES.get(k, k.upper())} {v:.4g}"
+                                                 for k, v in j.metrics.items()))
+        L += ["  " + J.metric_text(k, v) for k, v in j.metrics.items()]      # 1.9: what each one means
         L.append(LINE)
     # ── the end
     word = {"done": "COMPLETED!", "stop": "STOPPED!", "error": "FAILED!"}.get(j.status, j.status.upper() + "!")

@@ -295,17 +295,31 @@ class MainWindow(MainUI, QMainWindow):
             w = max(160, self.fr_img.width() - 28)
             self.fr_img.setPixmap(pm.scaled(min(w, 400), 200, Qt.KeepAspectRatio, Qt.SmoothTransformation))
 
+    def _metric_color(self, k: str, v: float) -> str:
+        return (style.OK, style.OK, style.TEXT, style.WARN, style.ERR)[J.metric_level(k, v)]
+
     def _show_metrics(self, j: J.Job | None):
-        av_vmaf = "libvmaf" in self.av.filters
-        self.m_check["vmaf"].setEnabled(av_vmaf or not self.av_ready)
-        self.m_check["vmaf"].setToolTip(t("m_tip_vmaf") if av_vmaf or not self.av_ready else t("m_no_vmaf"))
         m = j.metrics if j is not None else {}
         for k, lab in self.m_val.items():
+            ok = J.metric_ok(k, self.av) or not self.av_ready
+            self.m_check[k].setEnabled(ok)
+            tip = t("m_tip_" + k)
+            if not ok:
+                tip = t("m_no_vmaf") if "libvmaf" not in self.av.filters else t("m_no_feature", J.METRIC_NAMES[k])
+            self.m_check[k].setToolTip(tip)
             v = m.get(k)
-            lab.setText("—" if v is None else f"{v:.2f} dB" if k == "psnr" else f"{v:.4f}" if k == "ssim"
-                        else f"{v:.2f}")
-        if self.av_ready and not av_vmaf:
-            self.m_val["vmaf"].setText(t("m_no_vmaf_short"))
+            if not ok:
+                lab.setText(t("m_no_vmaf_short"))
+                lab.setStyleSheet(f"color: {style.MUTED};")
+                lab.setToolTip(tip)
+            elif v is None:
+                lab.setText("—")
+                lab.setStyleSheet("")
+                lab.setToolTip("")
+            else:                                                  # 1.9: the number, coloured by its verdict
+                lab.setText(J.metric_value(k, v))
+                lab.setStyleSheet(f"color: {self._metric_color(k, v)};")
+                lab.setToolTip(J.metric_text(k, v))
 
     # ── presets ───────────────────────────────────────────────
     def preset_entries(self) -> list[tuple[str, str, dict]]:
@@ -448,9 +462,12 @@ class MainWindow(MainUI, QMainWindow):
         self._adv_dlg = d
         d.exec()
 
-    def compare_dialog(self):
+    def compare_dialog(self, job: J.Job | None = None):
+        """1.5: the presets side by side on a piece of the selected task (1.9: or of the task right-clicked)."""
         from .preset_ui import CompareDialog
-        sel = self.selected_jobs()
+        if not isinstance(job, J.Job):                  # a menu's triggered(bool) must not pass for «job»
+            job = None
+        sel = [job] if job is not None else self.selected_jobs()
         j = sel[0] if sel and sel[0].info is not None and not sel[0].info.error else None
         key = self.preset_box.currentData() or self.cfg.get("preset", "hevc_hw")
         d = CompareDialog(self, self.av, self.preset_entries(), j, self._threads(), key)
@@ -936,8 +953,12 @@ class MainWindow(MainUI, QMainWindow):
                 m.addAction(style.icon("fa6s.play"), t("open_result"), lambda: self._open_result(j))
                 m.addAction(style.icon("fa6s.folder-open"), t("show_result"), lambda: winint.show_in_explorer(j.out))
             m.addAction(style.icon("fa6s.folder"), t("show_source"), lambda: winint.show_in_explorer(j.src))
+            m.addAction(style.icon("fa6s.circle-play"), t("open_source"), lambda: self.open_source(j))
             m.addSeparator()
             jobs = self.selected_jobs()
+            if j.status in EDITABLE and not self._busy(j):
+                m.addAction(style.icon("fa6s.angles-up"), t("q_first_next") if self.running else t("q_first"),
+                            lambda: self.encode_first(j))
             if any(x.status in ("error", "stop", "skip", "done") for x in jobs):
                 m.addAction(style.icon("fa6s.rotate-right"), t("retry"), lambda: self.retry(jobs))
             if any(x.status in ("wait", "probe") for x in jobs):
@@ -953,6 +974,8 @@ class MainWindow(MainUI, QMainWindow):
                 m.addAction(style.icon("fa6s.file-export"), t("demux") + "…", lambda: self.demux_dialog(j))
                 if j.info.video is not None and j.status in EDITABLE and not self._busy(j):
                     m.addAction(style.icon("fa6s.scale-balanced"), t("est_menu") + "…", lambda: self.estimate_dialog(j))
+                if j.info.video is not None:
+                    m.addAction(style.icon("fa6s.ranking-star"), t("cmp_title") + "…", lambda: self.compare_dialog(j))
             if len(jobs) == 1 and j in ed:
                 m.addAction(style.icon("fa6s.link"), t("join_add") + "…", lambda: self.join_add_dialog())
                 if j.joins:
@@ -962,7 +985,12 @@ class MainWindow(MainUI, QMainWindow):
                 m.addAction(style.icon("fa6s.file-lines"), t("open_log"), lambda: self.open_log(j))
             m.addSeparator()
             m.addAction(style.icon("fa6s.trash-can"), t("remove") + "\tDel", self.remove_selected)
+        if len(self._joinable()) > 1:
+            m.addAction(style.icon("fa6s.object-group"), t("join_all"), lambda: self.join_all())
         m.addAction(style.icon("fa6s.broom"), t("clear_done"), self.clear_done)
+        if self.jobs:
+            m.addAction(style.icon("fa6s.xmark"), t("q_clear_all") + "…", lambda: self.clear_queue())
+        self._menu = m                                     # 1.9: tests read its actions
         m.exec(self.view.viewport().mapToGlobal(pos))
 
     def _skip(self, jobs):
@@ -1084,6 +1112,89 @@ class MainWindow(MainUI, QMainWindow):
         d.show()
         return d
 
+    # ── 1.9: the queue from the task's menu ─────────────────
+    def clear_queue(self, ask: bool = True) -> bool:
+        """«Remove all from the queue»: only the list — the files on the disk stay. If something is being encoded,
+        it asks first whether to stop it. Returns True when the queue was emptied."""
+        if not self.jobs:
+            return False
+        running = self._any_running()
+        if ask:
+            if running and QMessageBox.question(self, APP_TITLE, t("q_clear_stop")) != QMessageBox.Yes:
+                return False
+            if QMessageBox.question(self, APP_TITLE, t("q_clear_ask", len(self.jobs))) != QMessageBox.Yes:
+                return False
+        if running:
+            self.stop_queue()
+            end = time.monotonic() + 15
+            while (self._busy_slots() or any(s.runner.running for s in self.slots)) and time.monotonic() < end:
+                QApplication.processEvents()
+                time.sleep(0.02)
+        self.running = False
+        self.view.blockSignals(True)
+        for j in list(self.jobs):
+            if self._busy(j):                       # it did not stop in time: it stays
+                continue
+            it = self.items.pop(j.uid, None)
+            if it is not None:
+                self.view.takeTopLevelItem(self.view.indexOfTopLevelItem(it))
+            self.jobs.remove(j)
+            self.thumbs.pop(j.uid, None)
+        self.view.blockSignals(False)
+        self._renumber()
+        self._queue_changed()
+        self._select_changed()
+        return not self.jobs
+
+    def encode_first(self, j: J.Job) -> None:
+        """«Encode first»: to the top of the queue; while the queue runs — next (before every waiting task)."""
+        if j not in self.jobs or self._busy(j):
+            return
+        if j.status in ("error", "stop", "skip", "done"):
+            self.retry([j])
+        others = [x for x in self.jobs if x is not j]
+        if self.running or self._any_running():
+            at = next((i for i, x in enumerate(others) if x.status in ("wait", "probe") and not self._busy(x)),
+                      len(others))
+        else:
+            at = 0
+        others.insert(at, j)
+        self.jobs = others
+        self.view.blockSignals(True)
+        while self.view.topLevelItemCount():
+            self.view.takeTopLevelItem(0)
+        for x in self.jobs:
+            self.view.addTopLevelItem(self.items[x.uid])
+        self.view.setCurrentItem(self.items[j.uid])
+        self.view.blockSignals(False)
+        self._renumber()
+        self._queue_changed()
+        self._select_changed()
+        self._toast(t("q_first_done_next") if (self.running or self._any_running()) else t("q_first_done"))
+
+    def open_source(self, j: J.Job) -> str:
+        """«Open the source»: in ArtCore Player when it is installed, else in Windows' default player.
+        A disc title opens at its first clip. Returns what it opened with («player» / «default» / "")."""
+        path = j.src
+        if path.lower().endswith(".ffconcat"):
+            files = J.ffconcat_entries(path)
+            path = files[0][0] if files else ""
+        if not path or not os.path.exists(path):
+            self._toast(t("missing_file"))
+            return ""
+        exe = winint.artcore_player()
+        if exe:
+            import subprocess
+            try:
+                subprocess.Popen([exe, path], close_fds=True)
+                return "player"
+            except OSError:
+                pass
+        from PySide6.QtCore import QUrl
+        from PySide6.QtGui import QDesktopServices
+        QDesktopServices.openUrl(QUrl.fromLocalFile(path))
+        return "default"
+
     def demux_dialog(self, j: J.Job | None = None):
         """1.8: the tracks of a task into files."""
         if j is None:
@@ -1155,7 +1266,23 @@ class MainWindow(MainUI, QMainWindow):
 
     def join_selected(self):
         """The selected tasks become one: the first one takes the others' files after its own."""
-        jobs = [j for j in self.selected_jobs(editable=True) if not self._busy(j)]
+        self.join_jobs([j for j in self.selected_jobs(editable=True) if not self._busy(j)])
+
+    def _joinable(self) -> list[J.Job]:
+        """1.9: the waiting tasks, in the order of the queue (what «Join all» joins)."""
+        return [j for j in self.jobs if j.status == "wait" and not self._busy(j) and j.info is not None
+                and not j.info.error]
+
+    def join_all(self) -> int:
+        """1.9: every waiting task into one, in the order of the queue. Returns how many files it holds."""
+        jobs = self._joinable()
+        if len(jobs) < 2:
+            self._toast(t("join_need_two"))
+            return 0
+        self.join_jobs(jobs)
+        return len(jobs[0].joins) + 1
+
+    def join_jobs(self, jobs: list[J.Job]):
         if len(jobs) < 2:
             self._toast(t("join_need_two"))
             return
@@ -1948,10 +2075,16 @@ class MainWindow(MainUI, QMainWindow):
             rows.append(f"<br><b>{t('i_result')}</b>: {_esc(j.out)} ({P.fmt_size(j.out_size)})")
             if len(j.parts) > 1:
                 rows.append(t("parts_n", len(j.parts)) + ": " + ", ".join(_esc(os.path.basename(x)) for x in j.parts))
-            if j.metrics:
-                rows.append(f"<b>{t('st_metrics')}</b>: " + " · ".join(
-                    f"{k.upper()} {v:.2f}" + (" dB" if k == "psnr" else "") if k != "ssim" else f"SSIM {v:.4f}"
-                    for k, v in j.metrics.items()))
+            if j.metrics:                                          # 1.9: each metric with what it means
+                rows.append(f"<br><b>{t('st_metrics')}</b>")
+                for k, v in j.metrics.items():
+                    col = self._metric_color(k, v)
+                    rows.append(f"<span style='color:{col}'>●</span> <b>{J.METRIC_NAMES.get(k, k)}</b> "
+                                f"{_esc(J.metric_value(k, v))} — {_esc(J.metric_verdict(k, v))}")
+            miss = [J.METRIC_NAMES[m] for m in self.cfg.get("metrics") or [] if self.av_ready
+                    and not J.metric_ok(m, self.av)]
+            if miss:
+                rows.append(f"<span style='color:{style.MUTED}'>{_esc(t('m_unavailable', ', '.join(miss)))}</span>")
         elif j.status == "error" and j.error:
             rows.append(f"<br><span style='color:{style.ERR}'>{_esc(j.error)}</span>")
         self.i_text.setText("<br>".join(rows))
@@ -2105,10 +2238,11 @@ class MainWindow(MainUI, QMainWindow):
             self.running = False
             QMessageBox.critical(self, APP_TITLE, t("no_ffmpeg"))
             return True
-        try:
-            os.remove(frame)
-        except OSError:
-            pass
+        for stale in (frame, J.vmaf_log(j)):
+            try:
+                os.remove(stale)
+            except OSError:
+                pass
         slot.job, slot.stage, slot.stat, slot.log = j, "main", {}, []
         slot.kinds, slot.peak, slot._mem_at = [], 0, 0.0
         slot.started = time.time()
@@ -2225,9 +2359,14 @@ class MainWindow(MainUI, QMainWindow):
             return
         if slot.stage == "main":
             if ok:
-                j.metrics = J.parse_metrics(slot.log)
-                if slot.runner.post_failed and self.cfg.get("metrics"):
+                want = self.cfg.get("metrics") or []
+                j.metrics = J.parse_metrics(slot.log, J.vmaf_log(j), want)
+                if slot.runner.post_failed and want:
                     self.log.appendPlainText("⚠ " + t("m_failed"))
+                if want and J.can_metrics(j, self.av):              # 1.9: what this ffmpeg could not measure
+                    miss = [J.METRIC_NAMES[m] for m in want if m not in j.metrics and not J.metric_ok(m, self.av)]
+                    if miss:
+                        self.log.appendPlainText("ℹ " + t("m_unavailable", ", ".join(miss)))
             if ok and J.split_on(j) and os.path.isfile(j.out):
                 self._split(slot)
                 return
@@ -2256,9 +2395,10 @@ class MainWindow(MainUI, QMainWindow):
             j.status, j.progress = "done", 1.0
             files = j.parts or [j.out]
             j.out_size = sum(os.path.getsize(f) for f in files if os.path.isfile(f))
-            extra = "".join(f", {k.upper()} {v:.4g}" for k, v in j.metrics.items())
-            self.log.appendPlainText(f"✓ {j.out} — {P.fmt_size(j.out_size)}, {P.fmt_time(j.elapsed)}" + extra +
+            self.log.appendPlainText(f"✓ {j.out} — {P.fmt_size(j.out_size)}, {P.fmt_time(j.elapsed)}" +
                                      (f" · {t('parts_n', len(j.parts))}" if len(j.parts) > 1 else ""))
+            for k, v in j.metrics.items():                         # 1.9: each with what it means
+                self.log.appendPlainText("    " + J.metric_text(k, v))
         elif slot.runner.cancelled:
             j.status, j.progress, j.out = "stop", 0.0, ""
         else:

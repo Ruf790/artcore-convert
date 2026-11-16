@@ -41,7 +41,7 @@ DEFAULTS = {
     "cpu_limit":     100,           # % of the processor ffmpeg may use (threads + the cores it runs on)
     "parallel":      1,             # tasks encoded at the same time (1 … 4)
     "chunks":        {"on": False, "workers": 0, "minutes": 3},   # 1.8: a task in chunks (0 workers = auto)
-    "metrics":       [],            # psnr / ssim / vmaf measured on every finished file (Status tab)
+    "metrics":       [],            # psnr / ssim / vmaf (1.9: psnr_hvs ms_ssim ciede cambi) on every finished file
     "show_frame":    True,          # the frame being encoded on the Status tab
     "task_view":     "cards",       # cards | rows
 }
@@ -128,7 +128,8 @@ def load() -> dict:
         cfg["parallel"] = 1
     if not isinstance(cfg.get("metrics"), list):
         cfg["metrics"] = []
-    cfg["metrics"] = [m for m in cfg["metrics"] if m in ("psnr", "ssim", "vmaf")]
+    cfg["metrics"] = [m for m in cfg["metrics"] if m in ("psnr", "ssim", "vmaf", "psnr_hvs", "ms_ssim", "ciede",
+                                                          "cambi")]
     if cfg.get("task_view") not in ("cards", "rows"):
         cfg["task_view"] = "cards"
     if not isinstance(cfg.get("out_suffix"), str):

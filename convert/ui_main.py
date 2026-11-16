@@ -666,7 +666,7 @@ class MainUI:
         self.m_check: dict[str, QCheckBox] = {}
         self.m_val: dict[str, QLabel] = {}
         for row, key in enumerate(J.METRICS):
-            cb = QCheckBox(key.upper())
+            cb = QCheckBox(J.METRIC_NAMES.get(key, key.upper()))
             cb.setChecked(key in self.cfg.get("metrics", []))
             cb.setToolTip(t("m_tip_" + key))
             cb.toggled.connect(lambda _on: self._metrics_changed())

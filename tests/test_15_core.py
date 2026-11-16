@@ -221,7 +221,7 @@ def test_format_with_filters_two_passes_trim_and_join(clip, tmp_path, av):
     pj, args = encode(j, out, av)
     v = vstream(pj)
     assert v["profile"] == "Main" and int(v["level"]) == 30 and v["width"] == 320
-    assert "-pass" in args and "concat=" in " ".join(args)
+    assert "-pass:v" in args and "concat=" in " ".join(args)
     assert max(b - a for a, b in zip(key_frames(out), key_frames(out)[1:])) <= 12
 
 
@@ -319,7 +319,7 @@ def test_device_presets_encode(clip, tmp_path, av, key):
         assert all(x["codec_name"] == "ac3" for x in a) and "bluray-compat=1" in " ".join(args)
     elif key == "discord10":
         assert os.path.getsize(args[-1]) < 10 * 1000 * 1000 and len(a) == 1 and a[0]["channels"] <= 2
-        assert "-pass" in args
+        assert "-pass:v" in args
     elif key == "youtube":
         assert v["profile"] == "High" and len(a) == 1 and a[0]["codec_name"] == "aac"
         assert args[args.index("-g") + 1] == "12"                      # half a second at 25 fps
