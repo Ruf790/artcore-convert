@@ -44,6 +44,11 @@ DEFAULTS = {
     "metrics":       [],            # psnr / ssim / vmaf (1.9: psnr_hvs ms_ssim ciede cambi) on every finished file
     "show_frame":    True,          # the frame being encoded on the Status tab
     "task_view":     "cards",       # cards | rows
+    # 2.0
+    "watch":         {"on": True, "stable": 10, "folders": []},   # watch folders (watch.py)
+    "tray":          False,         # minimised → into the notification area (watch folders go on working)
+    "shell_menu":    False,         # «Convert with ArtCore Convert» with the presets in Explorer's menu (HKCU)
+    "ctx_start":     False,         # files sent from that menu start the queue at once
 }
 
 CPU_LIMITS = (100, 75, 50, 25)
@@ -134,6 +139,11 @@ def load() -> dict:
         cfg["task_view"] = "cards"
     if not isinstance(cfg.get("out_suffix"), str):
         cfg["out_suffix"] = "_convert"
+    from . import watch                                    # 2.0: the watch folders made sane
+    w = watch.settings(cfg)
+    cfg["watch"] = {"on": w["on"], "stable": w["stable"], "folders": w["folders"]}
+    for k in ("tray", "shell_menu", "ctx_start"):
+        cfg[k] = bool(cfg.get(k))
     return cfg
 
 

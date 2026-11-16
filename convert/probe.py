@@ -57,6 +57,8 @@ class Stream:
     dv_compat: int = 0              # its base layer: 1 = HDR10, 2 = SDR, 4 = HLG, 0 = none (profile 5)
     hdr10plus: bool = False         # 1.8: HDR10+ dynamic metadata in the frames
     tag: int = 0                    # 1.9: the codec tag (a Blu-ray's stream type: 0x86 = DTS-HD MA, 0x85 = HRA)
+    filename: str = ""              # 2.0: an attachment's file name (fonts of ASS subtitles in MKV)
+    mime: str = ""
 
     def lang_label(self) -> str:
         return self.lang if self.lang and self.lang != "und" else ""
@@ -76,6 +78,7 @@ class MediaInfo:
     error: str = ""
     tags: dict = field(default_factory=dict)                 # the file's own tags (keys in lower case)
     chapter_list: list = field(default_factory=list)         # [(start s, end s, title)]
+    start: float = 0.0                                       # 2.0: the file's start time (TS / m2ts: not 0)
 
     def of(self, kind: str) -> list[Stream]:
         return [s for s in self.streams if s.kind == kind and not s.cover]
@@ -110,7 +113,7 @@ def parse(path: str, j: dict) -> MediaInfo:
     info = MediaInfo(path=path, format=fmt.get("format_name", ""), format_long=fmt.get("format_long_name", ""),
                      duration=_num(fmt.get("duration")), size=int(_num(fmt.get("size"))),
                      bitrate=int(_num(fmt.get("bit_rate"))), title=tags.get("title", ""),
-                     chapters=len(j.get("chapters") or []), tags=tags)
+                     chapters=len(j.get("chapters") or []), tags=tags, start=_num(fmt.get("start_time")))
     for ch in j.get("chapters") or []:
         ct = {k.lower(): v for k, v in (ch.get("tags") or {}).items()}
         info.chapter_list.append((_num(ch.get("start_time")), _num(ch.get("end_time")), ct.get("title", "")))
@@ -151,6 +154,9 @@ def parse(path: str, j: dict) -> MediaInfo:
             s.rate = int(_num(st.get("sample_rate")))
         elif kind == "subtitle":
             s.bitmap = s.codec in BITMAP_SUBS
+            s.width, s.height = int(st.get("width") or 0), int(st.get("height") or 0)     # 2.0: a PGS / VobSub canvas
+        elif kind == "attachment":
+            s.filename, s.mime = stags.get("filename", ""), stags.get("mimetype", "")
         try:
             s.tag = int(st.get("codec_tag") or "0", 16)
         except (TypeError, ValueError):

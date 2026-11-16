@@ -1,5 +1,6 @@
 """Entry point: one window; files sent from Explorer («Convert with ArtCore Convert») go to the running copy.
-ArtCoreConvert.exe [files / folders …]"""
+ArtCoreConvert.exe [--ctx] [--preset KEY] [files / folders …]   (2.0: from Explorer's menu, with a preset)
+ArtCoreConvert.exe --shell-menu on | off                        (2.0: the installer: Explorer's menu in HKCU)"""
 from __future__ import annotations
 
 import os
@@ -17,15 +18,40 @@ from .i18n import set_lang
 SERVER_NAME = "ArtCoreConvert-" + (os.environ.get("USERNAME") or os.environ.get("USER") or "user")
 
 
-def _send_to_running(paths: list[str]) -> bool:
+def _send_to_running(paths: list[str], ctx: bool = False, preset: str = "") -> bool:
+    from .shellmenu import message
     s = QLocalSocket()
     s.connectToServer(SERVER_NAME)
     if not s.waitForConnected(400):
         return False
-    s.write(("\n".join(os.path.abspath(p) for p in paths) if paths else "--show").encode("utf-8"))
+    s.write(message(paths, ctx, preset).encode("utf-8"))
     s.waitForBytesWritten(1000)
     s.disconnectFromServer()
     return True
+
+
+def start_lock():
+    """2.0: Explorer starts a copy per selected file at once — one of them becomes the program, the others wait for
+    it to listen and hand their files over (a lock file in %TEMP% decides who is first)."""
+    import tempfile
+    from PySide6.QtCore import QLockFile
+    lock = QLockFile(os.path.join(tempfile.gettempdir(), SERVER_NAME + ".lock"))
+    lock.setStaleLockTime(30000)
+    lock.tryLock(20000)
+    return lock
+
+
+def parse_message(data: str) -> tuple[list[str], bool, str]:
+    """The lines a second copy sent → (paths, from Explorer's menu, preset)."""
+    paths, ctx, preset = [], False, ""
+    for ln in data.splitlines():
+        if ln == "--ctx":
+            ctx = True
+        elif ln.startswith("--preset="):
+            preset = ln.split("=", 1)[1]
+        elif ln and not ln.startswith("--"):
+            paths.append(ln)
+    return paths, ctx, preset
 
 
 def _surface_format() -> None:
@@ -230,6 +256,7 @@ def selftest() -> int:
         selftest_14(win, app, src, wide, tmp, lines)
         selftest_15(win, app, src, wide, tmp, lines)
         selftest_19(win, app, src, tmp, lines)
+        selftest_20(win, app, src, tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -421,6 +448,92 @@ def _wait(app, cond, secs: float) -> bool:
     return cond()
 
 
+def selftest_20(win, app, src: str, tmp: str, lines: list) -> None:
+    """2.0 in the built exe: subtitles burnt in through the real queue — an SRT in Windows-1251 with an apostrophe
+    and brackets in its name (libass and its fonts in this FFmpeg build) and a PGS cut into two pieces; the 2.0
+    matrix (Dolby Pro Logic II, custom); a watch folder; Explorer's menu in HKCU and «a file held open»."""
+    import shutil
+    import time
+    from . import ff, probe, shellmenu, winint
+    from . import job as J
+    from .pgswriter import write_sup
+    grey = os.path.join(tmp, "grey20.mkv")
+    sup = write_sup(os.path.join(tmp, "box20.sup"), [(0.5, 1.5, (100, 100, 400, 200), False)])
+    r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "color=gray:s=1920x1080:r=25:d=3",
+                "-f", "lavfi", "-i", "sine=d=3", "-i", sup, "-map", "0", "-map", "1", "-map", "2", "-c:v", "libx264",
+                "-preset", "ultrafast", "-c:a", "ac3", "-ac", "6", "-c:s", "copy", grey], 120)
+    if r.returncode != 0:
+        raise RuntimeError("2.0: making the PGS clip failed: " + r.stderr[-300:])
+    srt = os.path.join(tmp, "Фильм it's [2].srt")
+    with open(srt, "wb") as f:
+        f.write("1\n00:00:00,300 --> 00:00:02,500\nПривет, мир\n".encode("cp1251"))
+    a = J.Job(src=grey, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "speed": 1, "height": 360},
+                                           "audio": {"codec": "aac", "channels": "stereo", "downmix": "dplii"}}))
+    a.ext = [J.clean_ext({"path": srt, "kind": "subtitle", "burn": "all"})]
+    b = J.Job(src=grey, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "speed": 1, "height": 360},
+                                           "audio": {"codec": "aac", "channels": "stereo", "downmix": "custom",
+                                                     "dm": {"c": 0, "s": -6, "lfe": True}}}))
+    b.tracks = {"2": {"burn": "all"}}
+    b.trim = [[0.2, 1.0], [1.2, 2.5]]
+    a.dest, b.dest = os.path.join(tmp, "out20", "srt"), os.path.join(tmp, "out20", "pgs")
+    win.cfg.update(parallel=1, metrics=[], chunks={"on": False, "workers": 0, "minutes": 3})
+    for j in (a, b):
+        win._append(j)
+    win._queue_changed()
+    _wait(app, lambda: all(j.status != "probe" and j.infos.get(e["path"], 1) is not None for j in (a, b)
+                           for e in j.ext), 30)
+    win.start_queue()
+    _wait(app, lambda: all(j.status in ("done", "error") for j in (a, b)), 300)
+
+    def brightest(path, n, x, y, w, h):
+        rr = ff.run([ff.ffmpeg(), "-v", "error", "-i", path, "-map", "0:v:0", "-vf",
+                     f"select=eq(n\\,{n}),crop={w}:{h}:{x}:{y},format=gray", "-frames:v", "1", "-f", "rawvideo", "-"],
+                    60, binary=True)
+        return max(rr.stdout) if rr.returncode == 0 and rr.stdout else -1
+    for j in (a, b):
+        if j.status != "done":
+            raise RuntimeError(f"2.0 burnt-in subtitles: {j.error}")
+    text, after = brightest(a.out, 25, 160, 290, 320, 66), brightest(a.out, 70, 160, 290, 320, 66)
+    box, bg = brightest(b.out, 10, 40, 40, 100, 50), brightest(b.out, 10, 400, 200, 100, 50)
+    ach = [probe.probe(x.out).of("audio")[0].channels for x in (a, b)]
+    lines.append(f"2.0 hardsub: SRT text {text} (after it {after}), PGS box {box} (grey {bg}); 2.0 matrix: {ach} ch")
+    if not (text > 220 and after < 160 and box > 220 and bg < 160) or ach != [2, 2]:
+        raise RuntimeError("2.0: the subtitles were not burnt in (libass / fonts?) or the matrix failed")
+    # a watch folder
+    wdir, wout = os.path.join(tmp, "watch20"), os.path.join(tmp, "watch20_out")
+    shutil.rmtree(wdir, ignore_errors=True)
+    os.makedirs(os.path.join(wdir, "sub"))
+    win.cfg["watch"] = {"on": True, "stable": 2, "folders": [{"path": wdir, "preset": "remux_mkv", "out": wout,
+                                                              "sub": True, "on": True}]}
+    win.watcher.timer.setInterval(500)
+    win.watcher.apply()
+    n0 = len(win.jobs)
+    shutil.copy(src, os.path.join(wdir, "sub", "w.mkv"))
+    if not _wait(app, lambda: len(win.jobs) > n0 and win.jobs[-1].status == "done", 90):
+        raise RuntimeError("2.0: the watch folder's file was not taken / encoded: "
+                           f"{[(j.name, j.status, j.error) for j in win.jobs[n0:]]}")
+    wj = win.jobs[-1]
+    lines.append(f"2.0 watch folder: {wj.preset} → {wj.out}")
+    if os.path.dirname(wj.out) != os.path.join(wout, "sub") or not os.path.isfile(os.path.join(wdir, "sub", "w.mkv")):
+        raise RuntimeError("2.0 watch folder: the result is in the wrong place / the source is gone")
+    win.cfg["watch"] = {"on": False, "stable": 10, "folders": []}
+    win.watcher.apply()
+    if winint.IS_WIN:                                    # Explorer's menu in HKCU and back; a file held open
+        cfg = dict(win.cfg, shell_menu=True)
+        err = shellmenu.apply(cfg, win.user_presets)
+        on = winint.shell_menu_on()
+        err2 = shellmenu.apply(dict(cfg, shell_menu=False))
+        off = not winint.shell_menu_on()
+        held = os.path.join(tmp, "held20.mkv")
+        with open(held, "wb") as f:
+            f.write(b"x")
+            busy = winint.file_busy(held)
+        free = not winint.file_busy(held)
+        lines.append(f"2.0 Explorer menu: written {on} {err!r}, removed {off} {err2!r}; file held: {busy}, freed: {free}")
+        if err or err2 or not on or not off or not busy or not free:
+            raise RuntimeError("2.0: Explorer's menu / the «file held open» check failed")
+
+
 def selftest_19(win, app, src: str, tmp: str, lines: list) -> None:
     """1.9: the demux stops and leaves no half-written files; the DTS core of a real DTS-HD MA track (when the
     sample is at hand: a run from the source tree); the queue menu (encode first, join all, remove all)."""
@@ -509,9 +622,15 @@ def main() -> int:
     args = sys.argv[1:]
     if "--selftest" in args:
         return selftest()
-    paths = [a for a in args if not a.startswith("--")]
+    from . import shellmenu
+    opt = shellmenu.parse_args(args)
+    paths = opt["paths"]
     cfg = config.load()
     set_lang(cfg.get("language", "ru"))
+    if opt["shell"] in ("on", "off"):                     # 2.0: the installer turns Explorer's menu on / off
+        cfg["shell_menu"] = opt["shell"] == "on"
+        config.save(cfg)
+        return 1 if shellmenu.apply(cfg) else 0
     winint.init_process(APP_ID)
     _surface_format()
     app = QApplication(sys.argv)
@@ -529,11 +648,15 @@ def main() -> int:
         tr = QTranslator(app)
         if tr.load("qtbase_ru", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
             app.installTranslator(tr)
-    if cfg.get("single_window", True) and _send_to_running(paths):
+    lock = start_lock() if cfg.get("single_window", True) else None
+    if lock is not None and _send_to_running(paths, opt["ctx"], opt["preset"]):
+        lock.unlock()
         return 0
     server = QLocalServer()
     QLocalServer.removeServer(SERVER_NAME)
     server.listen(SERVER_NAME)
+    if lock is not None:
+        lock.unlock()                                     # listening now: the next copies hand their files over
     from .window import MainWindow
     win = MainWindow(cfg)
     win.restore_geometry()
@@ -541,23 +664,26 @@ def main() -> int:
 
     def on_conn():
         s = server.nextPendingConnection()
+        buf = []
 
         def read():
-            data = bytes(s.readAll()).decode("utf-8", "replace")
-            got = [ln for ln in data.splitlines() if ln and not ln.startswith("--")]
-            if win.isMinimized():
-                win.showNormal()
-            win.raise_()
-            win.activateWindow()
+            buf.append(bytes(s.readAll()))
+
+        def done():
+            read()
+            got, ctx, preset = parse_message(b"".join(buf).decode("utf-8", "replace"))
+            buf.clear()
+            win.bring_up()
             if got:
-                win.add_paths(got)
+                win.open_from_shell(got, preset, ctx)
         s.readyRead.connect(read)
+        s.disconnected.connect(done)
     server.newConnection.connect(on_conn)
 
     def start():
         win.restore_queue()
         if paths:
-            win.add_paths(paths)
+            win.open_from_shell(paths, opt["preset"], opt["ctx"])
     QTimer.singleShot(0, start)
     QTimer.singleShot(4000, win.maybe_check_updates)
     code = app.exec()

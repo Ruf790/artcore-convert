@@ -3,7 +3,7 @@
 ; Expects the PyInstaller output (with ffmpeg\ inside) in dist\ArtCoreConvert\.
 
 #define AppName      "ArtCore Convert"
-#define AppVersion   "1.9.0"
+#define AppVersion   "2.0.0"
 #define AppPublisher "ArtCore"
 #define AppURL       "https://github.com/Ruf790/artcore-convert"
 #define AppExe       "ArtCoreConvert.exe"
@@ -47,8 +47,8 @@ Name: "en"; MessagesFile: "compiler:Default.isl"
 [CustomMessages]
 ru.GroupIntegration=Интеграция с Windows:
 en.GroupIntegration=Windows integration:
-ru.FileMenu=Пункт «Конвертировать в ArtCore Convert» в меню видео- и аудиофайлов и папок
-en.FileMenu="Convert with ArtCore Convert" in the menu of video and audio files and folders
+ru.FileMenu=Меню Проводника «Конвертировать в ArtCore Convert» с пресетами (видеофайлы и папки; меняется в Настройках)
+en.FileMenu=Explorer's menu "Convert with ArtCore Convert" with the presets (video files and folders; changed in Settings)
 ru.ConvertIn=Конвертировать в ArtCore Convert
 en.ConvertIn=Convert with ArtCore Convert
 
@@ -71,23 +71,26 @@ Name: "{autodesktop}\{#AppName}";  Filename: "{app}\{#AppExe}"; Tasks: desktopic
 
 [Registry]
 ; HKA = HKLM for "all users", HKCU for "just me"
-; "Convert with ArtCore Convert" for every file Windows treats as video, and for folders
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert"; ValueType: string; ValueName: ""; ValueData: "{cm:ConvertIn}"; Flags: uninsdeletekey; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert"; ValueType: string; ValueName: "Icon"; ValueData: """{app}\{#AppExe}"",0"; Tasks: filemenu
-Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert\command"; ValueType: string; ValueName: ""; ValueData: """{app}\{#AppExe}"" ""%1"""; Tasks: filemenu
+; 2.0: the program writes Explorer's menu itself (Settings → «Explorer's menu», HKCU, with a submenu of presets);
+; the single item of 1.x (HKCU or HKLM) goes away
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert"; ValueType: none; Flags: deletekey
+Root: HKA; Subkey: "Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert"; ValueType: none; Flags: deletekey
+Root: HKA; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert"; ValueType: none; Flags: deletekey
+Root: HKCU; Subkey: "Software\Classes\ArtCoreConvert.Menu"; ValueType: none; Flags: uninsdeletekey dontcreatekey
+Root: HKCU; Subkey: "Software\Classes\Directory\shell\ArtCoreConvert.Convert"; ValueType: none; Flags: uninsdeletekey dontcreatekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}"; ValueType: string; ValueName: "FriendlyAppName"; ValueData: "{#AppName}"; Flags: uninsdeletekey
 Root: HKA; Subkey: "Software\Classes\Applications\{#AppExe}"; ValueType: string; ValueName: "NoOpenWith"; ValueData: ""
 
 [Run]
+; 2.0: Explorer's menu for the user who installs (the program keeps it up to date at every start)
+Filename: "{app}\{#AppExe}"; Parameters: "--shell-menu on"; Flags: runasoriginaluser waituntilterminated runhidden; Tasks: filemenu
 Filename: "{app}\{#AppExe}"; Description: "{cm:LaunchProgram,{#AppName}}"; Flags: nowait postinstall skipifsilent
 ; silent update from the program itself: start it again afterwards
 Filename: "{app}\{#AppExe}"; Flags: nowait runasoriginaluser; Check: WizardSilent
+
+[UninstallRun]
+; 2.0: Explorer's menu (every video type and folders) taken away
+Filename: "{app}\{#AppExe}"; Parameters: "--shell-menu off"; RunOnceId: "ShellMenuOff"; Flags: runhidden waituntilterminated
 
 [UninstallDelete]
 ; Settings, presets and the queue in %APPDATA%\ArtCoreConvert are kept on purpose.

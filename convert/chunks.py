@@ -112,9 +112,13 @@ def key(job: J.Job, minutes: float, enc_id: str) -> str:
         fid = [os.path.abspath(job.src), stt.st_size, int(stt.st_mtime)]
     except OSError:
         fid = [os.path.abspath(job.src)]
+    from . import hardsub as HS
+    b = HS.active(job)                                    # 2.0: burnt-in subtitles are in the picture
+    burn = [b.key(), b.mode, job.ext[b.ext].get("path") if b.ext is not None else "",
+            job.ext[b.ext].get("delay") if b.ext is not None else 0, job.settings.get("hardsub")] if b else []
     data = json.dumps([fid, job.settings.get("video"), job.settings.get("filters"), job.settings.get("venc"),
                        job.settings.get("fmt"), job.settings.get("container"), job.trim, job.trim_cut,
-                       job.crop_found, minutes, enc_id], sort_keys=True, default=str)
+                       job.crop_found, minutes, enc_id, burn], sort_keys=True, default=str)
     return hashlib.sha1(data.encode("utf-8")).hexdigest()[:16]
 
 
@@ -124,10 +128,15 @@ def chunk_job(job: J.Job, pieces: list) -> J.Job:
     k.settings = copy.deepcopy(job.settings)
     k.settings["meta"] = False
     k.settings["split"] = {"mode": "off"}
-    k.trim, k.trim_cut, k.joins, k.ext, k.chapters = [list(p) for p in pieces], False, [], [], []
+    k.trim, k.trim_cut, k.joins, k.chapters = [list(p) for p in pieces], False, [], []
+    k.ext = [dict(e) for e in job.ext if e.get("kind") == "subtitle" and e.get("burn")]    # 2.0: burnt in
     k.meta = {}
     info = job.info
-    k.tracks = {str(s.index): {"keep": False} for s in (info.of("audio") + info.of("subtitle") if info else [])}
+    k.tracks = {str(s.index): {"keep": False} | ({"burn": job.tracks[str(s.index)]["burn"]}
+                                                  if "burn" in job.tracks.get(str(s.index), {}) else {})
+                for s in (info.of("audio") + info.of("subtitle") if info else [])}
+    from . import hardsub as HS
+    HS.pin(job, k)
     return k
 
 
