@@ -22,6 +22,7 @@ DEFAULTS = {
     "out_mode":      "source",      # source = next to the source file | folder = out_dir
     "out_dir":       "",
     "out_suffix":    "_convert",    # name.mkv → name_convert.mkv
+    "name_template": "",            # 1.8: «{title} ({year}) {res} {vcodec}» … ("" = name + suffix)
     "overwrite":     False,         # else name_convert (2).mkv
     # the default settings of new tasks
     "preset":        "hevc_hw",
@@ -39,6 +40,7 @@ DEFAULTS = {
     # 1.4
     "cpu_limit":     100,           # % of the processor ffmpeg may use (threads + the cores it runs on)
     "parallel":      1,             # tasks encoded at the same time (1 … 4)
+    "chunks":        {"on": False, "workers": 0, "minutes": 3},   # 1.8: a task in chunks (0 workers = auto)
     "metrics":       [],            # psnr / ssim / vmaf measured on every finished file (Status tab)
     "show_frame":    True,          # the frame being encoded on the Status tab
     "task_view":     "cards",       # cards | rows
@@ -119,6 +121,9 @@ def load() -> dict:
         cfg["cpu_limit"] = 100
     try:
         cfg["parallel"] = max(1, min(4, int(cfg.get("parallel", 1))))
+        ch = cfg.get("chunks") if isinstance(cfg.get("chunks"), dict) else {}
+        cfg["chunks"] = {"on": bool(ch.get("on")), "workers": max(0, min(32, int(ch.get("workers", 0) or 0))),
+                         "minutes": max(0.5, min(30.0, float(ch.get("minutes", 3) or 3)))}
     except (TypeError, ValueError):
         cfg["parallel"] = 1
     if not isinstance(cfg.get("metrics"), list):

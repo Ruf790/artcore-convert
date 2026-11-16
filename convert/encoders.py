@@ -228,6 +228,9 @@ def ffmpeg_filters() -> set[str]:
     return {ln.split()[1] for ln in out.splitlines() if len(ln.split()) > 2 and ln.startswith(" ")}
 
 
+LAST: "Available | None" = None
+
+
 def detect(cache: dict | None = None) -> Available:
     """CPU encoders: present in this ffmpeg. Hardware ones: actually encode (in parallel, ~1 s in all).
     `cache` = {ffmpeg version: {id: ok}} from the config; reused when the ffmpeg build is the same."""
@@ -267,6 +270,8 @@ def detect(cache: dict | None = None) -> Available:
             av.svt_2pass = bool(cached["_svt2pass"])
         else:
             av.svt_2pass = _svt_2pass()
+    global LAST
+    LAST = av                                         # 1.8: what plan() resolves «auto» with
     return av
 
 

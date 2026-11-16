@@ -1,6 +1,7 @@
 """The per-file tabs of 1.1: Trim (pieces of the film with a libmpv preview), Metadata (the file's tags; language,
 title and flags of every track) and Chapters. Each one edits a single task; `changed` tells the window."""
 from __future__ import annotations
+import os
 
 from PySide6.QtCore import QSize, Qt, Signal
 from PySide6.QtGui import QColor
@@ -173,8 +174,12 @@ class TrimTab(QWidget):
         side = QVBoxLayout()
         self.b_del = _btn("fa6s.trash-can", t("trm_del"), self.delete_piece)
         self.b_clear = _btn("fa6s.eraser", t("trm_clear"), self.clear)
+        self.b_edl = _btn("fa6s.file-import", t("edl_import") + "…", lambda: self.import_edl())   # 1.8
+        self.b_edl_out = _btn("fa6s.file-export", t("edl_export") + "…", lambda: self.export_edl())
         side.addWidget(self.b_del)
         side.addWidget(self.b_clear)
+        side.addWidget(self.b_edl)
+        side.addWidget(self.b_edl_out)
         side.addStretch(1)
         body.addLayout(side)
         lay.addLayout(body, 2)
@@ -188,8 +193,9 @@ class TrimTab(QWidget):
         self.job, self.editable = job, editable
         ok = job is not None and job.info is not None and not job.info.error and J.src_duration(job) > 0
         for w in (self.b_in, self.b_out, self.e_in, self.e_out, self.b_add, self.b_replace, self.r_keep, self.r_cut,
-                  self.list, self.b_del, self.b_clear):
+                  self.list, self.b_del, self.b_clear, self.b_edl):
             w.setEnabled(ok and editable)
+        self.b_edl_out.setEnabled(ok and bool(job.trim) if job is not None else False)
         for w in (self.b_back, self.b_prev, self.b_play, self.b_next, self.b_fwd, self.bar):
             w.setEnabled(ok)
         if not ok:
@@ -452,6 +458,47 @@ class TrimTab(QWidget):
         self.e_in.setText(J.fmt_tc(a))
         self.e_out.setText(J.fmt_tc(b))
         self._seek(a)
+
+    # ── 1.8: EDL ───────────────────────────────────────────────
+    def import_edl(self, path: str | None = None) -> bool:
+        """An EDL (Kodi / MPlayer, DaVinci / Premiere CMX 3600, mpv) → the pieces of this task."""
+        if self.job is None or not self.editable:
+            return False
+        if not isinstance(path, str) or not path:
+            from PySide6.QtWidgets import QFileDialog
+            path, _f = QFileDialog.getOpenFileName(self, t("edl_import"), os.path.dirname(self.job.src),
+                                                   "EDL (*.edl *.txt);;" + t("all_files") + " (*)")
+            if not path:
+                return False
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                pcs, cut = J.parse_edl(f.read(), self.fps or 25.0)
+        except (OSError, ValueError):
+            self.summary.setText("⚠ " + t("edl_bad"))
+            return False
+        dur = J.src_duration(self.job)
+        pcs = [[a, min(b, dur) if dur else b] for a, b in pcs if not dur or a < dur]
+        self.job.trim, self.job.trim_cut = pcs, cut
+        self.r_cut.setChecked(cut)
+        self.r_keep.setChecked(not cut)
+        self._changed()
+        return True
+
+    def export_edl(self, path: str | None = None) -> bool:
+        if self.job is None or not self.job.trim:
+            return False
+        if not isinstance(path, str) or not path:
+            from PySide6.QtWidgets import QFileDialog
+            path, _f = QFileDialog.getSaveFileName(self, t("edl_export"), os.path.splitext(self.job.src)[0] + ".edl",
+                                                   "EDL (*.edl)")
+            if not path:
+                return False
+        try:
+            with open(path, "w", encoding="utf-8") as f:
+                f.write(J.write_edl(self.job.trim, self.job.trim_cut))
+        except OSError:
+            return False
+        return True
 
     def _mode_changed(self):
         if self.job is not None and self.editable:

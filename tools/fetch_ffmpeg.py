@@ -73,9 +73,34 @@ def main() -> int:
         if not os.path.isfile(os.path.join(OUT, "bin", exe)):
             print("missing", exe)
             return 1
+    fetch_hdr10plus_tool()
     size = sum(os.path.getsize(os.path.join(dp, f)) for dp, _, fs in os.walk(OUT) for f in fs)
     print(f"ffmpeg/: {size / 1e6:.0f} MB")
     return 0
+
+
+def fetch_hdr10plus_tool() -> None:
+    """1.8: hdr10plus_tool.exe (quietvoid, MIT) beside ffmpeg — HDR10+ metadata into x265. Not fatal."""
+    try:
+        with _get("https://api.github.com/repos/quietvoid/hdr10plus_tool/releases/latest") as r:
+            rel = json.load(r)
+        a = next((x for x in rel.get("assets", []) if re.search(r"x86_64-pc-windows-msvc\.zip$", x["name"])), None)
+        if a is None:
+            print("hdr10plus_tool: no Windows asset in", rel.get("tag_name"))
+            return
+        tmp = tempfile.mkdtemp()
+        arc = os.path.join(tmp, a["name"])
+        with _get(a["browser_download_url"], "application/octet-stream") as r, open(arc, "wb") as f:
+            shutil.copyfileobj(r, f, 1 << 20)
+        with zipfile.ZipFile(arc) as z:
+            for name in z.namelist():
+                if name.lower().endswith("hdr10plus_tool.exe"):
+                    with z.open(name) as src, open(os.path.join(OUT, "bin", "hdr10plus_tool.exe"), "wb") as out:
+                        shutil.copyfileobj(src, out)
+        shutil.rmtree(tmp, ignore_errors=True)
+        print("hdr10plus_tool:", rel.get("tag_name"))
+    except Exception as e:                                # noqa: BLE001
+        print("hdr10plus_tool: not fetched:", e)
 
 
 if __name__ == "__main__":

@@ -32,7 +32,8 @@ _RE_FRAMES = re.compile(r"frame\s+([IPB]):\s*(\d+),?\s+Avg QP:\s*([\d.]+)\s+(?:k
 _RE_PROGRESS = re.compile(r"^(frame=|size=)")
 _RE_OPTIONS = re.compile(rb"(x26[45][^\x00]{0,120}?)options: ([\x20-\x7e]{20,4000})")
 
-PHASE_TITLE = {"main": "MAIN PASS", "pass1": "PASS 1 (ANALYSIS)", "vidstab": "STABILIZATION (ANALYSIS)",
+PHASE_TITLE = {"concat": "JOINING THE CHUNKS", "rest": "SOUND AND SUBTITLES", "chunk": "CHUNK",
+               "resume": "RESUMED", "main": "MAIN PASS", "pass1": "PASS 1 (ANALYSIS)", "vidstab": "STABILIZATION (ANALYSIS)",
                "metrics": "QUALITY METRICS", "split": "SPLITTING", "pre": "PRE PASS", "post": "POST PASS"}
 
 
@@ -409,7 +410,12 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
     except Exception:                                       # noqa: BLE001 — a log must not fail
         pl = {"video": [], "audio": [], "subs": [], "warnings": []}
     main = next((p for p in phases(lines, kinds) if p["kind"] == "main"), None)
-    cmd = _split_cmd(main["cmd"]) if main and main["cmd"] else []
+    all_runs = phases(lines, kinds)
+    # 1.8: in chunks the picture is made by the chunks and the sound by its own run: their commands tell
+    vrun = next((p for p in all_runs if p["kind"] == "chunk"), main)
+    arun = next((p for p in all_runs if p["kind"] == "rest"), main)
+    cmd = _split_cmd(vrun["cmd"]) if vrun and vrun["cmd"] else []
+    acmd = _split_cmd(arun["cmd"]) if arun and arun["cmd"] else []
     v = st.get("video", {})
     if pl["video"]:
         s = pl["video"][0]
@@ -495,8 +501,8 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
             no = J.ext_no(s)
             src = f"#ext{no + 1}" if no is not None else f"#{s.index}"
             trk = j.track(s) if no is None else (j.ext[no] if no < len(j.ext) else {})
-            kb = _arg_after(cmd, f"-b:a:{an}").rstrip("k") or (trk.get("kbps") if isinstance(trk, dict) else 0)
-            ach, arate = _arg_after(cmd, f"-ac:a:{an}"), _arg_after(cmd, f"-ar:a:{an}")
+            kb = _arg_after(acmd, f"-b:a:{an}").rstrip("k") or (trk.get("kbps") if isinstance(trk, dict) else 0)
+            ach, arate = _arg_after(acmd, f"-ac:a:{an}"), _arg_after(acmd, f"-ar:a:{an}")
             delay = (trk.get("delay") if isinstance(trk, dict) else 0) or 0
             bits = [f" Stream {src}: {P.codec_name(s).upper()} {s.channels}ch {s.rate / 1000:g}kHz > {_codec_label(codec)}"]
             if codec != "copy" and kb:
@@ -512,7 +518,7 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
             if lang and lang != "und":
                 bits.append(lang)
             L.append(" ".join(bits))
-        af = _arg_after(cmd, "-af")
+        af = _arg_after(acmd, "-af")
         if af:
             L.append(f" Filters:     {af}")
         L.append(LINE)
@@ -532,6 +538,11 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
     runs = phases(lines, kinds)
     n_pass1 = sum(1 for p in runs if p["kind"] == "pass1")
     k1 = 0
+    n_chunks = 0
+    m = next((re.match(r"resume (\d+) (\d+)(?: (\d+))?", p["cmd"]) for p in runs if p["kind"] == "resume"), None)
+    n_chunks = int(m.group(2)) if m else 0
+    chunk_seen = 0
+    totals: dict[str, list[int]] = {}
     for p in runs:
         title = PHASE_TITLE.get(p["kind"], p["kind"].upper())
         if p["kind"] == "pass1":
@@ -539,17 +550,49 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
             title = f"PASS {k1} OF {n_pass1 + 1} (ANALYSIS)"
         elif p["kind"] == "main" and n_pass1:
             title = f"PASS {n_pass1 + 1} OF {n_pass1 + 1} (ENCODING)"
+        elif p["kind"] == "chunk":
+            cm = re.search(r"chunk_(\d+)", p["cmd"])
+            title = f"CHUNK {int(cm.group(1)) if cm else chunk_seen + 1}" + (f" OF {n_chunks}" if n_chunks else "")
+        elif p["kind"] == "resume" and m:
+            p["title"] = "IN CHUNKS"
+            L.append("ENCODING IN CHUNKS" + (f" STARTED {stamp(p['started'])}" if p["started"] else ""))
+            L.append(f"Chunks: {m.group(2)}" + (f", {m.group(3)} at a time" if m.group(3) else ""))
+            if m.group(1) != "0":
+                L.append(f"Resumed: {m.group(1)} of {m.group(2)} chunks were encoded before — reused")
+            L.append(LINE)
+            continue
+        elif p["kind"] == "main" and any(x["kind"] == "chunk" for x in runs):
+            title = "MUXING"
         p["title"] = title
-        L.append(title + (f" STARTED {stamp(p['started'])}" if p["started"] else ""))
+        when = " FINISHED " if p["kind"] == "chunk" else " STARTED "     # a chunk is logged when it is done
+        L.append(title + (when + stamp(p["started"]) if p["started"] else ""))
         L.append("Encoding in progress...")
         L.append(LINE)
         el = encoder_lines(p["lines"])                     # 1.7.1: «x264 info: …», as the encoder said it
+        if p["kind"] == "chunk":                           # 1.8: the settings once; every chunk its statistics
+            chunk_seen += 1
+            if chunk_seen > 1:
+                el = [x for x in el if _RE_FRAMES.search(x) or "kb/s" in x]
         if el:
             L += el
             L.append(LINE)
         fs = frame_stats(p["lines"])
         if fs:
             L += fs
+            L.append(LINE)
+            if p["kind"] == "chunk":
+                for x in fs:
+                    mm = re.match(r"([IPBN]) frames: (\d+) frames(?:, size = \d+ / (\d+))?", x)
+                    if mm:
+                        t = totals.setdefault(mm.group(1), [0, 0])
+                        t[0] += int(mm.group(2))
+                        t[1] += int(mm.group(3) or 0)
+        if p["kind"] == "concat" and totals:               # all chunks together
+            L.append("Chunks of this run:" if m and m.group(1) != "0" else "All chunks:")
+            for kk in ("I", "P", "B", "N"):
+                if kk in totals:
+                    n, b = totals[kk]
+                    L.append(f"{kk} frames: {n} frames" + (f", size = {b // max(1, n)} / {b}" if b else ""))
             L.append(LINE)
         if p["kind"] == "main":
             od0 = J.out_duration(j) if j.info is not None and not j.info.error else 0

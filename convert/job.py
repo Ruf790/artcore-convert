@@ -310,8 +310,45 @@ def media_src(job: Job) -> str:
     return path
 
 
+def ff_inp(path: str) -> list[str]:
+    """-i path (1.8: a disc title is a concat list, read with -f concat -safe 0)."""
+    from .ff import inp
+    return inp(path)
+
+
+def ffconcat_entries(path: str) -> list[tuple[str, float | None, float | None]]:
+    """The files of a concat list with their in / out points (seconds)."""
+    out: list = []
+    try:
+        with open(path, encoding="utf-8") as f:
+            for ln in f:
+                ln = ln.strip()
+                if ln.startswith("file "):
+                    name = ln[5:].strip().strip("'").replace("'\\''", "'")
+                    if not os.path.isabs(name):
+                        name = os.path.join(os.path.dirname(path), name)
+                    out.append([name, None, None])
+                elif ln.startswith("inpoint ") and out:
+                    out[-1][1] = float(ln.split()[1])
+                elif ln.startswith("outpoint ") and out:
+                    out[-1][2] = float(ln.split()[1])
+    except (OSError, ValueError):
+        return []
+    return [tuple(x) for x in out]
+
+
 def preview_src(job: Job) -> str:
     """What mpv plays on the Trim tab: src, or the joined files one after another (an EDL)."""
+    if not job.joins and job.src.lower().endswith(".ffconcat"):       # 1.8: a disc title as an mpv EDL
+        parts = []
+        for p, a, b in ffconcat_entries(job.src):
+            seg = f"%{len(p.encode('utf-8'))}%{p}"
+            if a is not None:
+                seg += f",start={a:.3f}"
+                if b is not None:
+                    seg += f",length={b - a:.3f}"
+            parts.append(seg)
+        return "edl://" + ";".join(parts) if parts else job.src
     if not job.joins:
         return job.src
     files = [p for p, i in sources(job) if i is not None and not i.error]
@@ -597,7 +634,8 @@ def plan(job: Job) -> dict:
     # cut and the picture encoded: copied sound would start before the picture (ffmpeg copies from the
     # keyframe the seek lands on) — it is encoded again, into its own codec where we have one. 1.4: the
     # concat filter decodes the sound too (joined files)
-    recut = (bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy") or joined
+    recut = (bool(segments(job)) and bool(out["video"]) and vcfg.get("mode") != "copy") or joined \
+        or bool(getattr(job, "force_recut", False))            # 1.8: the sound of a task encoded in chunks
     if job.joins:
         files = sources(job)
         if any(i is None or i.error for _p, i in files[1:]):
@@ -727,6 +765,18 @@ def plan(job: Job) -> dict:
             w.append("w_bitmap_subs")
     if segments(job) and vcfg.get("mode") == "copy" and out["video"]:
         w.append("w_trim_copy")
+    if out["video"] and vcfg.get("mode") not in ("copy", "none"):        # 1.8: Dolby Vision / HDR10+
+        eid = vcfg.get("encoder", "auto_hevc")
+        e = E.LAST.resolve(eid) if E.LAST is not None else None
+        if e is None:
+            e = E.BY_ID.get(eid) or next((x for x in E.VIDEO if x.family == enc_family(eid) and not x.hw), None)
+        if e is not None:
+            dyn = dyn_hdr(job, e, out_bits(job, e))
+            w += [x for x in dyn["lost"] if x not in w]
+            if dyn["dv"]:
+                w.append("w_dv_kept")
+            if dyn["hdr10p"]:
+                w.append("w_hdr10p_kept")
     return out
 
 
@@ -886,10 +936,31 @@ def _concat_list(path: str, files: list[str], pcs) -> None:
     with open(path, "w", encoding="utf-8") as f:
         f.write("ffconcat version 1.0\n")
         for k, a, b in pcs:
-            q = files[k].replace("\\", "/").replace("'", "'\\''")
-            f.write(f"file '{q}'\n")
-            if a is not None:
-                f.write(f"inpoint {a:.3f}\noutpoint {b:.3f}\n")
+            for name, x, y in _disc_parts(files[k], a, b):   # 1.8: a disc title: the clips themselves
+                q = name.replace("\\", "/").replace("'", "'\\''")
+                f.write(f"file '{q}'\n")
+                if x is not None:
+                    f.write(f"inpoint {x:.3f}\n")
+                if y is not None:
+                    f.write(f"outpoint {y:.3f}\n")
+
+
+def _disc_parts(path: str, a, b) -> list[tuple[str, float | None, float | None]]:
+    """A piece [a, b) of a file; of a disc title's concat list, the pieces of its clips (a concat list cannot
+    hold another one)."""
+    if not path.lower().endswith(".ffconcat"):
+        return [(path, a, b)]
+    out, pos = [], 0.0
+    for name, x, y in ffconcat_entries(path):
+        if x is None or y is None:
+            return [(path, a, b)]
+        d = y - x
+        lo, hi = (0.0 if a is None else a), (9e18 if b is None else b)
+        s, e = max(lo, pos), min(hi, pos + d)
+        if e > s + 1e-6:
+            out.append((name, x + (s - pos), x + (e - pos)))
+        pos += d
+    return out
 
 
 def work_file(job: Job, kind: str, work_dir: str | None = None, ext: str = "txt") -> str:
@@ -940,12 +1011,78 @@ def pre_passes(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     """The commands that run before the conversion: the analysis pass of vid.stab (writes the motion file),
     1.4: the first pass of the two-pass encode (writes its statistics)."""
     out = []
+    job.pre_kinds = []
+    enc0 = resolve(job, av)
+    if enc0 is not None and dyn_hdr(job, enc0, out_bits(job, enc0))["hdr10p"]:      # 1.8: HDR10+ metadata
+        out += hdr10p_passes(job, ffmpeg, work_dir)
+        job.pre_kinds += ["hdr10p"] * len(out)
     if needs_vidstab(job):
         out.append(build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, mode="vidstab", threads=threads))
+        job.pre_kinds.append("vidstab")
     load_files(job)
     if two_pass(job, resolve(job, av), av):
         out.append(build_args(job, ffmpeg, out_path, av, hw_decode, work_dir, mode="pass1", threads=threads,
                               preview=preview))
+        job.pre_kinds.append("pass1")
+    return out
+
+
+# ── 1.8: Dolby Vision and HDR10+ into the result ──────────────
+def hdr10p_tool() -> str:
+    from .ff import find
+    return find("hdr10plus_tool")
+
+
+def dyn_hdr(job: Job, enc: E.VEnc | None, bits: int) -> dict:
+    """What of the dynamic HDR goes into the result: {dv, hdr10p, lost: [what is lost and why]}.
+    Dolby Vision: its RPUs carried by ffmpeg (-dolbyvision, libx265 / libsvtav1 of a new ffmpeg) frame by frame —
+    through the cut, the crop and the chunks. HDR10+: hdr10plus_tool takes the metadata out, x265 writes it in
+    (the whole film only: no cut, no chunks, the same frame rate)."""
+    out = {"dv": False, "hdr10p": False, "lost": []}
+    src = job.info.video if job.info is not None and not job.info.error else None
+    v = job.settings.get("video", {})
+    if src is None or enc is None or v.get("mode") in ("copy", "none") or not v.get("dyn_hdr", True):
+        return out
+    keeps = F.hdr_keeps(job, enc, bits) and not F.tonemap_on(job, enc, bits)
+    if src.hdr == "Dolby Vision":
+        if keeps and enc.id in ("x265", "svtav1") and "dolbyvision" in ADV.caps(enc):
+            out["dv"] = True
+        else:
+            out["lost"].append("w_dv_hw" if enc.hw else "w_dv")
+    if src.hdr10plus:
+        why = ""
+        if not keeps or enc.id != "x265":
+            why = "w_hdr10p_enc"
+        elif segments(job) or job.joins:
+            why = "w_hdr10p_cut"
+        elif F.fps_on(job):
+            why = "w_hdr10p_fps"
+        elif not hdr10p_tool():
+            why = "w_hdr10p_tool"
+        elif getattr(job, "in_chunks", False):
+            why = "w_hdr10p_chunks"
+        if why:
+            out["lost"].append(why)
+        else:
+            out["hdr10p"] = True
+    return out
+
+
+def hdr10p_json(job: Job, work_dir: str | None = None) -> str:
+    return work_file(job, "hdr10plus", work_dir, "json")
+
+
+def hdr10p_passes(job: Job, ffmpeg: str, work_dir: str | None = None) -> list[list[str]]:
+    """hdr10plus_tool reads an MKV / HEVC file itself; anything else gives it the bare HEVC stream first."""
+    js = hdr10p_json(job, work_dir)
+    src = job.src
+    out = []
+    if not src.lower().endswith((".mkv", ".hevc", ".h265", ".265")):
+        raw = work_file(job, "video", work_dir, "hevc")
+        out.append([ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "error", "-nostats", "-progress", "pipe:1"]
+                   + ff_inp(src) + ["-map", "0:v:0", "-c", "copy", "-bsf:v", "hevc_mp4toannexb", "-f", "hevc", raw])
+        src = raw
+    out.append([hdr10p_tool(), "extract", "-o", js, src])
     return out
 
 
@@ -1156,21 +1293,21 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     # base = the file input 0 reads (a single piece can lie in a joined file)
     base = 0
     if not pcs:
-        args += hw + dec + ["-i", job.src]
+        args += hw + dec + ff_inp(job.src)
         n_in, meta_in = 1, 0
     elif len(pcs) == 1:
         base, a, b = pcs[0]
-        args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", files[base][0]]
+        args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}"] + ff_inp(files[base][0])
         n_in, meta_in = 1, 0
     elif joined:
         for k, a, b in pcs:
-            args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}", "-i", files[k][0]]
+            args += hw + dec + ["-ss", f"{a:.3f}", "-t", f"{b - a:.3f}"] + ff_inp(files[k][0])
         n_in, meta_in = len(pcs), 0
     else:                                                         # copied video / sound only: concat demuxer
         lst = work_file(job, "pieces", work_dir)
         full = [(k, None if (a <= 0.001 and b >= _dur(files[k][1]) - 0.001) else a, b) for k, a, b in pcs]
         _concat_list(lst, [f for f, _i in files], full)
-        args += ["-f", "concat", "-safe", "0", "-i", lst, "-i", job.src]
+        args += ["-f", "concat", "-safe", "0", "-i", lst] + ff_inp(job.src)
         n_in, meta_in = 2, 1
         base = pcs[0][0]
     ov_in = None                                                  # the picture of the Overlay row
@@ -1289,7 +1426,18 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                 if enc.id == "x265":                                      # into the VUI itself, every build
                     i = args.index("-x265-params") + 1
                     args[i] += f":colorprim={prim}:transfer={trc}:colormatrix={mat}" + \
-                        (":hdr10=1:repeat-headers=1" if s.hdr == "HDR10" else "")
+                        (":hdr10=1:repeat-headers=1" if trc == "smpte2084" else "")
+                dyn = dyn_hdr(job, enc, bits)                            # 1.8: Dolby Vision / HDR10+
+                if dyn["dv"]:
+                    args += ["-dolbyvision", "1"]
+                    if enc.id == "x265":
+                        i = args.index("-x265-params") + 1
+                        if "vbv-maxrate" not in args[i]:              # x265 writes DV only with VBV (level 5.1)
+                            args[i] += ":vbv-maxrate=160000:vbv-bufsize=160000"
+                if dyn["hdr10p"] and enc.id == "x265":
+                    i = args.index("-x265-params") + 1
+                    js = hdr10p_json(job, work_dir).replace("\\", "/").replace(":", "\\:")
+                    args[i] += f":dhdr10-info={js}:dhdr10-opt=1"
             else:
                 args += F.color_tags(job, enc, bits)
         fam = s.codec if copy_v else enc.family
@@ -1554,7 +1702,11 @@ def out_name(job: Job, cfg: dict, taken=()) -> str:
             return path
     stem = os.path.splitext(os.path.basename(job.src))[0]
     folder = cfg.get("out_dir") if cfg.get("out_mode") == "folder" and cfg.get("out_dir") else os.path.dirname(job.src)
-    base = os.path.join(folder, stem + (cfg.get("out_suffix") or ""))
+    tpl = (cfg.get("name_template") or "").strip()
+    if tpl:                                              # 1.8: «{title} ({year}) {res} {vcodec}», folders by «/»
+        base = os.path.join(folder, *render_name(tpl, job).split("/"))
+    else:
+        base = os.path.join(folder, stem + (cfg.get("out_suffix") or ""))
     path = base + ext
     if os.path.normcase(os.path.abspath(path)) == os.path.normcase(os.path.abspath(job.src)):
         base += "_convert"
@@ -1687,3 +1839,252 @@ def apply_from(src: Job, dst: Job, parts=("settings", "tracks")) -> list[str]:
             dst.trim, dst.trim_cut = pcs, src.trim_cut
             done.append("trim")
     return done
+
+
+# ── 1.8: EDL — lists of pieces from editors and players ───────
+def _edl_tc(text: str, fps: float) -> float | None:
+    """«01:02:03:12» (frames) / «01:02:03.500» / «3723.5» → seconds."""
+    text = text.strip()
+    m = re.fullmatch(r"(\d+):(\d\d):(\d\d)[:;](\d\d)", text)
+    if m:
+        h, mi, s, f = (int(x) for x in m.groups())
+        return h * 3600 + mi * 60 + s + f / (fps or 25.0)
+    m = re.fullmatch(r"(?:(\d+):)?(\d+):(\d+(?:[.,]\d+)?)", text)
+    if m:
+        return int(m.group(1) or 0) * 3600 + int(m.group(2)) * 60 + float(m.group(3).replace(",", "."))
+    try:
+        return float(text.replace(",", "."))
+    except ValueError:
+        return None
+
+
+def parse_edl(text: str, fps: float = 25.0) -> tuple[list[list[float]], bool]:
+    """An EDL → (pieces, cut). Three kinds are read:
+    • MPlayer / Kodi / ComSkip «start end action» lines — the pieces to throw away (cut = True);
+    • CMX 3600 (DaVinci Resolve, Premiere, Avid) events — the source in / out of each video event are kept,
+      the time code of the first one taken as the start of the file when it is an hour mark (01:00:00:00);
+    • mpv's «# mpv EDL v0» «file,start,length» — kept.
+    Raises ValueError when nothing is understood."""
+    lines = [ln.strip() for ln in text.replace("\r", "\n").split("\n") if ln.strip()]
+    if lines and lines[0].lower().startswith("# mpv edl"):
+        out = []
+        for ln in lines[1:]:
+            if ln.startswith("#"):
+                continue
+            parts = ln.split(",")
+            if len(parts) >= 3:
+                a, d = _edl_tc(parts[1].split("=")[-1], fps), _edl_tc(parts[2].split("=")[-1], fps)
+                if a is not None and d:
+                    out.append([round(a, 3), round(a + d, 3)])
+        if out:
+            return out, False
+        raise ValueError("edl")
+    cmx = re.compile(r"^\d{1,6}\s+\S+\s+(\S+)\s+\S+(?:\s+\d+)?\s+([\d:;]{11})\s+([\d:;]{11})\s+[\d:;]{11}\s+[\d:;]{11}")
+    ev = [m for m in (cmx.match(ln) for ln in lines) if m and "V" in m.group(1).upper()]
+    if ev:
+        pcs = [(_edl_tc(m.group(2), fps), _edl_tc(m.group(3), fps)) for m in ev]
+        base = min(a for a, _b in pcs)
+        hour = int(base // 3600) * 3600 if base >= 3600 else 0     # a timeline starting at 01:00:00:00
+        return [[round(a - hour, 3), round(b - hour, 3)] for a, b in pcs if b > a], False
+    out = []
+    for ln in lines:
+        if ln.startswith(("#", "TITLE", "FCM")):
+            continue
+        parts = ln.split()
+        if len(parts) >= 2:
+            a, b = _edl_tc(parts[0], fps), _edl_tc(parts[1], fps)
+            if a is not None and b is not None and b > a:
+                out.append([round(a, 3), round(b, 3)])
+    if out:
+        return out, True
+    raise ValueError("edl")
+
+
+def write_edl(pieces, cut: bool) -> str:
+    """The pieces as an MPlayer / Kodi EDL (the parts to skip): the cut-out pieces, or what lies between kept ones."""
+    pcs = sorted((float(a), float(b)) for a, b in pieces)
+    if not cut:
+        gaps, pos = [], 0.0
+        for a, b in pcs:
+            if a > pos + 0.001:
+                gaps.append((pos, a))
+            pos = max(pos, b)
+        gaps.append((pos, 9e9))
+        pcs = gaps
+    return "".join(f"{a:.3f}\t{b:.3f}\t0\n" if b < 9e9 else f"{a:.3f}\t99999\t0\n" for a, b in pcs)
+
+
+# ── 1.8: name templates ──────────────────────────────────────
+NAME_TEMPLATES = (
+    ("tpl_none", ""),
+    ("tpl_film", "{title} ({year}) {res} {vcodec}"),
+    ("tpl_film_folder", "{title} ({year})/{title} ({year}) {res} {hdr} {vcodec} {acodec}"),
+    ("tpl_series", "{series} - {sxe}"),
+    ("tpl_series_folder", "{series}/Season {season}/{series} - {sxe} {res}"),
+    ("tpl_release", "{title}.{year}.{res}.{source}.{vcodec}.{acodec}"),
+)
+_RE_SXE = re.compile(r"[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})|(\d{1,2})x(\d{2,3})")
+_RE_YEAR = re.compile(r"[(\[ ._-]((?:19|20)\d\d)(?:[)\] ._-]|$)")
+_RE_SOURCE = re.compile(r"\b(UHD[ ._-]?Blu-?ray|Blu-?ray|BDRip|BDRemux|Remux|WEB-?DL|WEBRip|WEB|HDTV|DVDRip|DVD)\b", re.I)
+
+
+def name_fields(job: Job) -> dict:
+    """What a template can use: from the file name (title, year, series, S01E02, source), its tags, and what
+    the result will be (resolution, codecs, HDR, bits, container)."""
+    stem = os.path.splitext(os.path.basename(job.src))[0]
+    tags = job.info.tags if job.info is not None and not job.info.error else {}
+    tags = dict(tags) | {k: v for k, v in (job.meta.get("tags") or {}).items() if v}
+    clean = re.sub(r"[._]+", " ", stem).strip()
+    year = ""
+    m = _RE_YEAR.search(" " + stem + " ")
+    if m:
+        year = m.group(1)
+    elif re.match(r"(19|20)\d\d", str(tags.get("date", tags.get("DATE", "")))):
+        year = str(tags.get("date", tags.get("DATE", "")))[:4]
+    se = _RE_SXE.search(stem)
+    season = episode = ""
+    if se:
+        season, episode = (se.group(1), se.group(2)) if se.group(1) else (se.group(3), se.group(4))
+    cut = len(clean)
+    for rx in (_RE_YEAR, _RE_SXE, _RE_SOURCE):
+        mm = rx.search(" " + clean + " ")
+        if mm:
+            cut = min(cut, max(0, mm.start() - 1))
+    title_guess = re.sub(r"[\s(\[-]+$", "", clean[:cut]).strip() or clean
+    title = str(tags.get("title") or tags.get("TITLE") or "").strip() if not se else ""
+    title = title or title_guess
+    src_m = _RE_SOURCE.search(stem)
+    p = plan(job)
+    v = job.settings.get("video", {})
+    out = {"name": stem, "title": title, "year": year, "series": title_guess, "season": f"{int(season):02d}" if season else "",
+           "episode": f"{int(episode):02d}" if episode else "",
+           "sxe": f"S{int(season):02d}E{int(episode):02d}" if season else "", "source": src_m.group(1) if src_m else "",
+           "res": "", "vcodec": "", "acodec": "", "hdr": "", "bits": "", "container": (job.settings.get("container") or "").upper()}
+    if p["video"]:
+        s = p["video"][0]
+        try:
+            if v.get("mode") == "copy":
+                w, h = s.width, s.height
+            else:
+                eid = v.get("encoder", "auto_hevc")
+                e = E.BY_ID.get(job.enc_used) or (E.LAST.resolve(eid) if E.LAST is not None else None) or E.BY_ID.get(eid)
+                w, h = out_size(job, e)
+        except Exception:                                  # noqa: BLE001
+            w, h = s.width, s.height
+        from .probe import resolution_name
+        out["res"] = resolution_name(w, h)
+        if v.get("mode") == "copy":
+            fam = {"h264": "H264", "hevc": "HEVC", "av1": "AV1"}.get(s.codec, s.codec.upper())
+        else:
+            eid = v.get("encoder", "auto_hevc")
+            fam = enc_family(eid) if eid.startswith("auto_") else (E.BY_ID[eid].family if eid in E.BY_ID else eid)
+            fam = {"h264": "H264", "hevc": "HEVC", "av1": "AV1", "mpeg4": "XviD", "vp9": "VP9"}.get(fam, str(fam).upper())
+        out["vcodec"] = fam
+        out["bits"] = "10bit" if str(v.get("bits")) == "10" or (v.get("bits") in ("auto", None) and s.bits > 8) else ""
+        keep_hdr = s.hdr and not F.fset(job.settings, "hdr").get("mode") == "sdr"
+        out["hdr"] = s.hdr.replace("Dolby Vision", "DV") if keep_hdr else ""
+    if p["audio"]:
+        s, c = p["audio"][0]
+        name = s.codec if c == "copy" else E.A_CODEC.get(c, c)
+        out["acodec"] = {"ac3": "AC3", "eac3": "EAC3", "dts": "DTS", "truehd": "TrueHD", "aac": "AAC", "opus": "Opus",
+                         "flac": "FLAC", "mp3": "MP3"}.get(name, str(name).upper())
+    return out
+
+
+def render_name(tpl: str, job: Job) -> str:
+    """A template filled in; empty fields leave no «()» / doubled spaces or dots; characters Windows refuses go."""
+    f = name_fields(job)
+    if f["res"] in ("4K", "8K"):                         # in a file name: the number of lines
+        f["res"] = {"4K": "2160p", "8K": "4320p"}[f["res"]]
+    if "}.{" in tpl:                                     # a release name: words joined by dots
+        f = {k: re.sub(r"\s+", ".", str(v)) for k, v in f.items()}
+    text = re.sub(r"\{(\w+)\}", lambda m: str(f.get(m.group(1), m.group(0))), tpl)
+    parts = []
+    for part in text.replace("\\", "/").split("/"):
+        part = re.sub(r"\(\s*\)|\[\s*\]|\bSeason\s*$", "", part)
+        part = re.sub(r'[<>:"|?*\x00-\x1f]', "", part)
+        part = re.sub(r"\s{2,}", " ", part)
+        part = re.sub(r"\.{2,}", ".", part)
+        part = re.sub(r"\s+-\s*$|^\s*-\s+", "", part)
+        part = part.strip(" .-")
+        if part:
+            parts.append(part)
+    return "/".join(parts) or os.path.splitext(os.path.basename(job.src))[0]
+
+
+# ── 1.8: demux — every track into a file of its own, as it is ─
+DEMUX_EXT = {"h264": ("h264", "h264"), "hevc": ("hevc", "hevc"), "av1": ("ivf", "ivf"), "mpeg2video": ("m2v", "mpeg2video"),
+             "mpeg1video": ("m1v", "mpeg1video"), "vc1": ("vc1", "vc1"), "vp9": ("ivf", "ivf"), "vp8": ("ivf", "ivf"),
+             "mpeg4": ("avi", "avi"), "ac3": ("ac3", "ac3"), "eac3": ("eac3", "eac3"), "dts": ("dts", "dts"),
+             "truehd": ("thd", "truehd"), "mlp": ("mlp", "mlp"), "aac": ("aac", "adts"), "mp3": ("mp3", "mp3"),
+             "mp2": ("mp2", "mp2"), "flac": ("flac", "flac"), "opus": ("opus", "opus"), "vorbis": ("ogg", "ogg"),
+             "alac": ("m4a", "ipod"), "subrip": ("srt", "srt"), "ass": ("ass", "ass"), "ssa": ("ssa", "ass"),
+             "webvtt": ("vtt", "webvtt"), "hdmv_pgs_subtitle": ("sup", "sup"), "dvd_subtitle": ("mks", "matroska"),
+             "dvb_subtitle": ("mks", "matroska"), "mov_text": ("srt", "srt")}
+
+
+def _safe_name(s: str) -> str:
+    return re.sub(r'[\\/:*?"<>|\x00-\x1f]+', " ", s).strip()[:120]
+
+
+def demux_items(job: Job, folder: str, cores: bool = True) -> list[dict]:
+    """What a demux writes: [{stream, path, args, what}] — each track as it is (PCM as WAV, mov_text as SRT, DVD
+    and DVB subtitles in MKS); 1.8 cores: the DTS core of DTS-HD and the AC3 core of E-AC3 as files of their own
+    (the AC3 core of a Blu-ray's TrueHD is a track of its own already)."""
+    if job.info is None or job.info.error:
+        return []
+    stem = _safe_name(os.path.splitext(os.path.basename(job.src))[0]) or "track"
+    out = []
+    for s in job.info.streams:
+        if s.kind not in ("video", "audio", "subtitle") or s.cover:
+            continue
+        lang = (job.smeta(s).get("lang") or s.lang or "").replace("und", "")
+        tag = " ".join(x for x in (f"#{s.index}", lang, _safe_name(s.title)) if x)
+        ext, fmt = DEMUX_EXT.get(s.codec, ("", ""))
+        args = ["-c", "copy"]
+        if s.codec.startswith("pcm_"):
+            bits = 24 if ("24" in s.codec or s.codec == "pcm_bluray") else 16
+            ext, fmt, args = "wav", "wav", ["-c", f"pcm_s{bits}le"]
+        elif s.codec == "mov_text":
+            args = ["-c", "srt"]
+        elif not ext:
+            ext, fmt = ("mka", "matroska") if s.kind == "audio" else ("mks", "matroska") if s.kind == "subtitle" \
+                else ("mkv", "matroska")
+        if s.kind == "video" and s.codec in ("h264", "hevc"):
+            args += ["-bsf:v", f"{s.codec}_mp4toannexb"]
+        base = os.path.join(folder, f"{stem} - {tag}")
+        out.append({"stream": s, "path": f"{base}.{ext}", "args": ["-map", f"0:{s.index}"] + args + ["-f", fmt],
+                    "what": P_codec(s)})
+        if cores and s.codec == "dts" and "HD" in (s.profile or "").upper():
+            out.append({"stream": s, "path": f"{base} core.dts", "what": "DTS core",
+                        "args": ["-map", f"0:{s.index}", "-c", "copy", "-bsf:a", "dca_core", "-f", "dts"]})
+        if cores and s.codec == "eac3" and (s.channels or 0) > 6:
+            out.append({"stream": s, "path": f"{base} core.ac3", "what": "AC3 core",
+                        "args": ["-map", f"0:{s.index}", "-c", "copy", "-bsf:a", "eac3_core", "-f", "ac3"]})
+    return out
+
+
+def P_codec(s: Stream) -> str:
+    from .probe import codec_name
+    return codec_name(s) + (f" ({s.profile})" if s.profile and s.kind == "audio" else "")
+
+
+def demux_args(job: Job, ffmpeg: str, items: list[dict], chapters_txt: str = "") -> list[str]:
+    """One ffmpeg run that reads the file once and writes every chosen track."""
+    args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "info", "-nostats", "-progress", "pipe:1"]
+    args += ff_inp(job.src)
+    for it in items:
+        args += it["args"] + [it["path"]]
+    return args
+
+
+def chapters_text(job: Job) -> str:
+    """The chapters as an OGM chapter file (CHAPTER01=00:00:00.000 / CHAPTER01NAME=…), "" when none."""
+    ch = out_chapters(job) if job.chapters is not None else [(a, b, n) for a, b, n in (job.info.chapter_list if job.info else [])]
+    lines = []
+    for i, (a, _b, name) in enumerate(ch or []):
+        h, rest = divmod(float(a), 3600)
+        m, s = divmod(rest, 60)
+        lines.append(f"CHAPTER{i + 1:02d}={int(h):02d}:{int(m):02d}:{s:06.3f}")
+        lines.append(f"CHAPTER{i + 1:02d}NAME={name or f'Chapter {i + 1}'}")
+    return "\n".join(lines) + ("\n" if lines else "")

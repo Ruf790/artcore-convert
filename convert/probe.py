@@ -52,6 +52,10 @@ class Stream:
     rate: int = 0
     # subtitle
     bitmap: bool = False            # PGS / VobSub / DVB: can't go into MP4
+    pid: int = -1                   # 1.8: the stream's id in the container (TS PID, DVD sub-stream): disc languages
+    dv_profile: int = 0             # 1.8: Dolby Vision profile (5, 7, 8 …), 0 = none
+    dv_compat: int = 0              # its base layer: 1 = HDR10, 2 = SDR, 4 = HLG, 0 = none (profile 5)
+    hdr10plus: bool = False         # 1.8: HDR10+ dynamic metadata in the frames
 
     def lang_label(self) -> str:
         return self.lang if self.lang and self.lang != "und" else ""
@@ -126,9 +130,13 @@ def parse(path: str, j: dict) -> MediaInfo:
             s.color = {k: st.get(k, "") for k in ("color_primaries", "color_transfer", "color_space", "color_range")
                        if st.get(k)}
             trc = s.color.get("color_transfer", "")
-            if any((sd.get("side_data_type") or "").startswith("DOVI") for sd in st.get("side_data_list") or []) \
-                    or _dv(st):
+            dovi = next((sd for sd in st.get("side_data_list") or []
+                         if (sd.get("side_data_type") or "").startswith("DOVI")), None)
+            if dovi is not None or _dv(st):
                 s.hdr = "Dolby Vision"
+                if dovi is not None:
+                    s.dv_profile = int(dovi.get("dv_profile") or 0)
+                    s.dv_compat = int(dovi.get("dv_bl_signal_compatibility_id") or 0)
             elif trc == "smpte2084":
                 s.hdr = "HDR10"
             elif trc == "arib-std-b67":
@@ -142,15 +150,38 @@ def parse(path: str, j: dict) -> MediaInfo:
             s.rate = int(_num(st.get("sample_rate")))
         elif kind == "subtitle":
             s.bitmap = s.codec in BITMAP_SUBS
+        try:
+            sid = st.get("id")
+            s.pid = int(sid, 16) if isinstance(sid, str) and sid.lower().startswith("0x") else int(sid) if sid is not None else -1
+        except (TypeError, ValueError):
+            pass
         info.streams.append(s)
     return info
 
 
 def probe(path: str) -> MediaInfo:
     try:
-        return parse(path, ff.probe_json(path))
+        info = parse(path, ff.probe_json(path))
+        v = info.video
+        if v is not None and v.hdr in ("HDR10", "Dolby Vision") and v.codec in ("hevc", "av1", "vp9"):
+            v.hdr10plus = has_hdr10plus(path)            # 1.8: one more look, at the first frames
+        return info
     except Exception as e:
         return MediaInfo(path=path, size=os.path.getsize(path) if os.path.isfile(path) else 0, error=str(e))
+
+
+def has_hdr10plus(path: str) -> bool:
+    """HDR10+ (SMPTE 2094-40) metadata in the first frames of the video."""
+    exe = ff.ffprobe()
+    if not exe:
+        return False
+    extra = ["-f", "concat", "-safe", "0"] if path.lower().endswith(".ffconcat") else []
+    try:
+        r = ff.run([exe, "-v", "error", "-hide_banner", *extra, "-select_streams", "v:0", "-read_intervals", "%+#6",
+                    "-show_entries", "frame=side_data_list", "-of", "json", path], 30)
+    except Exception:                                     # noqa: BLE001
+        return False
+    return "2094-40" in (r.stdout or "") or "HDR10+" in (r.stdout or "")
 
 
 # ── words ─────────────────────────────────────────────────────

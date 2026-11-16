@@ -1,8 +1,10 @@
 """Settings, «encoders on this PC», update."""
 from __future__ import annotations
 
-from PySide6.QtCore import Signal
+from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QIcon
+import os
+
 from PySide6.QtWidgets import (QCheckBox, QComboBox, QDialog, QDialogButtonBox, QFormLayout, QGroupBox, QHBoxLayout,
                                QLabel, QLineEdit, QProgressBar, QPushButton, QTextBrowser, QTreeWidget,
                                QTreeWidgetItem, QVBoxLayout, QHeaderView)
@@ -68,6 +70,19 @@ class SettingsDialog(QDialog):
         self.suffix = QLineEdit(cfg.get("out_suffix", "_convert"))
         self.suffix.setPlaceholderText(t("suffix_empty"))
         form.addRow(t("out_suffix"), self.suffix)
+        from . import job as J                            # 1.8: the name from a template
+        self.tpl = QComboBox()
+        self.tpl.setEditable(True)
+        for key, tpl in J.NAME_TEMPLATES:
+            self.tpl.addItem(t(key) + (f"  —  {tpl}" if tpl else ""), tpl)
+        cur = cfg.get("name_template", "") or ""
+        i = self.tpl.findData(cur)
+        if i >= 0:
+            self.tpl.setCurrentIndex(i)
+        else:
+            self.tpl.setEditText(cur)
+        self.tpl.setToolTip(t("tpl_tip"))
+        form.addRow(t("tpl_label"), self.tpl)
         lay.addLayout(form)
         lay.addWidget(_hint(t("suffix_hint")))
         self.checks: dict[str, QCheckBox] = {}
@@ -79,6 +94,34 @@ class SettingsDialog(QDialog):
                 cb.setChecked(bool(cfg.get(k)))
                 self.checks[k] = cb
                 v.addWidget(cb)
+            if title == "grp_encode":                     # 1.8: encoding in chunks
+                from PySide6.QtWidgets import QSpinBox, QDoubleSpinBox
+                ch = cfg.get("chunks") or {}
+                self.ch_on = QCheckBox(t("opt_chunks"))
+                self.ch_on.setChecked(bool(ch.get("on")))
+                v.addWidget(self.ch_on)
+                row = QHBoxLayout()
+                row.setContentsMargins(24, 0, 0, 0)
+                row.addWidget(QLabel(t("chk_workers")))
+                self.ch_workers = QSpinBox()
+                self.ch_workers.setRange(0, 32)
+                self.ch_workers.setSpecialValueText(t("chk_auto"))
+                self.ch_workers.setValue(int(ch.get("workers", 0) or 0))
+                row.addWidget(self.ch_workers)
+                row.addSpacing(12)
+                row.addWidget(QLabel(t("chk_minutes")))
+                self.ch_min = QDoubleSpinBox()
+                self.ch_min.setRange(0.5, 30.0)
+                self.ch_min.setSingleStep(0.5)
+                self.ch_min.setDecimals(1)
+                self.ch_min.setSuffix(" " + t("min_short"))
+                self.ch_min.setValue(float(ch.get("minutes", 3) or 3))
+                row.addWidget(self.ch_min)
+                row.addStretch(1)
+                v.addLayout(row)
+                hint = _hint(t("chk_hint"))
+                hint.setContentsMargins(24, 0, 0, 0)
+                v.addWidget(hint)
             lay.addWidget(box)
         from . import config
         lay.addWidget(_hint(t("data_in", config.data_dir())))
@@ -89,8 +132,13 @@ class SettingsDialog(QDialog):
         self.cfg["theme"] = self.theme.currentData()
         self.cfg["look"] = self.look.currentData()
         self.cfg["out_suffix"] = self.suffix.text().strip()
+        txt = self.tpl.currentText().strip()
+        i = self.tpl.findText(txt)
+        self.cfg["name_template"] = (self.tpl.itemData(i) or "") if i >= 0 else txt
         for k, cb in self.checks.items():
             self.cfg[k] = cb.isChecked()
+        self.cfg["chunks"] = {"on": self.ch_on.isChecked(), "workers": self.ch_workers.value(),
+                              "minutes": round(self.ch_min.value(), 1)}
         super().accept()
 
 
@@ -340,4 +388,288 @@ class BenchDialog(QDialog):
 
     def reject(self):
         self._stop = True
+        super().reject()
+
+
+class DiscDialog(QDialog):
+    """1.8: the titles of a Blu-ray / DVD — playlist, length, parts, size, video, the sound and subtitle
+    languages; the main film (the longest) is chosen. Several can be taken at once (a task each)."""
+
+    def __init__(self, kind: str, root: str, titles: list[dict], name: str, parent=None):
+        super().__init__(parent)
+        from . import probe as P
+        self.titles = titles
+        self.setWindowTitle(("Blu-ray" if kind == "bd" else "DVD") + " — " + name)
+        self.setMinimumSize(860, 420)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(_head(("Blu-ray" if kind == "bd" else "DVD") + ": " + name))
+        lay.addWidget(_hint(t("disc_hint")))
+        self.view = QTreeWidget()
+        self.view.setObjectName("playlist")
+        self.view.setRootIsDecorated(False)
+        self.view.setSelectionMode(QTreeWidget.ExtendedSelection)
+        self.view.setHeaderLabels([t("disc_title"), t("disc_len"), t("disc_parts"), t("disc_size"), t("disc_video"),
+                                   t("disc_audio"), t("disc_subs")])
+        h = self.view.header()
+        for c in range(7):
+            h.setSectionResizeMode(c, QHeaderView.ResizeToContents if c < 5 else QHeaderView.Stretch)
+        for n, ti in enumerate(titles):
+            d = ti["duration"]
+            audio = ", ".join(f"{c} {lang}".strip() for c, lang in ti["audio"]) or "—"
+            subs = ", ".join(x or "?" for x in ti["subs"]) or "—"
+            it = QTreeWidgetItem(self.view, [("★ " if ti.get("main") else "") + ti["id"],
+                                             f"{int(d // 3600)}:{int(d // 60 % 60):02d}:{int(d % 60):02d}" if d else "?",
+                                             str(len(ti["files"])), P.fmt_size(ti["size"]), ", ".join(ti["video"]),
+                                             audio, subs])
+            it.setData(0, Qt.UserRole, n)
+            it.setToolTip(5, audio)
+            it.setToolTip(6, subs)
+            if ti.get("main"):
+                it.setSelected(True)
+                f = it.font(0)
+                f.setBold(True)
+                for c in range(7):
+                    it.setFont(c, f)
+        self.view.itemDoubleClicked.connect(lambda *_: self.accept())
+        lay.addWidget(self.view, 1)
+        if not titles:
+            lay.addWidget(_hint(t("disc_none")))
+        lay.addWidget(_buttons(self))
+
+    def chosen(self) -> list[dict]:
+        rows = sorted(self.view.indexOfTopLevelItem(it) for it in self.view.selectedItems())
+        return [self.titles[self.view.topLevelItem(r).data(0, Qt.UserRole)] for r in rows]
+
+
+class DemuxDialog(QDialog):
+    """1.8: every track of a task into a file of its own, without encoding (.h264 .hevc .ac3 .dts .thd .srt .sup …),
+    the DTS core of DTS-HD and the AC3 core of E-AC3 too, the chapters as a text file."""
+
+    def __init__(self, job, parent=None):
+        super().__init__(parent)
+        import os
+        from . import job as J
+        from .runner import Runner
+        self.job = job
+        self.setWindowTitle(t("demux"))
+        self.setMinimumSize(760, 440)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(_head(t("demux")))
+        lay.addWidget(_hint(t("demux_hint")))
+        row = QHBoxLayout()
+        row.addWidget(QLabel(t("demux_to")))
+        stem = os.path.splitext(os.path.basename(job.src))[0]
+        self.folder = QLineEdit(os.path.join(os.path.dirname(job.src) if not job.src.lower().endswith(".ffconcat")
+                                             else os.path.expanduser("~"), f"{stem} [tracks]"))
+        row.addWidget(self.folder, 1)
+        pick = QPushButton("…")
+        pick.clicked.connect(self._pick)
+        row.addWidget(pick)
+        lay.addLayout(row)
+        self.cores = QCheckBox(t("demux_cores"))
+        self.cores.setChecked(True)
+        self.cores.toggled.connect(lambda _on: self._fill())
+        lay.addWidget(self.cores)
+        self.chap = QCheckBox(t("demux_chapters"))
+        self.chap.setChecked(True)
+        lay.addWidget(self.chap)
+        self.view = QTreeWidget()
+        self.view.setObjectName("playlist")
+        self.view.setRootIsDecorated(False)
+        self.view.setHeaderLabels([t("demux_track"), t("demux_file")])
+        self.view.header().setSectionResizeMode(0, QHeaderView.ResizeToContents)
+        self.view.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        lay.addWidget(self.view, 1)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.hide()
+        lay.addWidget(self.bar)
+        self.state = _hint("")
+        lay.addWidget(self.state)
+        bb = QDialogButtonBox()
+        self.b_go = bb.addButton(t("demux_go"), QDialogButtonBox.AcceptRole)
+        self.b_go.setObjectName("primary")
+        self.b_close = bb.addButton(QDialogButtonBox.Close)
+        self.b_go.clicked.connect(self.start)
+        self.b_close.clicked.connect(self.reject)
+        lay.addWidget(bb)
+        self.runner = Runner(self)
+        self.runner.progress.connect(lambda d: self.bar.setValue(int(d.get("frac", 0) * 1000)))
+        self.runner.finished.connect(self._done)
+        self.J = J
+        self._fill()
+
+    def _pick(self):
+        from PySide6.QtWidgets import QFileDialog
+        d = QFileDialog.getExistingDirectory(self, t("demux_to"), self.folder.text())
+        if d:
+            self.folder.setText(d)
+            self._fill()
+
+    def _fill(self):
+        import os
+        self.items = self.J.demux_items(self.job, self.folder.text().strip(), self.cores.isChecked())
+        self.view.clear()
+        for n, it in enumerate(self.items):
+            s = it["stream"]
+            row = QTreeWidgetItem(self.view, [f"#{s.index} {it['what']}" + (f" · {s.lang}" if s.lang else ""),
+                                              os.path.basename(it["path"])])
+            row.setFlags(row.flags() | Qt.ItemIsUserCheckable)
+            row.setCheckState(0, Qt.Checked)
+            row.setData(0, Qt.UserRole, n)
+
+    def chosen(self) -> list[dict]:
+        out = []
+        for i in range(self.view.topLevelItemCount()):
+            row = self.view.topLevelItem(i)
+            if row.checkState(0) == Qt.Checked:
+                out.append(self.items[row.data(0, Qt.UserRole)])
+        return out
+
+    def start(self):
+        import os
+        from . import ff
+        folder = self.folder.text().strip()
+        off = {self.view.topLevelItem(i).data(0, Qt.UserRole) for i in range(self.view.topLevelItemCount())
+               if self.view.topLevelItem(i).checkState(0) != Qt.Checked}
+        self._fill()                                      # the paths in the folder now typed, the ticks kept
+        for i in range(self.view.topLevelItemCount()):
+            if self.view.topLevelItem(i).data(0, Qt.UserRole) in off:
+                self.view.topLevelItem(i).setCheckState(0, Qt.Unchecked)
+        items = self.chosen() if self.view.topLevelItemCount() else []
+        if not items or not folder:
+            return
+        try:
+            os.makedirs(folder, exist_ok=True)
+        except OSError as e:
+            self.state.setText("✗ " + str(e))
+            return
+        if self.chap.isChecked():
+            txt = self.J.chapters_text(self.job)
+            if txt:
+                stem = os.path.splitext(os.path.basename(self.job.src))[0]
+                with open(os.path.join(folder, f"{stem} - chapters.txt"), "w", encoding="utf-8") as f:
+                    f.write(txt)
+        self.done_items = items
+        args = self.J.demux_args(self.job, ff.ffmpeg() or "ffmpeg", items)
+        self.bar.show()
+        self.b_go.setEnabled(False)
+        self.state.setText(t("demux_running"))
+        self.runner.start(args, items[0]["path"], self.J.src_duration(self.job), direct=True)
+
+    def _done(self, ok: bool, err: str):
+        import os
+        self.b_go.setEnabled(True)
+        self.bar.setValue(1000 if ok else 0)
+        made = [it["path"] for it in getattr(self, "done_items", []) if os.path.isfile(it["path"])]
+        self.state.setText(("✓ " + t("demux_done", len(made), self.folder.text())) if ok else ("✗ " + (err or t("s_stop"))))
+        self.ok = ok
+
+    def reject(self):
+        if self.runner.running:
+            self.runner.cancel()
+        super().reject()
+
+
+class EstimateDialog(QDialog):
+    """1.8: «at CRF 20 it comes to about 4.3 GB» — measured on short samples from all over the film; two steps
+    either side on request; a row's quality can be taken for the task."""
+
+    def __init__(self, job, av, hw: bool = True, parent=None, on_pick=None):
+        super().__init__(parent)
+        from . import job as J
+        from .estimate import Estimator
+        self.job, self.av, self.hw, self.on_pick = job, av, hw, on_pick
+        self.setWindowTitle(t("est_title"))
+        self.setMinimumSize(560, 360)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(_head(t("est_title")))
+        self.enc = av.resolve(job.settings.get("video", {}).get("encoder", "auto_hevc")) if av is not None else None
+        v = job.settings.get("video", {})
+        self.quality_mode = v.get("rc", "quality") == "quality" or (self.enc is not None and not self.enc.rc)
+        self.q = int(v.get("quality") or (self.enc.q_default if self.enc else 23))
+        lay.addWidget(_hint(t("est_hint", J.describe(job.settings, av, t))))
+        self.view = QTreeWidget()
+        self.view.setObjectName("playlist")
+        self.view.setRootIsDecorated(False)
+        self.view.setHeaderLabels([t("est_q"), t("est_size"), t("est_vrate")])
+        for c in range(3):
+            self.view.header().setSectionResizeMode(c, QHeaderView.Stretch)
+        self.view.itemDoubleClicked.connect(lambda it, _c: self._pick(it))
+        lay.addWidget(self.view, 1)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        lay.addWidget(self.bar)
+        self.state = _hint("")
+        lay.addWidget(self.state)
+        row = QHBoxLayout()
+        self.b_more = QPushButton(t("est_more"))
+        self.b_more.clicked.connect(self.more)
+        self.b_more.setEnabled(self.quality_mode and self.enc is not None)
+        self.b_take = QPushButton(t("est_take"))
+        self.b_take.clicked.connect(lambda: self._pick(self.view.currentItem()))
+        self.b_take.setEnabled(False)
+        row.addWidget(self.b_more)
+        row.addWidget(self.b_take)
+        row.addStretch(1)
+        close = QPushButton(t("close"))
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        lay.addLayout(row)
+        self.est = Estimator(self)
+        self.est.row.connect(self._row)
+        self.est.progress.connect(lambda k, n: self.bar.setValue(int(1000 * k / max(1, n))))
+        self.est.done.connect(self._done)
+        self.view.currentItemChanged.connect(lambda cur, _p: self.b_take.setEnabled(cur is not None and self.quality_mode))
+        self.rows = {}
+        self.J = J
+        self.start([self.q if self.quality_mode else None])
+
+    def start(self, qualities):
+        qualities = [q for q in qualities if q not in self.rows]
+        if not qualities:
+            return
+        self.bar.setValue(0)
+        self.state.setText(t("est_running"))
+        self.b_more.setEnabled(False)
+        self.est.run(self.job, self.av, qualities, self.hw)
+
+    def more(self):
+        from .estimate import steps_around
+        self.start(steps_around(self.enc, self.q))
+
+    def _row(self, q, size: float, kbps: float):
+        from . import probe as P
+        name = (("CQ " if self.enc is not None and self.enc.hw else "CRF ") + str(q)) if q is not None else \
+            self.J.describe(self.job.settings, self.av, t)
+        it = QTreeWidgetItem([name + ("  ★" if q == self.q else ""), "≈ " + P.fmt_size(size), f"≈ {kbps:.0f} kbit/s"])
+        it.setData(0, Qt.UserRole, q)
+        if q == self.q or q is None:
+            f = it.font(0)
+            f.setBold(True)
+            for c in range(3):
+                it.setFont(c, f)
+        self.rows[q] = (size, kbps)
+        keys = sorted(k for k in self.rows if k is not None)
+        self.view.insertTopLevelItem(keys.index(q) if q is not None else 0, it)
+
+    def _done(self, err: str):
+        self.bar.setValue(1000 if not err else self.bar.value())
+        self.state.setText(("✗ " + err) if err and err != "stopped" else t("est_note"))
+        self.b_more.setEnabled(self.quality_mode and self.enc is not None and len(self.rows) < 5)
+
+    def _pick(self, it):
+        if it is None or it.data(0, Qt.UserRole) is None:
+            return
+        q = int(it.data(0, Qt.UserRole))
+        self.job.settings.setdefault("video", {})["quality"] = q
+        if self.on_pick:
+            self.on_pick(self.job, q)
+        self.accept()
+
+    def reject(self):
+        self.est.stop = True
         super().reject()

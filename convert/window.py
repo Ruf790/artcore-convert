@@ -54,7 +54,10 @@ class Slot:
 
     def __init__(self, win: "MainWindow", n: int):
         self.n = n
-        self.runner = Runner(win)
+        self.plain = Runner(win)
+        from .chunks import ChunkRunner
+        self.chunked = ChunkRunner(win)               # 1.8: the same task in chunks, several ffmpeg at a time
+        self.runner = self.plain
         self.job: J.Job | None = None
         self.log: list[str] = []
         self.started = 0.0
@@ -63,9 +66,10 @@ class Slot:
         self.kinds: list[tuple[str, float]] = []     # 1.6: what each «$ command» of the log was, and when
         self.peak = 0                                # 1.6: the most memory its ffmpeg took (bytes)
         self._mem_at = 0.0
-        self.runner.progress.connect(lambda d, s=self: win._on_progress(d, s))
-        self.runner.log.connect(lambda line, s=self: win._on_log(line, s))
-        self.runner.finished.connect(lambda ok, err, s=self: win._on_finished(ok, err, s))
+        for r in (self.plain, self.chunked):
+            r.progress.connect(lambda d, s=self: win._on_progress(d, s))
+            r.log.connect(lambda line, s=self: win._on_log(line, s))
+            r.finished.connect(lambda ok, err, s=self: win._on_finished(ok, err, s))
 
     @property
     def busy(self) -> bool:
@@ -496,7 +500,50 @@ class MainWindow(MainUI, QMainWindow):
         d = QFileDialog.getExistingDirectory(self, t("add_folder"), self.cfg.get("last_dir", ""))
         if d:
             self.cfg["last_dir"] = d
+            from . import disc as DS
+            if DS.disc_root(d):                           # 1.8: a disc folder: its titles, not its files
+                self.open_disc(d)
+                return
             self.add_paths([d])
+
+    # ── 1.8: Blu-ray / DVD ────────────────────────────────────
+    def open_disc_dialog(self):
+        d = QFileDialog.getExistingDirectory(self, t("disc_open"), self.cfg.get("last_dir", ""))
+        if d:
+            self.cfg["last_dir"] = d
+            self.open_disc(d)
+
+    def open_disc(self, path: str, pick=None) -> int:
+        """The titles of the disc in a window; the chosen ones become tasks. pick: choose without asking (tests)."""
+        from . import disc as DS
+        found = DS.disc_root(path)
+        if not found:
+            self._toast(t("disc_not"))
+            return 0
+        kind, root = found
+        QApplication.setOverrideCursor(Qt.WaitCursor)
+        try:
+            titles = DS.titles(kind, root)
+            name = DS.disc_name(kind, root)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if pick is not None:
+            chosen = pick(titles)
+        else:
+            from .dialogs import DiscDialog
+            dlg = DiscDialog(kind, root, titles, name, self)
+            self._disc_dlg = dlg
+            if not dlg.exec():
+                return 0
+            chosen = dlg.chosen()
+        n = 0
+        for ti in chosen:
+            src = DS.title_source(ti, name)
+            if self.add_paths([src]):
+                j = self.jobs[-1]
+                self.__dict__.setdefault("_disc_titles", {})[j.uid] = ti
+                n += 1
+        return n
 
     @staticmethod
     def expand(paths: list[str]) -> list[str]:
@@ -513,16 +560,31 @@ class MainWindow(MainUI, QMainWindow):
         return out
 
     def add_incoming(self, paths: list[str], target_uid: int = 0, ask: bool = True) -> int:
+        from . import disc as DS
+        discs = [p for p in paths if os.path.isdir(p) and DS.disc_root(p)]
+        if discs:                                          # 1.8: a disc folder dropped: its titles
+            n = 0
+            for p in discs:
+                n += self.open_disc(p)
+            rest = [p for p in paths if p not in discs]
+            return n + (self.add_incoming(rest, target_uid, ask) if rest else 0)
+        return self._add_incoming(paths, target_uid, ask)
+
+    def _add_incoming(self, paths: list[str], target_uid: int = 0, ask: bool = True) -> int:
         """1.6: files dropped or opened (Ctrl+O): a film becomes a task; a sound or a
         subtitle file is attached to a film — to the card (or the picture) it fell on, to the film whose name it
         starts with (film.mkv ← film.rus.ac3, film.eng.srt), else to the selected film after asking — and only
         without a film it becomes a task of its own (sound) or is left out (subtitles). Returns the tasks added."""
         files = self.expand(paths)
+        edls = [f for f in files if f.lower().endswith(".edl")]           # 1.8: cut lists → the film's trim
+        files = [f for f in files if f not in edls]
         extra_ext = J.EXT_AUDIO + J.EXT_SUBS
         videos = [f for f in files if not f.lower().endswith(extra_ext)]
         extras = [f for f in files if f.lower().endswith(extra_ext)]
         n = self.add_paths(videos) if videos else 0
         new = list(self.jobs[-n:]) if n else []
+        if edls:
+            QTimer.singleShot(0, lambda e=edls, u=target_uid: self._incoming_edl(e, u))
         try:
             return self._incoming_extras(n, extras, target_uid, ask)
         finally:
@@ -539,6 +601,38 @@ class MainWindow(MainUI, QMainWindow):
                     cur = self.selected_jobs()
                     if len(cur) == 1 and cur[0] in new:
                         self._fill_tracks()
+
+    def _incoming_edl(self, edls: list[str], target_uid: int = 0, tries: int = 0):
+        """An EDL dropped or opened: onto the card it fell on, the film of the same name, or the selected one."""
+        if any(j.status == "probe" for j in self.jobs) and tries < 50:
+            QTimer.singleShot(200, lambda: self._incoming_edl(edls, target_uid, tries + 1))
+            return
+        ok = [j for j in self.jobs if j.status in EDITABLE and not self._busy(j) and j.info is not None
+              and not j.info.error]
+        sel = [j for j in self.selected_jobs(editable=True) if j in ok]
+        done = 0
+        for f in edls:
+            j = next((x for x in ok if x.uid == target_uid), None) or self._film_for(f, ok) or \
+                (sel[0] if len(sel) == 1 else None)
+            if j is None:
+                continue
+            try:
+                with open(f, encoding="utf-8", errors="replace") as fh:
+                    v = j.info.video
+                    pcs, cut = J.parse_edl(fh.read(), v.fps if v is not None and v.fps else 25.0)
+            except (OSError, ValueError):
+                continue
+            j.trim, j.trim_cut = pcs, cut
+            if j.status in ("done", "error", "stop", "skip"):
+                j.status, j.error, j.progress = "wait", "", 0.0
+            self._refresh(j)
+            done += 1
+        if done:
+            self._queue_changed()
+            self._select_changed()
+            self._toast(t("edl_loaded", done))
+        elif edls:
+            self._toast(t("edl_bad"))
 
     def _incoming_extras(self, n: int, extras: list[str], target_uid: int, ask: bool) -> int:
         if not extras:
@@ -677,6 +771,10 @@ class MainWindow(MainUI, QMainWindow):
         if j is None:
             return
         j.info = info
+        ti = self.__dict__.get("_disc_titles", {}).pop(uid, None)
+        if ti is not None and not info.error:              # 1.8: the disc's languages and chapters
+            from . import disc as DS
+            DS.apply_title(j, ti)
         if j.status == "probe":
             j.status = "wait"
         self._show_thumb(j)
@@ -851,6 +949,10 @@ class MainWindow(MainUI, QMainWindow):
                 m.addAction(style.icon("fa6s.object-group"), t("join_selected"), self.join_selected)
             if j.info is not None and not j.info.error and len(self.jobs) > 1:
                 m.addAction(style.icon("fa6s.clone"), t("apply_to") + "…", lambda: self.apply_dialog(j))
+            if j.info is not None and not j.info.error:
+                m.addAction(style.icon("fa6s.file-export"), t("demux") + "…", lambda: self.demux_dialog(j))
+                if j.info.video is not None and j.status in EDITABLE and not self._busy(j):
+                    m.addAction(style.icon("fa6s.scale-balanced"), t("est_menu") + "…", lambda: self.estimate_dialog(j))
             if len(jobs) == 1 and j in ed:
                 m.addAction(style.icon("fa6s.link"), t("join_add") + "…", lambda: self.join_add_dialog())
                 if j.joins:
@@ -961,6 +1063,41 @@ class MainWindow(MainUI, QMainWindow):
         return n
 
     # ── 1.4: joining files, external tracks ───────────────────
+    def estimate_dialog(self, j: J.Job | None = None):
+        """1.8: how big the result will be (samples encoded with the task's settings)."""
+        if j is None:
+            sel = self.selected_jobs()
+            j = sel[0] if len(sel) == 1 else None
+        if j is None or j.info is None or j.info.error or j.info.video is None or not self.av_ready:
+            self._toast(t("tr_pick_one"))
+            return None
+        from .dialogs import EstimateDialog
+
+        def picked(job, q):
+            if job.status in ("done", "error", "stop", "skip"):
+                job.status, job.error, job.progress = "wait", "", 0.0
+            self._refresh(job)
+            self._queue_changed()
+            self._select_changed()
+        d = EstimateDialog(j, self.av, bool(self.cfg.get("hw_decode", True)), self, picked)
+        self._est_dlg = d
+        d.show()
+        return d
+
+    def demux_dialog(self, j: J.Job | None = None):
+        """1.8: the tracks of a task into files."""
+        if j is None:
+            sel = self.selected_jobs()
+            j = sel[0] if len(sel) == 1 else None
+        if j is None or j.info is None or j.info.error:
+            self._toast(t("tr_pick_one"))
+            return None
+        from .dialogs import DemuxDialog
+        d = DemuxDialog(j, self)
+        self._demux_dlg = d
+        d.show()
+        return d
+
     def apply_dialog(self, src: J.Job | None = None, parts=None, scope: str = "", ask: bool = True) -> int:
         """1.7: this task's settings onto the other selected tasks (or every waiting one): the profile and filters,
         the choice of tracks, the trim. Returns how many tasks changed."""
@@ -1742,8 +1879,8 @@ class MainWindow(MainUI, QMainWindow):
         src = jobs[0].info.video if jobs and jobs[0].info else None
         if src is not None and src.hdr and 10 not in enc.bits:
             txt += "\n⚠ " + t("w_hdr_8bit")
-        elif src is not None and src.hdr == "Dolby Vision":
-            txt += "\n⚠ " + t("w_dv")
+        elif src is not None and src.hdr == "Dolby Vision" and enc.id not in ("x265", "svtav1"):
+            txt += "\n⚠ " + t("w_dv_hw" if enc.hw else "w_dv")
         self.v_enc_hint.setText(txt)
         self.codec_hint.setText(txt)
 
@@ -1979,11 +2116,25 @@ class MainWindow(MainUI, QMainWindow):
         self._refresh(j)
         if self._shown_slot() is slot:
             self._show_slot(slot)
-        kinds = ["vidstab"] if J.needs_vidstab(j) else []
-        kinds += ["pass1"] * (len(pre) - len(kinds))
+        kinds = list(getattr(j, "pre_kinds", None) or [])           # 1.8: as pre_passes named them
+        if len(kinds) != len(pre):
+            kinds = (["vidstab"] if J.needs_vidstab(j) else [])
+            kinds += ["pass1"] * (len(pre) - len(kinds))
         kinds += ["main"] + ["metrics"] * len(post)
-        slot.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre, post,
-                          self._cores(slot), kinds=kinds)
+        ch = self.cfg.get("chunks") or {}
+        from . import chunks as CH
+        why = CH.why_not(j, self.av) if ch.get("on") else "off"
+        if not why and J.out_duration(j) > float(ch.get("minutes", 3) or 3) * 60 * 1.5:
+            slot.runner = slot.chunked                     # 1.8: in chunks, several at a time
+            slot.chunked.start_job(j, exe, out, self.av, hw, workers=int(ch.get("workers", 0) or 0),
+                                   minutes=float(ch.get("minutes", 3) or 3), priority=self.cfg.get("priority", "below"),
+                                   post=post, cores=self._cores(slot), threads=n)
+        else:
+            if why not in ("", "off"):
+                self.log.appendPlainText("ℹ " + t("chk_not", t(why)))
+            slot.runner = slot.plain
+            slot.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre, post,
+                              self._cores(slot), kinds=kinds)
         self._update_buttons()
         self._queue_changed()
         return True
@@ -2011,20 +2162,21 @@ class MainWindow(MainUI, QMainWindow):
         now = time.monotonic()
         if now - slot._mem_at >= 1.0:                     # 1.6: the peak memory of ffmpeg, for the log
             slot._mem_at = now
-            pid = slot.runner.proc.processId() if slot.runner.proc is not None else 0
-            if pid:
+            rss = 0
+            for pid in _pids(slot.runner):                # 1.8: in chunks, all its ffmpeg together
                 try:
                     import psutil
-                    slot.peak = max(slot.peak, psutil.Process(int(pid)).memory_info().rss)
+                    rss += psutil.Process(int(pid)).memory_info().rss
                 except Exception:                         # noqa: BLE001
                     pass
+            slot.peak = max(slot.peak, rss)
         if j is None:
             return
         slot.stat = d
         self._last_stat = d
         if slot.stage == "main":
             j.progress = d["frac"] * (0.97 if J.split_on(j) else 1.0)
-            j.out_size = d["size"] if slot.runner.kind == "main" else j.out_size
+            j.out_size = d["size"] if slot.runner.kind == "main" or d.get("chunks") else j.out_size
         else:
             j.progress = 0.97 + 0.03 * d["frac"]
         self._refresh(j)
@@ -2033,6 +2185,8 @@ class MainWindow(MainUI, QMainWindow):
             return
         kind = slot.runner.kind if slot.stage == "main" else "split"
         name = f"{j.name}  →  {os.path.basename(j.out)}" + (f"  ·  {t('st_' + kind)}" if kind != "main" else "")
+        if d.get("chunks"):                               # 1.8: «chunks 7 / 20 · 4 at a time»
+            name = f"{j.name}  →  {os.path.basename(j.out)}  ·  {t('chk_progress', d['chunks'], d.get('workers', 0))}"
         if self.st_name.text() != name:
             self.st_name.setText(name)
         self.st_bar.setValue(int(d["frac"] * 1000))
@@ -2044,7 +2198,7 @@ class MainWindow(MainUI, QMainWindow):
         self.st["fps"].setText(f"{d['fps']:.1f}" if d["fps"] else "—")
         br = d["bitrate"]
         self.st["bitrate"].setText(br.replace("kbits/s", " kbit/s") if br and br != "N/A" else "—")
-        if d["size"] and kind == "main":
+        if d["size"] and (kind == "main" or d.get("chunks")):
             est = d["size"] / d["frac"] if d["frac"] > 0.02 else 0
             self.st["size"].setText(P.fmt_size(d["size"]) + (f"  (≈ {P.fmt_size(est)})" if est else ""))
         self._update_total()
@@ -2156,6 +2310,7 @@ class MainWindow(MainUI, QMainWindow):
             self._on_finished(True, "", slot)
             return
         args = J.split_args(j, ff.ffmpeg() or "ffmpeg", j.out, times)
+        slot.runner = slot.plain
         slot.runner.start(args, J.split_pattern(j.out), J.out_duration(j), self.cfg.get("priority", "below"),
                           cores=self._cores(slot), direct=True, kinds=["split"])
 
@@ -2294,8 +2449,7 @@ class MainWindow(MainUI, QMainWindow):
             self.st["ram"].setText(f"{P.fmt_size(vm.used)} / {P.fmt_size(vm.total)}")
             rss = 0
             for sl in self.slots:
-                pid = sl.runner.proc.processId() if sl.runner.proc is not None else 0
-                if pid:
+                for pid in _pids(sl.runner):
                     try:
                         rss += psutil.Process(int(pid)).memory_info().rss
                     except Exception:
@@ -2534,6 +2688,14 @@ class _Shim:
 
     def __init__(self, st: dict):
         self.settings, self.info, self.crop_found = st, None, None
+
+
+def _pids(runner) -> list[int]:
+    """The ffmpeg processes of a runner (1.8: a task in chunks has several)."""
+    if hasattr(runner, "pids"):
+        return runner.pids()
+    p = runner.proc
+    return [int(p.processId())] if p is not None and p.processId() else []
 
 
 def _lang_from_name(path: str, src: str) -> str:

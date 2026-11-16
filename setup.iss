@@ -3,7 +3,7 @@
 ; Expects the PyInstaller output (with ffmpeg\ inside) in dist\ArtCoreConvert\.
 
 #define AppName      "ArtCore Convert"
-#define AppVersion   "1.7.1"
+#define AppVersion   "1.8.0"
 #define AppPublisher "ArtCore"
 #define AppURL       "https://github.com/Ruf790/artcore-convert"
 #define AppExe       "ArtCoreConvert.exe"
