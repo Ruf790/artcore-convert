@@ -2131,7 +2131,7 @@ class MainWindow(MainUI, QMainWindow):
                                    post=post, cores=self._cores(slot), threads=n)
         else:
             if why not in ("", "off"):
-                self.log.appendPlainText("ℹ " + t("ch_not", t(why)))
+                self.log.appendPlainText("ℹ " + t("chk_not", t(why)))
             slot.runner = slot.plain
             slot.runner.start(args, out, J.out_duration(j), self.cfg.get("priority", "below"), pre, post,
                               self._cores(slot), kinds=kinds)
@@ -2186,7 +2186,7 @@ class MainWindow(MainUI, QMainWindow):
         kind = slot.runner.kind if slot.stage == "main" else "split"
         name = f"{j.name}  →  {os.path.basename(j.out)}" + (f"  ·  {t('st_' + kind)}" if kind != "main" else "")
         if d.get("chunks"):                               # 1.8: «chunks 7 / 20 · 4 at a time»
-            name = f"{j.name}  →  {os.path.basename(j.out)}  ·  {t('ch_progress', d['chunks'], d.get('workers', 0))}"
+            name = f"{j.name}  →  {os.path.basename(j.out)}  ·  {t('chk_progress', d['chunks'], d.get('workers', 0))}"
         if self.st_name.text() != name:
             self.st_name.setText(name)
         self.st_bar.setValue(int(d["frac"] * 1000))

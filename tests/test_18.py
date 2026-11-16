@@ -56,10 +56,10 @@ def test_chunk_plan_on_frames(films):
     assert pl[0]["pieces"] == [[1.0, 10.0], [15.0, 17.0]]                              # across the cut
     assert C.why_not(j, None) == "" and C.key(j, 3, "x264") == C.key(j, 3, "x264") != C.key(j, 2, "x264")
     j.joins = ["/x/b.mkv"]
-    assert C.why_not(j, None) == "ch_joins"
+    assert C.why_not(j, None) == "chk_joins"
     j.joins = []
     j.settings["video"]["mode"] = "copy"
-    assert C.why_not(j, None) == "ch_no_video"
+    assert C.why_not(j, None) == "chk_no_video"
 
 
 def test_chunks_run_stop_and_resume(qapp, films, data_dir):
@@ -360,7 +360,7 @@ def test_dyn_hdr_decisions(monkeypatch):
     p = J.hdr10p_passes(m2ts, "ffmpeg")
     assert len(p) == 2 and "hevc_mp4toannexb" in p[0] and p[1][-1].endswith(".hevc")
     from convert import chunks as C
-    assert C.why_not(j, None) == "ch_hdr10p"
+    assert C.why_not(j, None) == "chk_hdr10p"
     monkeypatch.setattr(J, "hdr10p_tool", lambda: "")
     assert J.dyn_hdr(j, x265, 10)["lost"] == ["w_hdr10p_tool"]
 
@@ -435,3 +435,20 @@ def test_estimate_dialog(qapp, films, data_dir):
     d._pick(d.view.topLevelItem(4))
     assert j.settings["video"]["quality"] == 27
     w.close()
+
+
+def test_every_string_is_there_once():
+    """Every t("key") the code asks for is in i18n, and no key is written twice (a later one would win)."""
+    import collections
+    import glob
+    import re
+    from convert import i18n
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    src = "".join(open(f, encoding="utf-8").read() for f in glob.glob(os.path.join(root, "convert", "*.py")))
+    used = set(re.findall(r'''\bt\(\s*["']([a-z0-9_]+)["']\s*[,)]''', src))
+    assert sorted(k for k in used if k not in i18n.STRINGS) == []
+    with open(os.path.join(root, "convert", "i18n.py"), encoding="utf-8") as f:
+        keys = re.findall(r'^\s+"([a-z0-9_]+)":\s+\(', f.read(), re.M)
+    assert [k for k, n in collections.Counter(keys).items() if n > 1] == []
+    for key, _tpl in J.NAME_TEMPLATES:
+        assert key in i18n.STRINGS

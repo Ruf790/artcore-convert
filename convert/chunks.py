@@ -47,22 +47,22 @@ def purge(days: int = KEEP_DAYS) -> None:
 def why_not(job: J.Job, av: E.Available | None) -> str:
     """"" when the task can be encoded in chunks, else the i18n key of the reason."""
     if job.info is None or job.info.error or job.info.video is None:
-        return "ch_no_video"
+        return "chk_no_video"
     v = job.settings.get("video", {})
     c = E.container(job.settings.get("container", "mkv"))
     if v.get("mode") in ("copy", "none") or c.audio_only:
-        return "ch_no_video"
+        return "chk_no_video"
     enc = av.resolve(v.get("encoder", "auto_hevc")) if av is not None else E.BY_ID.get(v.get("encoder", ""))
     if enc is None or enc.id == "gif":
-        return "ch_no_video"
+        return "chk_no_video"
     if job.joins:
-        return "ch_joins"
+        return "chk_joins"
     if av is not None and J.two_pass(job, enc, av):
-        return "ch_two_pass"
+        return "chk_two_pass"
     if J.needs_vidstab(job):
-        return "ch_vidstab"
+        return "chk_vidstab"
     if enc is not None and J.dyn_hdr(job, enc, J.out_bits(job, enc))["hdr10p"]:
-        return "ch_hdr10p"
+        return "chk_hdr10p"
     return ""
 
 
