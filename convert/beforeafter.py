@@ -55,7 +55,9 @@ def piece_job(job, at: float):
     k.trim, k.trim_cut, k.joins, k.chapters = [[at, at + PIECE]], False, [], []
     k.metrics, k.parts = {}, []
     k.tracks = {key: dict(val, keep=False) for key, val in job.tracks.items()}
-    k.ext = []
+    k.ext = [dict(e) for e in job.ext if e.get("kind") == "subtitle" and e.get("burn")]    # 2.0: burnt in
+    from . import hardsub as HS
+    HS.pin(job, k)
     return k
 
 

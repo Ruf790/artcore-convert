@@ -10,7 +10,7 @@ import time
 from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap
 from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMainWindow, QMenu, QMessageBox,
-                               QSystemTrayIcon, QTreeWidgetItem)
+                               QSystemTrayIcon, QTreeWidgetItem, QVBoxLayout, QCheckBox, QComboBox)
 
 from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
 from . import encoders as E
@@ -195,6 +195,13 @@ class MainWindow(MainUI, QMainWindow):
         self._select_changed()
         self._update_buttons()
         self.detect_encoders()
+        from .watch import Watcher                     # 2.0: watch folders
+        self.watcher = Watcher(self.cfg, lambda: [j.src for j in self.jobs if j.status in ("wait", "probe", "run", "pause")],
+                               self)
+        self.watcher.found.connect(self._watch_found)
+        self._tray_setup()
+        if self.cfg.get("shell_menu"):                 # 2.0: the menu follows the program (its place, presets)
+            QTimer.singleShot(1500, self._shell_menu_apply)
 
     # ── 1.4: the places where tasks are encoded ──────────────
     @property
@@ -336,6 +343,8 @@ class MainWindow(MainUI, QMainWindow):
 
     def _fill_presets(self):
         """The preset list in groups (1.5): general, Apple, Android, TVs, consoles, the web, discs, own."""
+        if self.cfg.get("shell_menu") and hasattr(self, "watcher"):      # 2.0: Explorer's submenu has them too
+            QTimer.singleShot(0, self._shell_menu_apply)
         self.preset_box.blockSignals(True)
         self.preset_box.clear()
         self.preset_box.setMaxVisibleItems(32)
@@ -738,15 +747,18 @@ class MainWindow(MainUI, QMainWindow):
         self._refresh(j)
         self._queue_changed()
 
-    def add_paths(self, paths: list[str]) -> int:
+    def add_paths(self, paths: list[str], preset: str = "") -> int:
+        """Files / folders → tasks with the settings of new files, or (2.0) with the given preset."""
         have = {os.path.normcase(os.path.abspath(j.src)) for j in self.jobs if j.status in ("wait", "probe", "run", "pause")}
         n = 0
+        known = preset and (preset in J.PRESETS or preset in self.user_presets or preset in FM.DEVICE)
         for p in self.expand(paths):
             key = os.path.normcase(os.path.abspath(p))
             if key in have:
                 continue
             have.add(key)
-            j = J.Job(src=os.path.abspath(p), settings=self.new_settings(), preset=self.cfg.get("preset", ""))
+            st = J.preset_settings(preset, self.user_presets) if known else self.new_settings()
+            j = J.Job(src=os.path.abspath(p), settings=st, preset=preset if known else self.cfg.get("preset", ""))
             self._append(j)
             n += 1
         if n:
@@ -1384,6 +1396,158 @@ class MainWindow(MainUI, QMainWindow):
         if key in ("codec", "default"):
             QTimer.singleShot(0, self._fill_tracks)
 
+    # ── 2.0: burnt-in subtitles, the 2.0 matrix ───────────────
+    def _track_burn(self, key: tuple, value: str):
+        """One subtitle track of the task burnt in (choosing it takes the mark off any other)."""
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or jobs[0].info is None or jobs[0].info.error:
+            return
+        j = jobs[0]
+        for s in j.info.of("subtitle"):
+            tr = j.tracks.setdefault(str(s.index), {})
+            if key == ("src", s.index):
+                tr["burn"] = value or ""
+            elif tr.get("burn"):
+                tr["burn"] = ""
+        for n, e in enumerate(j.ext):
+            if key == ("ext", n):
+                e["burn"] = value or ""
+            elif e.get("burn"):
+                e["burn"] = ""
+        self._track_changed(j)
+
+    def hardsub_dialog(self):
+        """How burnt-in text subtitles look (SRT and the like; ASS keeps its own styles), the brightness on HDR and
+        the preset's automatic choice — a part of the settings (and of a preset)."""
+        from PySide6.QtGui import QFont
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QDoubleSpinBox, QFontComboBox, QFormLayout, QSpinBox
+        from . import hardsub as HS
+        from .ui_main import _hint
+        h = HS.hset(self._shown_settings())
+        d = QDialog(self)
+        d.setObjectName("hardsubDialog")
+        d.setWindowTitle(t("hs_look"))
+        lay = QVBoxLayout(d)
+        form = QFormLayout()
+        font = QFontComboBox()
+        font.setCurrentFont(QFont(h["font"]))
+        font.currentFontChanged.connect(lambda f: self._set("hardsub", "font", f.family()))
+        size = QSpinBox()
+        size.setRange(12, 200)
+        size.setSuffix(" " + t("hs_px"))
+        size.setValue(int(h["size"]))
+        size.valueChanged.connect(lambda x: self._set("hardsub", "size", int(x)))
+        outline = QDoubleSpinBox()
+        outline.setRange(0, 12)
+        outline.setSingleStep(0.5)
+        outline.setDecimals(1)
+        outline.setValue(float(h["outline"]))
+        outline.valueChanged.connect(lambda x: self._set("hardsub", "outline", round(float(x), 1)))
+        shadow = QDoubleSpinBox()
+        shadow.setRange(0, 12)
+        shadow.setSingleStep(0.5)
+        shadow.setDecimals(1)
+        shadow.setValue(float(h["shadow"]))
+        shadow.valueChanged.connect(lambda x: self._set("hardsub", "shadow", round(float(x), 1)))
+        pos = QComboBox()
+        for k in HS.POSITIONS:
+            pos.addItem(t("hs_pos_" + k), k)
+        pos.setCurrentIndex(max(0, pos.findData(h["pos"])))
+        pos.currentIndexChanged.connect(lambda _i: self._set("hardsub", "pos", pos.currentData()))
+        margin = QSpinBox()
+        margin.setRange(0, 400)
+        margin.setSuffix(" " + t("hs_px"))
+        margin.setValue(int(h["margin"]))
+        margin.valueChanged.connect(lambda x: self._set("hardsub", "margin", int(x)))
+        color = QComboBox()
+        for k in HS.COLORS:
+            color.addItem(t("hs_color_" + k), k)
+        color.setCurrentIndex(max(0, color.findData(h["color"])))
+        color.currentIndexChanged.connect(lambda _i: self._set("hardsub", "color", color.currentData()))
+        bold = QCheckBox(t("hs_bold"))
+        bold.setChecked(bool(h["bold"]))
+        bold.toggled.connect(lambda on: self._set("hardsub", "bold", bool(on)))
+        nits = QSpinBox()
+        nits.setRange(80, 1000)
+        nits.setSingleStep(10)
+        nits.setSuffix(" " + t("hs_nits_unit"))
+        nits.setValue(int(h["nits"]))
+        nits.setToolTip(t("hs_nits_tip"))
+        nits.valueChanged.connect(lambda x: self._set("hardsub", "nits", int(x)))
+        auto = QComboBox()
+        for k in HS.AUTO:
+            auto.addItem(t("hs_auto_" + k), k)
+        auto.setCurrentIndex(max(0, auto.findData(h["auto"])))
+        auto.setToolTip(t("hs_auto_tip"))
+        auto.currentIndexChanged.connect(lambda _i: self._set("hardsub", "auto", auto.currentData()))
+        for name, w in ((t("hs_font"), font), (t("hs_size"), size), (t("hs_outline"), outline),
+                        (t("hs_shadow"), shadow), (t("hs_pos"), pos), (t("hs_margin"), margin), (t("hs_color"), color),
+                        ("", bold), (t("hs_nits"), nits), (t("hs_auto"), auto)):
+            form.addRow(name, w)
+        lay.addLayout(form)
+        lay.addWidget(_hint(t("hs_look_hint")))
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(d.reject)
+        lay.addWidget(bb)
+        self._hs_dialog = d
+        d.exec()
+
+    def downmix_dialog(self, idx: int | None = None):
+        """«Custom» 2.0 matrix: the level of the centre, the front, the surround and the 7.1 back in dB, the LFE on
+        or off — of the common sound settings (idx None) or of one track."""
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QDoubleSpinBox, QFormLayout
+        from .ui_main import _hint
+        jobs = self.selected_jobs()
+        if idx is not None:
+            if len(jobs) != 1 or jobs[0].info is None:
+                return
+            s = next((x for x in jobs[0].info.of("audio") if x.index == idx), None)
+            if s is None:
+                return
+            cfg = jobs[0].acfg(s)
+        else:
+            cfg = dict(self._shown_settings().get("audio", {}))
+        lv = F.dm_levels(dict(cfg, downmix="custom"))
+        d = QDialog(self)
+        d.setObjectName("downmixDialog")
+        d.setWindowTitle(t("dm_title"))
+        lay = QVBoxLayout(d)
+        form = QFormLayout()
+        boxes = {}
+
+        def save(*_a):
+            val = {k: round(float(b.value()), 1) for k, b in boxes.items()} | {"lfe": lfe.isChecked()}
+            if idx is None:
+                self._set("audio", "dm", val)
+            else:
+                self._track_opt(idx, "dm", val)
+            tail.setText(t("dm_result", F.downmix_text(dict(cfg, downmix="custom", dm=val), 6, "5.1(side)")))
+        for k in ("c", "f", "s", "b"):
+            b = QDoubleSpinBox()
+            b.setRange(-40.0, 12.0)
+            b.setSingleStep(0.5)
+            b.setDecimals(1)
+            b.setSuffix(" dB")
+            b.setValue(float(lv[k]))
+            boxes[k] = b
+            form.addRow(t("dm_" + k), b)
+        lfe = QCheckBox(t("dm_lfe"))
+        lfe.setChecked(bool(lv["lfe"]))
+        form.addRow("", lfe)
+        lay.addLayout(form)
+        tail = _hint("")
+        lay.addWidget(_hint(t("dm_hint")))
+        lay.addWidget(tail)
+        for b in boxes.values():
+            b.valueChanged.connect(save)
+        lfe.toggled.connect(save)
+        tail.setText(t("dm_result", F.downmix_text(dict(cfg, downmix="custom", dm=lv), 6, "5.1(side)")))
+        bb = QDialogButtonBox(QDialogButtonBox.Close)
+        bb.rejected.connect(d.reject)
+        lay.addWidget(bb)
+        self._dm_dialog = d
+        d.exec()
+
     def _ext_remove(self, n: int):
         jobs = self.selected_jobs(editable=True)
         if len(jobs) != 1 or n >= len(jobs[0].ext):
@@ -1499,12 +1663,12 @@ class MainWindow(MainUI, QMainWindow):
                               ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale"),
                               ("video", "quality"), ("video", "bitrate"), ("video", "size_mb"), ("video", "speed")):
             self._load_settings()
-        if key in ("deint", "fps", "bits") or section in ("venc", "mux"):
+        if key in ("deint", "fps", "bits", "channels", "downmix") or section in ("venc", "mux"):
             self._load_settings()
         if section == "audio" and key == "gain":
             self._gain_preview()
         if key in ("container", "subs", "lang", "tracks", "codec", "channels", "normalize", "kbps", "mode",
-                   "gain", "rate", "abits"):
+                   "gain", "rate", "abits", "downmix", "dm") or section == "hardsub":
             if key == "container":
                 self._edit_tabs()
             self._fill_tracks()
@@ -1859,6 +2023,9 @@ class MainWindow(MainUI, QMainWindow):
             sel(self.a_codec, a.get("codec", "auto"))
             sel(self.a_kbps, int(a.get("kbps", 0) or 0))
             sel(self.a_ch, a.get("channels", "keep"))
+            sel(self.a_dm, F.downmix_mode(a))                  # 2.0: the matrix, when the sound becomes stereo
+            self.a_dm.setVisible(a.get("channels", "keep") == "stereo")
+            self.a_dm_gear.setVisible(a.get("channels", "keep") == "stereo" and F.downmix_mode(a) == "custom")
             self.a_gain.setValue(float(a.get("gain", 0) or 0))
             sel(self.a_rate, int(a.get("rate", 0) or 0))
             sel(self.a_abits, int(a.get("abits", 0) or 0))
@@ -2391,6 +2558,12 @@ class MainWindow(MainUI, QMainWindow):
         J.cleanup(j)
         slot.job = None
         j.elapsed = time.time() - slot.started if slot.started else slot.runner.elapsed()
+        if ok or not slot.runner.cancelled:            # 2.0: a watch folder does not take it (or its result) again
+            if j.origin == "watch":
+                self.watcher.done(j.src)
+            for f in ((j.parts or [j.out]) if ok else []):
+                if f:
+                    self.watcher.done(f)
         if ok:
             j.status, j.progress = "done", 1.0
             files = j.parts or [j.out]
@@ -2647,12 +2820,117 @@ class MainWindow(MainUI, QMainWindow):
         if self.running:
             self._next()
 
+    # ── 2.0: watch folders, Explorer's menu, the tray ─────────
+    def bring_up(self):
+        if self.isMinimized() or not self.isVisible():
+            self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
+    def open_from_shell(self, paths: list[str], preset: str = "", ctx: bool = False) -> int:
+        """Files from Explorer (a second copy, or this one's command line): with the preset of the menu item; from
+        the menu with «start at once» on, the queue starts."""
+        n = self.add_paths(paths, preset)
+        if n and ctx and self.cfg.get("ctx_start"):
+            self._auto_start()
+        if n:
+            self._toast(t("added_n", n))
+        return n
+
+    def _auto_start(self):
+        """Start (or go on with) the queue without leaving the tab the user is on."""
+        if not self.av_ready:
+            QTimer.singleShot(800, self._auto_start)
+            return
+        if self.running:
+            QTimer.singleShot(0, self._next)
+            return
+        self.running = True
+        self._update_buttons()
+        self._next()
+
+    def _watch_found(self, path: str, folder: dict):
+        """A complete new file in a watch folder: a task with the folder's preset, its result into the folder's result
+        folder (the same folders under it), the queue goes."""
+        out = folder.get("out") or ""
+        if out and folder.get("sub", True):
+            rel = os.path.relpath(os.path.dirname(path), folder.get("path") or os.path.dirname(path))
+            if rel not in (".", "") and not rel.startswith(".."):
+                out = os.path.join(out, rel)
+        before = len(self.jobs)
+        n = self.add_paths([path], folder.get("preset", ""))
+        if not n:
+            return
+        for j in self.jobs[before:]:
+            j.out_dir, j.origin = out, "watch"
+            if self.cfg.get("auto_ext", True):
+                found = self.beside(j.src)
+                if found:
+                    self._attach(j, found)
+            self._refresh(j)
+        self._queue_changed()
+        self.log.appendPlainText("👁 " + t("wf_added", path))
+        self._auto_start()
+
+    def watch_dialog(self):
+        from .dialogs import WatchDialog
+        d = WatchDialog(self.cfg, [(k, lab) for k, lab, _s in self.preset_entries()], self)
+        self._watch_dlg = d
+        if d.exec():
+            config.save(self.cfg)
+            self.watcher.apply()
+            self._tray_setup()
+
+    def _shell_menu_apply(self):
+        from . import shellmenu
+        if self.cfg.get("shell_menu") or winint.shell_menu_on():
+            err = shellmenu.apply(self.cfg, self.user_presets)
+            if err:
+                self.log.appendPlainText("⚠ " + t("ctx_failed", err))
+
+    def _tray_setup(self):
+        """«Minimise to the tray»: an icon in the notification area with its menu (the window comes back by a click)."""
+        want = bool(self.cfg.get("tray")) and QSystemTrayIcon.isSystemTrayAvailable()
+        tray = getattr(self, "_tray", None)
+        if not want:
+            if tray is not None and getattr(self, "_tray_menu", None) is not None:
+                tray.hide()
+            return
+        if tray is None:
+            self._tray = tray = QSystemTrayIcon(style.app_icon(), self)
+        m = QMenu(self)
+        m.addAction(style.icon("fa6s.window-maximize"), t("tray_show"), self.bring_up)
+        m.addAction(style.icon("fa6s.play"), t("start"), self.start_queue)
+        m.addAction(style.icon("fa6s.eye"), t("wf_title") + "…", lambda: (self.bring_up(), self.watch_dialog()))
+        m.addSeparator()
+        m.addAction(t("quit"), self.close)
+        self._tray_menu = m
+        tray.setContextMenu(m)
+        tray.setToolTip(APP_TITLE)
+        if not getattr(self, "_tray_click", False):
+            self._tray_click = True
+            tray.activated.connect(lambda reason: self.bring_up() if reason in (QSystemTrayIcon.Trigger,
+                                                                                QSystemTrayIcon.DoubleClick) else None)
+        tray.show()
+
+    def changeEvent(self, e):
+        super().changeEvent(e)
+        from PySide6.QtCore import QEvent
+        if e.type() == QEvent.WindowStateChange and self.isMinimized() and self.cfg.get("tray") and \
+                QSystemTrayIcon.isSystemTrayAvailable() and not self._quitting:
+            QTimer.singleShot(0, self.hide)                # the window into the tray; the work goes on
+
     # ── menu, settings, updates ───────────────────────────────
     def settings_dialog(self):
         from .dialogs import SettingsDialog
         lang, theme = self.cfg.get("language"), (self.cfg.get("theme", "dark"), self.cfg.get("look", "classic"))
+        menu = (self.cfg.get("shell_menu"),)
         if SettingsDialog(self.cfg, self).exec():
             config.save(self.cfg)
+            if menu != (self.cfg.get("shell_menu"),) or self.cfg.get("shell_menu"):
+                self._shell_menu_apply()
+            self.watcher.apply()
+            self._tray_setup()
             for j in self.jobs:
                 self._refresh(j)
             if lang != self.cfg.get("language") or theme != (self.cfg.get("theme", "dark"), self.cfg.get("look", "classic")):

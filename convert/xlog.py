@@ -518,9 +518,20 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
             if lang and lang != "und":
                 bits.append(lang)
             L.append(" ".join(bits))
+            if codec != "copy" and codec in E.A_BY_ID:          # 2.0: which 2.0 matrix the mix down used
+                from . import filters as F
+                cfg = j.acfg(s)
+                och = F.layout_channels(cfg.get("channels", "keep"), s.channels, E.A_BY_ID[codec].max_ch)
+                if och == 2 and (s.channels or 2) > 2:
+                    L.append(f"  Downmix:    {s.layout or str(s.channels) + 'ch'} > 2.0, "
+                             f"{F.downmix_text(cfg, s.channels, s.layout)}")
         af = _arg_after(acmd, "-af")
         if af:
             L.append(f" Filters:     {af}")
+        L.append(LINE)
+    if pl.get("burn") is not None:                          # 2.0: subtitles burnt into the picture
+        from . import hardsub as HS
+        L.append(f"Burnt-in subtitles: {HS.describe(pl['burn'])}")
         L.append(LINE)
     if pl["subs"]:
         L.append("Subtitles:")

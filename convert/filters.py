@@ -52,7 +52,7 @@ CODEC_RATES = {"opus": (48000, 24000, 16000, 12000, 8000), "ac3": (48000, 44100,
                "mp2": (48000, 44100, 32000, 24000, 22050), "vorbis": None, "aac": None}
 LAYOUTS = ("keep", "mono", "stereo", "5.1", "7.1")
 LAYOUT_CH = {"mono": 1, "stereo": 2, "5.1": 6, "7.1": 8}
-AUDIO_FILTER_KEYS = ("delay", "gain", "rate", "abits")
+AUDIO_FILTER_KEYS = ("delay", "gain", "rate", "abits", "downmix", "dm")
 
 
 def defaults() -> dict:
@@ -100,10 +100,14 @@ def _ratio(s: str) -> float:
         return 1.0
 
 
-def escape_path(path: str) -> str:
-    """A file path as a value of a filter option, quoted for the filter graph (C:\\a → 'C\\:/a')."""
-    p = path.replace("\\", "/").replace(":", "\\:")
-    return "'" + p.replace("'", "'\\''") + "'"
+def escape_path(path: str, win: bool | None = None) -> str:
+    """A file path (or any text) as a value of a filter option inside a filter graph: escaped for the option parser
+    (\\ ' :), then quoted for the graph (C:\\a → 'C\\:/a'; 2.0: an apostrophe in the name works too)."""
+    v = str(path)
+    if (os.sep == "\\") if win is None else win:
+        v = v.replace("\\", "/")
+    v = v.replace("\\", "\\\\").replace("'", "\\'").replace(":", "\\:")
+    return "'" + v.replace("'", "'\\''") + "'"
 
 
 # ── the rows that are switched on ────────────────────────────
@@ -580,8 +584,10 @@ def out_rate(codec: str, src_rate: int, cfg: dict) -> int:
     return 0 if want == src_rate else want
 
 
-def audio_filters(cfg: dict, codec: str, src_rate: int) -> list[str]:
+def audio_filters(cfg: dict, codec: str, src_rate: int, src_ch: int = 0, layout: str = "", out_ch: int = 0) -> list[str]:
     out = []
+    if downmix_on(cfg, src_ch, out_ch):                     # 2.0: the 2.0 matrix first
+        out += downmix_filters(cfg, src_ch, layout)
     d = _int(cfg.get("delay"))
     if d > 0:
         out.append(f"adelay=delays={d}:all=1")
@@ -598,6 +604,117 @@ def audio_filters(cfg: dict, codec: str, src_rate: int) -> list[str]:
     elif cfg.get("normalize") and src_rate:
         out.append(f"aresample={src_rate}")                # loudnorm works at 192 kHz
     return out
+
+
+# ── 2.0: the 5.1 / 7.1 → 2.0 matrix ─────────────────────────
+DOWNMIX = ("normal", "dialog", "dplii", "custom")
+DM_DEFAULT = {"c": -3.0, "f": 0.0, "s": -3.0, "b": -3.0, "lfe": False}
+DM_DIALOG = {"c": 0.0, "f": 0.0, "s": -6.0, "b": -6.0, "lfe": False}     # the centre up, the back down
+LFE_DB = -6.0                                                             # the LFE in a mix that keeps it
+LAYOUT_NAMES = {"5.1": "FL FR FC LFE BL BR", "5.1(side)": "FL FR FC LFE SL SR", "5.0": "FL FR FC BL BR",
+                "5.0(side)": "FL FR FC SL SR", "6.0": "FL FR FC BC SL SR", "6.1": "FL FR FC LFE BC SL SR",
+                "6.1(back)": "FL FR FC LFE BL BR BC", "7.0": "FL FR FC BL BR SL SR", "7.1": "FL FR FC LFE BL BR SL SR",
+                "7.1(wide)": "FL FR FC LFE BL BR FLC FRC", "7.1(wide-side)": "FL FR FC LFE FLC FRC SL SR",
+                "quad": "FL FR BL BR", "quad(side)": "FL FR SL SR", "4.0": "FL FR FC BC", "4.1": "FL FR FC LFE BC",
+                "3.0": "FL FR FC", "3.1": "FL FR FC LFE", "2.1": "FL FR LFE",
+                "5.1.2": "FL FR FC LFE BL BR TFL TFR", "5.1.4": "FL FR FC LFE BL BR TFL TFR TBL TBR",
+                "7.1.2": "FL FR FC LFE BL BR SL SR TFL TFR", "7.1.4": "FL FR FC LFE BL BR SL SR TFL TFR TBL TBR"}
+BY_COUNT = {3: "2.1", 4: "4.0", 5: "5.0", 6: "5.1", 7: "6.1", 8: "7.1", 10: "5.1.4", 12: "7.1.4"}
+
+
+def downmix_mode(cfg: dict) -> str:
+    m = cfg.get("downmix", "normal")
+    return m if m in DOWNMIX else "normal"
+
+
+def dm_levels(cfg: dict) -> dict:
+    """The levels (dB) of «Custom», or of «Louder dialogue»."""
+    if downmix_mode(cfg) == "dialog":
+        return dict(DM_DIALOG)
+    out = dict(DM_DEFAULT)
+    d = cfg.get("dm")
+    if isinstance(d, dict):
+        for k in ("c", "f", "s", "b"):
+            if k in d:
+                out[k] = max(-40.0, min(12.0, _num(d[k], out[k])))
+        out["lfe"] = bool(d.get("lfe", False))
+    return out
+
+
+def channel_names(src_ch: int, layout: str) -> list[str]:
+    lay = (layout or "").strip()
+    names = LAYOUT_NAMES.get(lay) or LAYOUT_NAMES.get(BY_COUNT.get(src_ch, ""), "")
+    out = names.split()
+    return out if len(out) == src_ch else []
+
+
+def downmix_matrix(cfg: dict, src_ch: int, layout: str) -> tuple[list[tuple[str, float]], list[tuple[str, float]], float]:
+    """«Louder dialogue» / «Custom»: the gains of every source channel into L and into R, made smaller together
+    so the loudest possible sum is full scale (no clipping). Returns (left, right, the factor applied)."""
+    names = channel_names(src_ch, layout)
+    lv = dm_levels(cfg)
+    g = {k: 10 ** (lv[k] / 20) for k in ("c", "f", "s", "b")}
+    lfe = 10 ** (LFE_DB / 20) if lv["lfe"] else 0.0
+    side = any(n in ("SL", "SR") for n in names)
+    back_is_rear = side and any(n in ("BL", "BR") for n in names)     # 7.1: SL / SR the sides, BL / BR the back
+    left, right = [], []
+    for n in names:
+        if n in ("FL", "FLC"):
+            left.append((n, g["f"]))
+        elif n in ("FR", "FRC"):
+            right.append((n, g["f"]))
+        elif n == "FC":                                   # the levels are those of each side (−3 dB: ITU)
+            left.append((n, g["c"]))
+            right.append((n, g["c"]))
+        elif n in ("LFE", "LFE2") and lfe:
+            left.append((n, lfe * 0.7071))
+            right.append((n, lfe * 0.7071))
+        elif n in ("SL", "BL", "TBL"):
+            left.append((n, g["b"] if (n == "BL" and back_is_rear) or n == "TBL" else g["s"]))
+        elif n in ("SR", "BR", "TBR"):
+            right.append((n, g["b"] if (n == "BR" and back_is_rear) or n == "TBR" else g["s"]))
+        elif n == "BC":
+            left.append((n, g["b"] * 0.7071))
+            right.append((n, g["b"] * 0.7071))
+        elif n in ("TFL",):
+            left.append((n, g["f"] * 0.7071))
+        elif n in ("TFR",):
+            right.append((n, g["f"] * 0.7071))
+    worst = max(sum(x for _n, x in left), sum(x for _n, x in right), 1e-9)
+    k = min(1.0, 1.0 / worst)
+    return [(n, x * k) for n, x in left], [(n, x * k) for n, x in right], k
+
+
+def downmix_on(cfg: dict, src_ch: int, out_ch: int) -> bool:
+    return out_ch == 2 and (src_ch or 2) > 2 and downmix_mode(cfg) != "normal"
+
+
+def downmix_filters(cfg: dict, src_ch: int, layout: str) -> list[str]:
+    """The matrix as filters (before the volume and the normalisation): Dolby Pro Logic II through swresample's
+    matrix encoding, «Louder dialogue» / «Custom» as a pan of the source's own channels."""
+    mode = downmix_mode(cfg)
+    if mode == "dplii":
+        return ["aresample=matrix_encoding=dplii:ochl=stereo"]
+    left, right, _k = downmix_matrix(cfg, src_ch, layout)
+    if not left or not right:
+        return []
+    def side(ch):
+        return "+".join(f"{x:.5f}*{n}" for n, x in ch if x > 0)
+    return [f"pan=stereo|FL={side(left)}|FR={side(right)}"]
+
+
+def downmix_text(cfg: dict, src_ch: int, layout: str) -> str:
+    """For the log: «Dolby Pro Logic II» / «louder dialogue: C 0 dB, F 0 dB, S -6 dB … (× 0.414, no clipping)»."""
+    mode = downmix_mode(cfg)
+    if mode == "normal":
+        return "normal (FFmpeg: C -3 dB, surround -3 dB, LFE off, normalized)"
+    if mode == "dplii":
+        return "Dolby Pro Logic II (matrix encoded, normalized)"
+    lv = dm_levels(cfg)
+    _l, _r, k = downmix_matrix(cfg, src_ch, layout)
+    name = "louder dialogue" if mode == "dialog" else "custom"
+    return (f"{name}: C {lv['c']:g} dB, F {lv['f']:g} dB, S {lv['s']:g} dB, B {lv['b']:g} dB, "
+            f"LFE {'on' if lv['lfe'] else 'off'} (x {k:.3f}, no clipping)")
 
 
 SAMPLE_FMT = {"flac": {16: "s16", 24: "s32", 32: "s32"}, "alac": {16: "s16p", 24: "s32p", 32: "s32p"}}

@@ -300,6 +300,7 @@ class MainUI:
         from . import APP_TITLE, updater
         m = mb.addMenu(APP_TITLE)
         A(m, "fa6s.gear", t("settings") + "…", self.settings_dialog, "Ctrl+,")
+        A(m, "fa6s.eye", t("wf_title") + "…", self.watch_dialog)
         A(m, "fa6s.microchip", t("encoders_here") + "…", self.encoders_dialog)
         if updater.can_self_update():
             A(m, "fa6s.cloud-arrow-down", t("upd_check_now"), lambda: self.check_updates(True))
@@ -830,6 +831,18 @@ class MainUI:
         for key in F.LAYOUTS:
             self.a_ch.addItem(t("ch_" + key.replace(".", "")), key)
         self.a_ch.currentIndexChanged.connect(lambda: self._set("audio", "channels", self.a_ch.currentData()))
+        self.a_dm = QComboBox()                                  # 2.0: the 5.1 / 7.1 → 2.0 matrix
+        self.a_dm.setObjectName("audioDownmix")
+        for key in F.DOWNMIX:
+            self.a_dm.addItem(t("dm_" + key), key)
+        self.a_dm.setToolTip(t("dm_tip"))
+        self.a_dm.currentIndexChanged.connect(lambda: self._set("audio", "downmix", self.a_dm.currentData()))
+        self.a_dm_gear = ctl_button("fa6s.sliders", t("dm_title"), 13, lambda _c=False: self.downmix_dialog(None))
+        chrow = QHBoxLayout()
+        chrow.setSpacing(4)
+        chrow.addWidget(self.a_ch, 1)
+        chrow.addWidget(self.a_dm, 1)
+        chrow.addWidget(self.a_dm_gear)
         self.a_norm = QCheckBox(t("normalize"))
         self.a_norm.toggled.connect(lambda on: self._set("audio", "normalize", bool(on)))
         self.a_gain = _gain_box()
@@ -842,7 +855,7 @@ class MainUI:
         vol.addWidget(self.a_gain)
         vol.addWidget(self.a_norm, 1)
         for r, (name, wdg) in enumerate(((t("codec"), self.a_codec), (t("bitrate"), self.a_kbps),
-                                         (t("channels"), self.a_ch), (t("volume"), vol), (t("a_rate"), self.a_rate),
+                                         (t("channels"), chrow), (t("volume"), vol), (t("a_rate"), self.a_rate),
                                          (t("a_abits"), self.a_abits))):
             if isinstance(wdg, QHBoxLayout):
                 ag.addWidget(QLabel(name), r, 0)
@@ -964,6 +977,8 @@ class MainUI:
         pl = J.plan(j)
         out_audio = {s.index: c for s, c in pl["audio"]}
         out_subs = {s.index: how for s, how in pl["subs"]}
+        from . import hardsub as HS
+        burn = HS.choice(j)                                       # 2.0: the track burnt into the picture
         c = E.container(j.settings.get("container", "mkv"))
         for s in j.info.of("audio") + j.info.of("subtitle"):
             audio = s.kind == "audio"
@@ -973,7 +988,7 @@ class MainUI:
             cb.setEnabled(ed)
             cb.setToolTip(t("tr_keep_tip"))
             cb.toggled.connect(lambda on, idx=s.index: self._track_keep(idx, on))
-            is_open = self._fold_open(j, s.index, keep)
+            is_open = self._fold_open(j, s.index, keep or (burn is not None and burn.key() == ("src", s.index)))
             lang = QComboBox()
             lang.setObjectName("trackLang")
             from .edit_tabs import LANGS
@@ -1002,6 +1017,20 @@ class MainUI:
                     ch.addItem(t("ch_" + key.replace(".", "")), key)
                 ch.setCurrentIndex(max(0, ch.findData(tr.get("channels", ""))))
                 ch.currentIndexChanged.connect(lambda _i, b=ch, idx=s.index: self._track_opt(idx, "channels", b.currentData()))
+                acfg = j.acfg(s)                                # 2.0: the 2.0 matrix, when it mixes down to stereo
+                dm = QComboBox()
+                dm.setObjectName("trackDownmix")
+                dm.addItem(t("tr_default") + f" ({t('dm_' + F.downmix_mode(j.settings.get('audio', {})))})", "")
+                for key in F.DOWNMIX:
+                    dm.addItem(t("dm_" + key), key)
+                dm.setCurrentIndex(max(0, dm.findData(tr.get("downmix", ""))))
+                dm.setToolTip(t("dm_tip"))
+                dm.currentIndexChanged.connect(lambda _i, b=dm, idx=s.index: self._track_opt(idx, "downmix", b.currentData()))
+                dmg = ctl_button("fa6s.sliders", t("dm_title"), 13, lambda _c=False, idx=s.index: self.downmix_dialog(idx))
+                dmg.setObjectName("ctl")
+                stereo = F.layout_channels(acfg.get("channels", "keep"), s.channels, 8) == 2 and (s.channels or 2) > 2
+                dm.setVisible(stereo)
+                dmg.setVisible(stereo and F.downmix_mode(acfg) == "custom")
                 vol = QCheckBox(t("normalize"))
                 vol.setTristate(False)
                 vol.setChecked(bool(j.acfg(s).get("normalize")))
@@ -1045,7 +1074,12 @@ class MainUI:
                 ab.setCurrentIndex(max(0, ab.findData(int(tr.get("abits", 0) or 0))))
                 ab.currentIndexChanged.connect(lambda _i, b=ab, idx=s.index: self._track_opt(idx, "abits", b.currentData()))
                 g.addWidget(QLabel(t("channels")), 0, 0)
-                g.addWidget(ch, 0, 1)
+                crow = QHBoxLayout()
+                crow.setSpacing(4)
+                crow.addWidget(ch, 1)
+                crow.addWidget(dm, 1)
+                crow.addWidget(dmg)
+                g.addLayout(crow, 0, 1)
                 g.addWidget(QLabel(t("volume")), 1, 0)
                 vrow = QHBoxLayout()
                 vrow.addWidget(gn)
@@ -1063,19 +1097,56 @@ class MainUI:
                 row.addWidget(codec, 2)
                 row.addWidget(kb, 1)
                 g.addLayout(row, 4, 1)
-                for wdg in (ch, vol, codec, kb, dl, gn, rt, ab):
+                for wdg in (ch, vol, codec, kb, dl, gn, rt, ab, dm, dmg):
                     wdg.setEnabled(ed and keep)
             else:
                 how = out_subs.get(s.index)
-                text = t("sub_drop") if not keep else (t("a_copy") if how == "copy" else how.replace("mov_text", "MP4 Text")
-                                                       .replace("webvtt", "WebVTT"))
+                mine = burn is not None and burn.key() == ("src", s.index)
+                burnt = mine and not HS.why_not(j, burn)
+                text = t("hs_burnt") if burnt else t("sub_drop") if not keep else (
+                    t("a_copy") if how == "copy" else how.replace("mov_text", "MP4 Text").replace("webvtt", "WebVTT"))
                 g.addWidget(QLabel(t("codec") + ":"), 0, 0)
                 g.addWidget(QLabel(text), 0, 1)
+                self._burn_row(g, 1, j, s, ("src", s.index), burn if mine else None, ed)
+                if burnt:
+                    cb.setEnabled(False)
             g.setColumnStretch(1, 1)
             body.setProperty("stream", s.index)
             self.tracks_lay.addWidget(body)
             self._fold_body(j, s.index, body, is_open)
         self._compact(self.tracks_box, 8)
+
+    def _burn_row(self, g: QGridLayout, row: int, j, s, key: tuple, b, ed: bool):
+        """2.0: «Burn in: no / into the picture / the forced ones only» of a subtitle track, ⚙ = how text looks."""
+        from . import hardsub as HS
+        box = QComboBox()
+        box.setObjectName("trackBurn")
+        box.addItem(t("hs_no"), "")
+        box.addItem(t("hs_all"), "all")
+        if HS.can_forced(s):
+            box.addItem(t("hs_forced"), "forced")
+        box.setCurrentIndex(max(0, box.findData(b.mode if b is not None else "")))
+        why = HS.why_not(j, HS.Burn(s, None if key[0] == "src" else key[1], "all"))
+        box.setEnabled(ed and (not why or b is not None))
+        box.setToolTip(t("hs_tip") if not why else t(why))
+        box.currentIndexChanged.connect(lambda _i, bx=box, k=key: self._track_burn(k, bx.currentData()))
+        gear = ctl_button("fa6s.sliders", t("hs_look"), 13, lambda _c=False: self.hardsub_dialog())
+        row_l = QHBoxLayout()
+        row_l.setSpacing(4)
+        row_l.addWidget(box, 1)
+        row_l.addWidget(gear)
+        g.addWidget(QLabel(t("hs_burn") + ":"), row, 0)
+        g.addLayout(row_l, row, 1)
+        note = ""
+        if b is not None and b.auto:
+            note = t("hs_auto_note")
+        elif b is not None and why:
+            note = t(why)
+        elif b is not None and b.text and not b.ass:
+            h = HS.hset(j.settings)
+            note = t("hs_text_note", h["font"], h["size"])
+        if note:
+            g.addWidget(_hint(note), row + 1, 1)
 
     def _fill_ext(self, j, ed: bool):
         """1.4: the external tracks of the task: language, delay, codec; ✕ takes one away."""
@@ -1110,6 +1181,8 @@ class MainUI:
                 text += " …"
             elif bad:
                 text += " — " + t("ext_bad")
+            elif e.get("kind") == "subtitle" and e.get("burn") and n not in used:
+                text += " — " + t("hs_burnt")
             elif n not in used:
                 text += " — " + t("sub_drop")
             key = "ext:" + e["path"]
@@ -1170,6 +1243,12 @@ class MainUI:
             dft.setEnabled(ed)
             dft.toggled.connect(lambda on, k=n: self._ext_opt(k, "default", bool(on)))
             g.addWidget(dft, 2, 1)
+            if not audio and info is not None and not bad:          # 2.0: an outside subtitle burnt in
+                from . import hardsub as HS
+                b = HS.choice(j)
+                st0 = next((x for k2, x in J.ext_streams(j) if k2 == n), None)
+                if st0 is not None:
+                    self._burn_row(g, 3, j, st0, ("ext", n), b if b is not None and b.key() == ("ext", n) else None, ed)
             g.setColumnStretch(1, 1)
             self.ext_lay.addWidget(body)
             self._fold_body(j, key, body, is_open)

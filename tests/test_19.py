@@ -630,13 +630,3 @@ def test_two_pass_flags_only_for_video(media, tmp_path):
 
 
 # ── 5. the version ────────────────────────────────────────────
-def test_version_190():
-    from convert import VERSION
-    root = os.path.dirname(HERE)
-    assert VERSION == "1.9.0"
-    assert '#define AppVersion   "1.9.0"' in open(os.path.join(root, "setup.iss"), encoding="utf-8-sig").read() or \
-        '"1.9.0"' in open(os.path.join(root, "setup.iss"), encoding="utf-8-sig").read()
-    vi = open(os.path.join(root, "version_info.txt"), encoding="utf-8").read()
-    assert "(1, 9, 0, 0)" in vi and "1.9.0" in vi
-    readme = open(os.path.join(root, "README.md"), encoding="utf-8").read()
-    assert "1.9" in readme and "XviD4PSP" not in readme

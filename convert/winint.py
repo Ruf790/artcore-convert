@@ -203,3 +203,130 @@ class TaskbarProgress:
                               [ctypes.c_void_p, ctypes.c_ulonglong, ctypes.c_ulonglong]) == 0
         except Exception:
             return False
+
+
+def file_busy(path: str) -> bool:
+    """2.0: another program has the file open (a copy or a download still writing it): opening it with no sharing
+    fails with ERROR_SHARING_VIOLATION (Windows). Elsewhere: False (the size / time check decides)."""
+    if not IS_WIN:
+        return False
+    import ctypes
+    from ctypes import wintypes
+    k32 = ctypes.windll.kernel32
+    k32.CreateFileW.restype = wintypes.HANDLE
+    k32.CreateFileW.argtypes = [wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD,
+                                wintypes.DWORD, wintypes.HANDLE]
+    h = k32.CreateFileW(path, 0x80000000, 0, None, 3, 0x80, None)       # GENERIC_READ, no sharing, OPEN_EXISTING
+    if h == wintypes.HANDLE(-1).value or h is None:
+        return ctypes.GetLastError() in (32, 33)                          # sharing / lock violation
+    k32.CloseHandle(h)
+    return False
+
+
+# ── 2.0: «Convert with ArtCore Convert» in Explorer's menu (HKCU: no administrator rights) ─────────────────
+SHELL_KEY = "ArtCoreConvert.Convert"                  # the verb under each file type and Directory
+SHELL_MENU = "ArtCoreConvert.Menu"                    # the shared submenu (ExtendedSubCommandsKey)
+OLD_KEYS = (r"Software\Classes\SystemFileAssociations\video\shell\ArtCoreConvert",
+            r"Software\Classes\SystemFileAssociations\audio\shell\ArtCoreConvert",
+            r"Software\Classes\Directory\shell\ArtCoreConvert")          # 1.x installer's own (one item, no presets)
+
+
+def shell_command(exe_args: list[str], preset: str = "") -> str:
+    """The command line of a submenu item: the program, --ctx [--preset KEY], the file."""
+    cmd = " ".join(f'"{a}"' for a in exe_args) + " --ctx"
+    if preset:
+        cmd += f' --preset "{preset}"'
+    return cmd + ' "%1"'
+
+
+def shell_entries(items: list[tuple[str, str]], title: str, exe_args: list[str], icon: str, exts) -> dict:
+    """What the menu writes: {key path under HKCU: {value name: value}} — the verb for every video type and for
+    folders, pointing to one submenu with an item per preset (items: [(preset key, label)], "" = the default)."""
+    out: dict[str, dict] = {}
+    menu = rf"Software\Classes\{SHELL_MENU}"
+    out[menu] = {}
+    out[menu + r"\shell"] = {}
+    for i, (key, label) in enumerate(items):
+        k = rf"{menu}\shell\p{i:02d}"
+        out[k] = {"MUIVerb": label, "MultiSelectModel": "Player"}
+        if i == 0:
+            out[k]["Icon"] = icon
+        if i == 1:
+            out[k]["CommandFlags"] = 0x20                  # a line above the first preset
+        out[k + r"\command"] = {"": shell_command(exe_args, key)}
+    verb = {"MUIVerb": title, "Icon": icon, "ExtendedSubCommandsKey": SHELL_MENU, "MultiSelectModel": "Player"}
+    for ext in exts:
+        out[rf"Software\Classes\SystemFileAssociations\{ext}\shell\{SHELL_KEY}"] = dict(verb)
+    out[rf"Software\Classes\Directory\shell\{SHELL_KEY}"] = dict(verb)
+    return out
+
+
+def shell_menu(on: bool, entries: dict | None = None) -> str:
+    """Write (on) or remove the Explorer menu in HKCU. Returns "" or the error. Elsewhere: a no-op."""
+    if not IS_WIN:
+        return ""
+    import winreg
+
+    def drop(path: str):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_ALL_ACCESS) as k:
+                while True:
+                    try:
+                        sub = winreg.EnumKey(k, 0)
+                    except OSError:
+                        break
+                    drop(path + "\\" + sub)
+            winreg.DeleteKey(winreg.HKEY_CURRENT_USER, path)
+        except OSError:
+            pass
+    try:
+        drop(rf"Software\Classes\{SHELL_MENU}")
+        drop(rf"Software\Classes\Directory\shell\{SHELL_KEY}")
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, r"Software\Classes\SystemFileAssociations") as k:
+                i = 0
+                names = []
+                while True:
+                    try:
+                        names.append(winreg.EnumKey(k, i))
+                        i += 1
+                    except OSError:
+                        break
+            for name in names:
+                drop(rf"Software\Classes\SystemFileAssociations\{name}\shell\{SHELL_KEY}")
+        except OSError:
+            pass
+        if on:
+            for old in OLD_KEYS:                          # the 1.x item would stand beside the new menu
+                drop(old)
+            for path, values in (entries or {}).items():
+                with winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, path, 0, winreg.KEY_WRITE) as k:
+                    for name, val in values.items():
+                        if isinstance(val, int):
+                            winreg.SetValueEx(k, name, 0, winreg.REG_DWORD, val)
+                        else:
+                            winreg.SetValueEx(k, name, 0, winreg.REG_SZ, str(val))
+        _notify_shell()
+        return ""
+    except OSError as e:
+        return str(e)
+
+
+def shell_menu_on() -> bool:
+    if not IS_WIN:
+        return False
+    import winreg
+    try:
+        with winreg.OpenKey(winreg.HKEY_CURRENT_USER, rf"Software\Classes\Directory\shell\{SHELL_KEY}"):
+            return True
+    except OSError:
+        return False
+
+
+def _notify_shell() -> None:
+    try:
+        import ctypes
+        ctypes.windll.shell32.SHChangeNotify(0x08000000, 0, None, None)      # SHCNE_ASSOCCHANGED
+    except Exception:
+        pass
+

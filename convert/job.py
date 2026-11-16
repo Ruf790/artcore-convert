@@ -19,7 +19,9 @@ thrown out instead of kept); Job.meta — {"tags": {key: value} | None, "streams
 forced}}}; Job.chapters — None = as in the source, otherwise [[start, title], …] of the result.
 1.4: video.passes 1 | 2 (two passes for bit rate / size), split {mode: off | size | time, size_mb, minutes};
 Job.joins — more files joined after src into one result (the trim pieces then lie on the joined timeline);
-Job.ext — external tracks [{path, kind: audio | subtitle, delay (ms), lang, title, codec, kbps, default}]."""
+Job.ext — external tracks [{path, kind: audio | subtitle, delay (ms), lang, title, codec, kbps, default}].
+2.0: a subtitle track burnt into the picture: Job.tracks[index]["burn"] / Job.ext[n]["burn"] = all | forced
+(hardsub.py); settings["hardsub"] — the look of text subtitles; audio "downmix" — the 5.1 / 7.1 → 2.0 matrix."""
 from __future__ import annotations
 
 import copy
@@ -34,6 +36,7 @@ from . import advanced as ADV
 from . import encoders as E
 from . import filters as F
 from . import formats as FM
+from . import hardsub as HS
 from .probe import MediaInfo, Stream
 
 DEFAULT_SETTINGS = {
@@ -50,6 +53,7 @@ DEFAULT_SETTINGS = {
     "fmt": {},           # 1.5: the preset of the format (formats.py; {} = the plain container)
     "mux": dict(FM.MUX_DEFAULT),     # 1.5: the container options (Format options)
     "venc": {},          # 1.5: the advanced settings of every encoder {encoder id: {…}} (advanced.py)
+    "hardsub": dict(HS.HS_DEFAULT),  # 2.0: how burnt-in text subtitles look; auto = burn the forced ones by itself
 }
 
 PRESETS = {      # built-in; quality 0 = the encoder's own default
@@ -163,6 +167,8 @@ class Job:
     metrics: dict = field(default_factory=dict)     # 1.4: {"psnr": dB, "ssim": 0..1, "vmaf": 0..100}
     parts: list = field(default_factory=list)       # 1.4: the files of a split result
     infos: dict = field(default_factory=dict, repr=False)   # path → MediaInfo of joined / external files
+    out_dir: str = ""                               # 2.0: a watch folder's result folder (the name as usual)
+    origin: str = ""                                # 2.0: "watch" — came from a watch folder
 
     def to_dict(self) -> dict:
         return {"src": self.src, "settings": self.settings, "preset": self.preset, "tracks": self.tracks,
@@ -172,7 +178,8 @@ class Job:
                 "dest": self.dest, "log": self.log_path, "crop_found": self.crop_found,
                 "joins": list(self.joins), "ext": [dict(e) for e in self.ext],
                 "metrics": dict(self.metrics) if self.status == "done" else {},
-                "parts": list(self.parts) if self.status == "done" else []}
+                "parts": list(self.parts) if self.status == "done" else [],
+                "out_dir": self.out_dir, "origin": self.origin}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Job":
@@ -192,6 +199,8 @@ class Job:
         j.ext = [clean_ext(e) for e in (d.get("ext") or []) if isinstance(e, dict) and e.get("path")]
         j.metrics = {k: float(v) for k, v in (d.get("metrics") or {}).items() if isinstance(v, (int, float))}
         j.parts = [str(x) for x in (d.get("parts") or []) if isinstance(x, str)]
+        j.out_dir = str(d.get("out_dir") or "")
+        j.origin = str(d.get("origin") or "")
         j.status = d.get("status", "wait")
         j.out = d.get("out", "")
         j.error = d.get("error", "")
@@ -246,7 +255,7 @@ class Job:
 
 
 EXT_KEYS = {"path": "", "kind": "audio", "delay": 0, "lang": "", "title": "", "codec": "", "kbps": 0,
-            "default": False}
+            "default": False, "burn": ""}         # 2.0: burn: "" | all | forced — an outside subtitle burnt in
 EXT_AUDIO = (".ac3", ".eac3", ".dts", ".aac", ".m4a", ".mka", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".thd",
              ".mp2", ".wv", ".ape")
 EXT_SUBS = (".srt", ".ass", ".ssa", ".sup", ".vtt", ".sub", ".idx", ".mks")
@@ -722,6 +731,14 @@ def plan(job: Job) -> dict:
     if most and len(out["audio"]) > most:
         out["audio"] = out["audio"][:most]
         w.append("w_fmt_audio_n")
+    burn = HS.choice(job)                                          # 2.0: a subtitle track burnt in
+    if burn is not None:
+        why = HS.why_not(job, burn)
+        if why:
+            w.append(why)
+            burn = None
+    out["burn"] = burn
+    burnt = burn.key() if burn is not None else None
     subs = info.of("subtitle")
     if lang:
         subs = [s for s in subs if (s.lang or "").lower() == lang]
@@ -732,6 +749,8 @@ def plan(job: Job) -> dict:
         subs = subs[:1]
     for s in info.of("subtitle"):
         t = job.track(s)
+        if ("src", s.index) == burnt:                              # in the picture, not a track of its own
+            continue
         if not t.get("keep", s in subs):
             continue
         if c.subs == "none":
@@ -748,7 +767,7 @@ def plan(job: Job) -> dict:
         else:
             w.append("w_bitmap_subs")
     for n, s in ext_streams(job):                                  # 1.4: external subtitles
-        if job.ext[n].get("kind") != "subtitle":
+        if job.ext[n].get("kind") != "subtitle" or ("ext", n) == burnt:
             continue
         if c.subs == "none":
             if not c.audio_only:
@@ -796,6 +815,7 @@ def out_bits(job: Job, enc: E.VEnc | None) -> int:
 
 
 OVERLAY = "\x00overlay"          # where the picture is laid on (the chain is cut there into two)
+SUBS = "\x00subs"                # 2.0: where burnt-in subtitles are drawn (after the scale and the frame rate)
 
 
 def video_chain(job: Job, enc: E.VEnc | None = None, transforms: str = "", detect: bool = False) -> list[str]:
@@ -811,6 +831,8 @@ def video_chain(job: Job, enc: E.VEnc | None = None, transforms: str = "", detec
     out += scale_filters(job, enc)
     out += F.pad_filter(job) + F.aspect_filter(job) + F.color_filters(job) + F.sharpen_filter(job)
     out += F.grain_filter(job) + F.fps_filters(job, enc)
+    if HS.active(job) is not None:
+        out.append(SUBS)
     if F.is_on(job, "overlay") and not gif:
         out.append(OVERLAY)
     out += F.colorspace_filter(job, enc, bits)
@@ -820,8 +842,8 @@ def video_chain(job: Job, enc: E.VEnc | None = None, transforms: str = "", detec
 
 
 def video_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
-    """The chain as one -vf (the overlay left out: build_args lays it on in the filter graph)."""
-    return [f for f in video_chain(job, enc) if f != OVERLAY]
+    """The chain as one -vf (the overlay and the burnt-in subtitles left out: build_args puts them in)."""
+    return [f for f in video_chain(job, enc) if f not in (OVERLAY, SUBS)]
 
 
 def needs_vidstab(job: Job) -> bool:
@@ -1213,13 +1235,17 @@ def _layout(s: Stream) -> str:
     return s.layout or f"{s.channels or 2}c"
 
 
-def _concat_graph(job: Job, p: dict, pcs, graph: list[str]) -> tuple[str | None, list[str]]:
+def _concat_graph(job: Job, p: dict, pcs, graph: list[str], canv=None) -> tuple[str | None, list[str]]:
     """The concat filter over the inputs 0 … n-1 (one per piece): every piece made like the first file
     (frame size, pixel aspect, frame rate; sample rate, channels; silence / black where a joined file lacks a
-    track). Returns the video label (or None) and the labels of the source's sound tracks."""
+    track). Returns the video label (or None) and the labels of the source's sound tracks. 2.0: canv — the
+    burnt-in subtitle pictures of every piece ([(input, stream index) | None], canvas size, fps): a second video
+    stream of the concat, [sj]."""
     v0 = p["video"][0] if p["video"] else None
     auds = [s for s, _c in p["audio"] if ext_no(s) is None]
     ins = ""
+    if v0 is None:
+        canv = None
     if v0 is not None:
         W, H, sar0, fps0 = v0.width, v0.height, _sar(v0), v0.fps or 25.0
         vids = [match_stream(job, k, v0) for k, _a, _b in pcs]
@@ -1243,6 +1269,11 @@ def _concat_graph(job: Job, p: dict, pcs, graph: list[str]) -> tuple[str | None,
                     ins += f"[cv{i}]"
                 else:
                     ins += f"[{i}:{sv.index}]"
+            if canv is not None:                                   # 2.0: this piece's subtitle pictures
+                srcs, (cw, chh), fps = canv
+                n_in, sidx, size = srcs[i] if srcs[i] is not None else (None, None, (cw, chh))
+                graph += HS.piece_canvas(i, n_in, sidx, size[0], size[1], fps, b - a, (cw, chh))
+                ins += f"[cs{i}]"
         for n, s in enumerate(auds):
             sa = match_stream(job, k, s)
             rate = s.rate or 48000
@@ -1256,23 +1287,52 @@ def _concat_graph(job: Job, p: dict, pcs, graph: list[str]) -> tuple[str | None,
                 ins += f"[ca{i}_{n}]"
             else:
                 ins += f"[{i}:{sa.index}]"
-    outs = ("[vj]" if v0 is not None else "") + "".join(f"[aj{n}]" for n in range(len(auds)))
-    graph.append(f"{ins}concat=n={len(pcs)}:v={1 if v0 is not None else 0}:a={len(auds)}{outs}")
+    outs = ("[vj]" if v0 is not None else "") + ("[sj]" if canv is not None else "") + \
+        "".join(f"[aj{n}]" for n in range(len(auds)))
+    nv = (1 if v0 is not None else 0) + (1 if canv is not None else 0)
+    graph.append(f"{ins}concat=n={len(pcs)}:v={nv}:a={len(auds)}{outs}")
     return ("[vj]" if v0 is not None else None), [f"[aj{n}]" for n in range(len(auds))]
 
 
-def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, detect: bool) -> list[str]:
-    """The video part of the filter graph: src → the chain (with the overlay laid on) → [vout]."""
+def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, detect: bool, hs=None,
+                 hs_label: str = "", work_dir: str | None = None) -> list[str]:
+    """The video part of the filter graph: src → the chain (the burnt-in subtitles and the overlay laid on where
+    their marks stand) → [vout]."""
     chain = video_chain(job, enc, transforms, detect)
-    if OVERLAY not in chain or ov_in is None:
+    if ov_in is None:
         chain = [f for f in chain if f != OVERLAY]
-        return [f"{src}{','.join(chain) if chain else 'null'}[vout]"]
-    i = chain.index(OVERLAY)
-    pre, post = chain[:i], chain[i + 1:]
-    ov_chain, ov = F.overlay_parts(job, out_size(job, enc)[0])
-    out = [f"{src}{','.join(pre) if pre else 'null'}[vpre]", f"[{ov_in}:v]{ov_chain}[wm]",
-           f"[vpre][wm]{ov}" + ("," + ",".join(post) if post else "") + "[vout]"]
-    return out
+    bits = out_bits(job, enc)
+    nodes, cur, seg, k = [], src, [], 0
+    for f in chain:
+        if f == SUBS:
+            if hs is None or (hs.bitmap and not hs_label):
+                continue
+            if HS.inline(job, enc, bits, hs):                         # text on SDR: on the frames themselves
+                seg += HS.text_filters(job, hs, work_dir=work_dir)
+                continue
+            nodes.append(f"{cur}{','.join(seg) if seg else 'null'}[vs{k}]")
+            seg = []
+            if hs.bitmap:
+                nodes.append(f"{hs_label}{','.join(HS.bitmap_chain(job, enc, bits, hs))}[hsc]")
+            else:                                                     # text on HDR: on a canvas, brought down
+                nodes.append(f"{','.join(HS.text_canvas(job, enc, bits, hs, work_dir))}[hsc]")
+            nodes.append(f"[vs{k}][hsc]{HS.overlay()}[vs{k + 1}]")
+            cur = f"[vs{k + 1}]"
+            k += 2
+        elif f == OVERLAY:
+            nodes.append(f"{cur}{','.join(seg) if seg else 'null'}[vpre]")
+            seg = []
+            ov_chain, ov = F.overlay_parts(job, out_size(job, enc)[0])
+            nodes.append(f"[{ov_in}:v]{ov_chain}[wm]")
+            nodes.append(f"[vpre][wm]{ov}[vov]")
+            cur = "[vov]"
+        else:
+            seg.append(f)
+    if nodes and not seg:
+        nodes[-1] = nodes[-1][:nodes[-1].rindex("[")] + "[vout]"
+    else:
+        nodes.append(f"{cur}{','.join(seg) if seg else 'null'}[vout]")
+    return nodes
 
 
 def ext_delay(job: Job, s: Stream) -> float:
@@ -1366,6 +1426,9 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     transforms = work_file(job, "vidstab", work_dir, "trf") if needs_vidstab(job) else ""
     hw = ["-hwaccel", "auto"] if enc is not None and enc.hw and hw_decode else []
     dec = ["-threads", str(threads)] if threads > 0 else []
+    hs = p.get("burn") if p["video"] and not copy_v and mode != "vidstab" else None     # 2.0: burnt-in subtitles
+    if hs is not None and hs.forced and hs.ext is None:
+        dec = dec + ["-forced_subs_only:s", "1"]                    # Blu-ray / DVD: only the forced pictures
     # 1.6: verbose — the read / decoded / encoded / muxed counts of every stream for the log
     args = [ffmpeg, "-hide_banner", "-nostdin", "-y", "-loglevel", "verbose", "-nostats", "-progress", "pipe:1"]
     if threads > 0:
@@ -1396,6 +1459,38 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         args += ["-i", F.fset(st, "overlay")["path"]]
         ov_in = n_in
         n_in += 1
+    hs_label, canv = "", None                                     # 2.0: where the subtitle pictures come from
+    if hs is not None and hs.bitmap:
+        size0 = HS.canvas_size(job, hs)
+        fps0 = (p["video"][0].fps or 25.0) if p["video"] else 25.0
+        if hs.ext is not None:
+            path = job.ext[hs.ext]["path"]
+            forced = ["-forced_subs_only:s", "1"] if hs.forced else []
+            if joined:                                            # the outside file read once per piece
+                srcs = []
+                for (p_at, a_us, l_us) in HS.time_map(job, hs):
+                    a = a_us / 1e6
+                    seek = ["-ss", f"{a:.3f}"] if a >= 0 else ["-itsoffset", f"{-a:.3f}"]
+                    args += forced + seek + ["-t", f"{l_us / 1e6:.3f}", "-i", path]
+                    srcs.append((n_in, hs.stream.index, size0))
+                    n_in += 1
+                canv = (srcs, size0, fps0)
+            else:
+                args += forced + _ext_input(job, hs.stream, segs)
+                hs_label = f"[{n_in}:{hs.stream.index}]"
+                n_in += 1
+        elif joined:
+            srcs = []
+            for i, (k, _a, _b) in enumerate(pcs):
+                sk = match_stream(job, k, hs.stream)
+                srcs.append((i, sk.index, (sk.width or files[k][1].video.width, sk.height or files[k][1].video.height))
+                            if sk is not None and files[k][1] is not None and files[k][1].video is not None else None)
+            canv = (srcs, size0, fps0)
+        else:
+            sk = match_stream(job, base, hs.stream)
+            hs_label = f"[0:{sk.index}]" if sk is not None else ""
+        if canv is not None:
+            hs_label = "[sj]"
     ext_in: dict[int, int] = {}                                   # 1.4: external track → its input
     for s, _how in p["audio"] + p["subs"]:
         if ext_no(s) is not None:
@@ -1424,10 +1519,11 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     graph: list[str] = []
     a_labels: list[str] = []
     want_preview = bool(preview) and enc is not None and enc.id != "gif" and mode in ("main", "pass1")
-    in_graph = joined or ov_in is not None or want_preview or mode == "metrics"
+    in_graph = joined or ov_in is not None or want_preview or mode == "metrics" or \
+        (hs is not None and not HS.inline(job, enc, out_bits(job, enc), hs))
     vsrc = vmap = ""
     if joined:
-        vlab, a_labels = _concat_graph(job, p, pcs, graph)
+        vlab, a_labels = _concat_graph(job, p, pcs, graph, canv)
         vsrc = vlab or ""
     elif p["video"]:
         sv = match_stream(job, base, p["video"][0]) or p["video"][0]
@@ -1438,10 +1534,15 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
             args += ["-map", vmap, "-c:v", "copy"]
         else:
             if in_graph:
-                graph += _graph_video(job, enc, vsrc, ov_in, transforms, mode == "vidstab")
+                graph += _graph_video(job, enc, vsrc, ov_in, transforms, mode == "vidstab", hs, hs_label, work_dir)
                 vmap = "[vout]"
             else:
-                vf = video_chain(job, enc, transforms, mode == "vidstab")
+                vf = []
+                for f in video_chain(job, enc, transforms, mode == "vidstab"):
+                    if f == SUBS:                                    # 2.0: text on SDR, drawn on the frames
+                        vf += HS.text_filters(job, hs, work_dir=work_dir) if hs is not None else []
+                    elif f != OVERLAY:
+                        vf.append(f)
                 if vf:
                     args += ["-vf", ",".join(vf)]
             if want_preview:                                      # the frame on the Status tab
@@ -1548,7 +1649,9 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
     # audio
     for n, (s, codec) in enumerate(p["audio"]):
         a_cfg = job.acfg(s)
-        af = F.audio_filters(a_cfg, codec, s.rate) if codec != "copy" else []
+        och = F.layout_channels(a_cfg.get("channels", "keep"), s.channels, E.A_BY_ID[codec].max_ch) \
+            if codec != "copy" else s.channels
+        af = F.audio_filters(a_cfg, codec, s.rate, s.channels, s.layout, och) if codec != "copy" else []
         en = ext_no(s)
         if en is not None and segs:
             args += ["-map", _ext_audio_graph(job, s, ext_in[en], segs, n, af, graph)]
@@ -1792,6 +1895,8 @@ def out_name(job: Job, cfg: dict, taken=()) -> str:
             return path
     stem = os.path.splitext(os.path.basename(job.src))[0]
     folder = cfg.get("out_dir") if cfg.get("out_mode") == "folder" and cfg.get("out_dir") else os.path.dirname(job.src)
+    if job.out_dir:                                      # 2.0: the result folder of a watch folder
+        folder = job.out_dir
     tpl = (cfg.get("name_template") or "").strip()
     if tpl:                                              # 1.8: «{title} ({year}) {res} {vcodec}», folders by «/»
         base = os.path.join(folder, *render_name(tpl, job).split("/"))

@@ -123,9 +123,51 @@ class SettingsDialog(QDialog):
                 hint.setContentsMargins(24, 0, 0, 0)
                 v.addWidget(hint)
             lay.addWidget(box)
+        # 2.0: Explorer's menu, the tray, the watch folders
+        from . import winint
+        box = QGroupBox(t("grp_windows"))
+        v = QVBoxLayout(box)
+        self.shell = QCheckBox(t("opt_shell_menu"))
+        self.shell.setChecked(bool(cfg.get("shell_menu")))
+        self.shell.setToolTip(t("opt_shell_menu_tip"))
+        self.shell.setEnabled(winint.IS_WIN)
+        v.addWidget(self.shell)
+        self.ctx_start = QCheckBox(t("opt_ctx_start"))
+        self.ctx_start.setChecked(bool(cfg.get("ctx_start")))
+        self.ctx_start.setContentsMargins(24, 0, 0, 0)
+        self.ctx_start.setStyleSheet("margin-left: 24px;")
+        v.addWidget(self.ctx_start)
+        self.tray = QCheckBox(t("opt_tray"))
+        self.tray.setChecked(bool(cfg.get("tray")))
+        v.addWidget(self.tray)
+        row = QHBoxLayout()
+        self.b_watch = QPushButton(t("wf_title") + "…")
+        self.b_watch.setObjectName("watchButton")
+        self.b_watch.clicked.connect(lambda _c=False: self._watch())
+        row.addWidget(self.b_watch)
+        self.watch_state = QLabel("")
+        self.watch_state.setObjectName("hint")
+        row.addWidget(self.watch_state, 1)
+        v.addLayout(row)
+        self._watch_text()
+        if not winint.IS_WIN:
+            v.addWidget(_hint(t("opt_shell_menu_win")))
+        lay.addWidget(box)
         from . import config
         lay.addWidget(_hint(t("data_in", config.data_dir())))
         lay.addWidget(_buttons(self))
+
+    def _watch_text(self):
+        from . import watch
+        w = watch.settings(self.cfg)
+        n = sum(1 for f in w["folders"] if f["on"])
+        self.watch_state.setText(t("wf_state", n) if w["on"] and n else t("wf_state_off"))
+
+    def _watch(self):
+        p = self.parent()
+        if p is not None and hasattr(p, "watch_dialog"):
+            p.watch_dialog()
+        self._watch_text()
 
     def accept(self):
         self.cfg["language"] = self.lang.currentData()
@@ -139,6 +181,178 @@ class SettingsDialog(QDialog):
             self.cfg[k] = cb.isChecked()
         self.cfg["chunks"] = {"on": self.ch_on.isChecked(), "workers": self.ch_workers.value(),
                               "minutes": round(self.ch_min.value(), 1)}
+        self.cfg["shell_menu"] = self.shell.isChecked()
+        self.cfg["ctx_start"] = self.ctx_start.isChecked()
+        self.cfg["tray"] = self.tray.isChecked()
+        super().accept()
+
+
+class WatchDialog(QDialog):
+    """2.0: Settings → Watch folders: a row per folder (on, the folder, its preset, where the results go, with the
+    folders under it); new complete video files are queued and encoded while the program is open."""
+
+    def __init__(self, cfg: dict, presets: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        from . import watch
+        self.cfg = cfg
+        self.presets = presets
+        self.setWindowTitle(t("wf_title") + " — " + APP_TITLE)
+        self.setMinimumWidth(760)
+        w = watch.settings(cfg)
+        self.folders = [dict(f) for f in w["folders"]]
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(22, 18, 22, 16)
+        lay.addWidget(_head(t("wf_title")))
+        lay.addWidget(_hint(t("wf_hint")))
+        self.on = QCheckBox(t("wf_on"))
+        self.on.setChecked(w["on"])
+        lay.addWidget(self.on)
+        self.tree = QTreeWidget()
+        self.tree.setObjectName("watchTree")
+        self.tree.setRootIsDecorated(False)
+        self.tree.setHeaderLabels([t("wf_col_on"), t("wf_col_folder"), t("wf_col_preset"), t("wf_col_out"),
+                                   t("wf_col_sub")])
+        self.tree.header().setSectionResizeMode(1, QHeaderView.Stretch)
+        self.tree.itemDoubleClicked.connect(lambda _it, _c: self.edit())
+        self.tree.itemChanged.connect(self._ticked)
+        lay.addWidget(self.tree, 1)
+        row = QHBoxLayout()
+        for key, slot in (("wf_add", self.add), ("wf_edit", self.edit), ("wf_remove", self.remove)):
+            b = QPushButton(t(key))
+            b.setObjectName(key)
+            b.clicked.connect(lambda _c=False, f=slot: f())
+            row.addWidget(b)
+        row.addStretch(1)
+        row.addWidget(QLabel(t("wf_stable")))
+        from PySide6.QtWidgets import QSpinBox
+        self.stable = QSpinBox()
+        self.stable.setRange(2, 600)
+        self.stable.setSuffix(" " + t("sec_short"))
+        self.stable.setValue(w["stable"])
+        self.stable.setToolTip(t("wf_stable_tip"))
+        row.addWidget(self.stable)
+        lay.addLayout(row)
+        lay.addWidget(_buttons(self))
+        self._fill()
+
+    def _preset_label(self, key: str) -> str:
+        if not key:
+            return t("wf_preset_default")
+        return next((lab for k, lab in self.presets if k == key), key)
+
+    def _fill(self):
+        self.tree.blockSignals(True)
+        self.tree.clear()
+        for f in self.folders:
+            it = QTreeWidgetItem(["", f["path"], self._preset_label(f["preset"]), f["out"] or t("wf_out_beside"),
+                                  t("yes") if f["sub"] else t("no")])
+            it.setFlags(it.flags() | Qt.ItemIsUserCheckable)
+            it.setCheckState(0, Qt.Checked if f["on"] else Qt.Unchecked)
+            self.tree.addTopLevelItem(it)
+        for c in (0, 2, 3, 4):
+            self.tree.resizeColumnToContents(c)
+        self.tree.blockSignals(False)
+
+    def _ticked(self, it, col):
+        i = self.tree.indexOfTopLevelItem(it)
+        if col == 0 and 0 <= i < len(self.folders):
+            self.folders[i]["on"] = it.checkState(0) == Qt.Checked
+
+    def add(self, folder: dict | None = None) -> bool:
+        from . import watch
+        f = FolderDialog(folder or dict(watch.FOLDER_KEYS), self.presets, self)
+        self._sub = f
+        if folder is not None or f.exec():
+            self.folders.append(watch.clean_folder(f.value()))
+            self._fill()
+            return True
+        return False
+
+    def edit(self):
+        i = self.tree.indexOfTopLevelItem(self.tree.currentItem()) if self.tree.currentItem() else -1
+        if not 0 <= i < len(self.folders):
+            return
+        from . import watch
+        f = FolderDialog(self.folders[i], self.presets, self)
+        self._sub = f
+        if f.exec():
+            self.folders[i] = watch.clean_folder(f.value())
+            self._fill()
+
+    def remove(self):
+        i = self.tree.indexOfTopLevelItem(self.tree.currentItem()) if self.tree.currentItem() else -1
+        if 0 <= i < len(self.folders):
+            self.folders.pop(i)
+            self._fill()
+
+    def accept(self):
+        self.cfg["watch"] = {"on": self.on.isChecked(), "stable": self.stable.value(), "folders": list(self.folders)}
+        super().accept()
+
+
+class FolderDialog(QDialog):
+    """One watch folder: the folder, its preset, the result folder (empty = beside the source), with subfolders."""
+
+    def __init__(self, folder: dict, presets: list[tuple[str, str]], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(t("wf_folder"))
+        self.setMinimumWidth(620)
+        self.f = dict(folder)
+        lay = QVBoxLayout(self)
+        form = QFormLayout()
+
+        def picker(edit: QLineEdit, title: str):
+            row = QHBoxLayout()
+            row.addWidget(edit, 1)
+            b = QPushButton("…")
+            b.setFixedWidth(34)
+
+            def pick(_c=False):
+                from PySide6.QtWidgets import QFileDialog
+                d = QFileDialog.getExistingDirectory(self, title, edit.text())
+                if d:
+                    edit.setText(os.path.normpath(d))
+            b.clicked.connect(pick)
+            row.addWidget(b)
+            return row
+        self.path = QLineEdit(self.f.get("path", ""))
+        self.path.setObjectName("wfPath")
+        form.addRow(t("wf_col_folder"), picker(self.path, t("wf_col_folder")))
+        self.preset = QComboBox()
+        self.preset.setObjectName("wfPreset")
+        self.preset.addItem(t("wf_preset_default"), "")
+        for key, label in presets:
+            if key.startswith("#"):
+                self.preset.addItem(label, None)
+                self.preset.model().item(self.preset.count() - 1).setEnabled(False)
+            else:
+                self.preset.addItem("   " + label, key)
+        self.preset.setMaxVisibleItems(30)
+        self.preset.setCurrentIndex(max(0, self.preset.findData(self.f.get("preset", ""))))
+        form.addRow(t("wf_col_preset"), self.preset)
+        self.out = QLineEdit(self.f.get("out", ""))
+        self.out.setObjectName("wfOut")
+        self.out.setPlaceholderText(t("wf_out_beside"))
+        form.addRow(t("wf_col_out"), picker(self.out, t("wf_col_out")))
+        self.sub = QCheckBox(t("wf_sub"))
+        self.sub.setChecked(bool(self.f.get("sub", True)))
+        form.addRow("", self.sub)
+        self.on = QCheckBox(t("wf_col_on"))
+        self.on.setChecked(bool(self.f.get("on", True)))
+        form.addRow("", self.on)
+        lay.addLayout(form)
+        lay.addWidget(_hint(t("wf_folder_hint")))
+        lay.addWidget(_buttons(self))
+
+    def value(self) -> dict:
+        return {"path": self.path.text().strip(), "preset": self.preset.currentData() or "",
+                "out": self.out.text().strip(), "sub": self.sub.isChecked(), "on": self.on.isChecked()}
+
+    def accept(self):
+        if not self.path.text().strip() or not os.path.isdir(self.path.text().strip()):
+            self.path.setFocus()
+            self.path.setStyleSheet(f"border: 1px solid {style.ERR};")
+            return
         super().accept()
 
 
