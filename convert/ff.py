@@ -76,7 +76,10 @@ def probe_json(path: str) -> dict:
     exe = ffprobe()
     if not exe:
         raise FileNotFoundError("ffprobe")
-    r = run([exe, "-v", "error", "-hide_banner", "-print_format", "json", "-show_format", "-show_streams",
+    extra = ["-f", "concat", "-safe", "0"] if path.lower().endswith(".ffconcat") else []   # 1.8: a disc title
+    r = run([exe, "-v", "error", "-hide_banner", *extra, "-print_format", "json", "-show_format", "-show_streams",
+             "-show_chapters", "-analyzeduration", "20M", "-probesize", "50M", path] if extra else
+            [exe, "-v", "error", "-hide_banner", "-print_format", "json", "-show_format", "-show_streams",
              "-show_chapters", path], 60)
     if r.returncode != 0:
         raise RuntimeError((r.stderr or "").strip().splitlines()[-1] if r.stderr.strip() else f"ffprobe: {r.returncode}")

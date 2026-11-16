@@ -117,8 +117,12 @@ def interlace_on(job) -> bool:
 def hdr_keeps(job, enc, bits: int) -> bool:
     """The HDR of the source goes into the result as is (10 bit HEVC / AV1 / VP9)."""
     src = job.info.video if job.info else None
-    return src is not None and src.hdr in ("HDR10", "HLG") and bits >= 10 and enc is not None and \
-        enc.family in ("hevc", "av1", "vp9")
+    if src is None or enc is None or bits < 10 or enc.family not in ("hevc", "av1", "vp9"):
+        return False
+    if src.hdr in ("HDR10", "HLG"):
+        return True
+    # 1.8: Dolby Vision with an HDR10 / HLG base layer (profile 7, 8.1, 8.4): that layer is HDR to keep
+    return src.hdr == "Dolby Vision" and src.color.get("color_transfer") in ("smpte2084", "arib-std-b67")
 
 
 def tonemap_on(job, enc, bits: int) -> bool:
