@@ -49,6 +49,9 @@ DEFAULTS = {
     "tray":          False,         # minimised → into the notification area (watch folders go on working)
     "shell_menu":    False,         # «Convert with ArtCore Convert» with the presets in Explorer's menu (HKCU)
     "ctx_start":     False,         # files sent from that menu start the queue at once
+    # 2.1
+    "start_at":      0,             # the delayed start of the queue (seconds since the epoch, 0 = none; delay.py)
+    "start_time":    "01:00",       # the time last picked in «Start at…»
 }
 
 CPU_LIMITS = (100, 75, 50, 25)
@@ -144,6 +147,13 @@ def load() -> dict:
     cfg["watch"] = {"on": w["on"], "stable": w["stable"], "folders": w["folders"]}
     for k in ("tray", "shell_menu", "ctx_start"):
         cfg[k] = bool(cfg.get(k))
+    from . import delay                                    # 2.1: the delayed start
+    try:
+        cfg["start_at"] = max(0.0, float(cfg.get("start_at") or 0))
+    except (TypeError, ValueError):
+        cfg["start_at"] = 0
+    if not isinstance(cfg.get("start_time"), str) or delay.parse_hhmm(cfg["start_time"]) is None:
+        cfg["start_time"] = "01:00"
     return cfg
 
 

@@ -9,7 +9,7 @@ import time
 
 from PySide6.QtCore import QByteArray, QObject, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPixmap
-from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QMainWindow, QMenu, QMessageBox,
+from PySide6.QtWidgets import (QApplication, QFileDialog, QInputDialog, QLabel, QMainWindow, QMenu, QMessageBox,
                                QSystemTrayIcon, QTreeWidgetItem, QVBoxLayout, QCheckBox, QComboBox)
 
 from . import APP_TITLE, AUDIO_EXT, VERSION, VIDEO_EXT, config, ff, style, winint
@@ -19,6 +19,8 @@ from . import job as J
 from . import filters as F
 from . import probe as P
 from . import logs
+from . import delay as DL
+from . import mpvview
 from .filter_ui import NEEDS_PARAMS, FilterDialog, short_name
 from .i18n import t
 from .runner import Runner
@@ -179,13 +181,19 @@ class MainWindow(MainUI, QMainWindow):
         self._gpu: dict = {}
         self._gpu_busy = False
         self._frame_mtime = 0.0
+        self.start_at = 0.0                      # 2.1: the delayed start of the queue (epoch seconds, 0 = none)
 
         self._build_ui()
+        self.dl_label = QLabel()                 # 2.1: «Start at 01:00 · in 1:02:03» in the status bar
+        self.dl_label.setObjectName("dlCountdown")
+        self.statusBar().addPermanentWidget(self.dl_label)
+        self.dl_label.hide()
 
         self.sys_timer = QTimer(self)
         self.sys_timer.setInterval(1000)
         self.sys_timer.timeout.connect(self._sys_tick)
         self.sys_timer.timeout.connect(self._frame_tick)
+        self.sys_timer.timeout.connect(self._delay_tick)
         self.sys_timer.start()
         self._cpu_label()
         self.save_timer = QTimer(self)
@@ -1663,6 +1671,8 @@ class MainWindow(MainUI, QMainWindow):
                               ("video", "width"), ("video", "height"), ("video", "fit"), ("video", "upscale"),
                               ("video", "quality"), ("video", "bitrate"), ("video", "size_mb"), ("video", "speed")):
             self._load_settings()
+        if section == "video" and key in ("width", "height", "fit", "upscale"):
+            self._update_frame_overlay()                    # 2.1: «Fill» cuts the edges: the frame shows it
         if key in ("deint", "fps", "bits", "channels", "downmix") or section in ("venc", "mux"):
             self._load_settings()
         if section == "audio" and key == "gain":
@@ -1835,6 +1845,7 @@ class MainWindow(MainUI, QMainWindow):
             if j is None or j.info.video is None:
                 return
             self.show_side("streams")
+            self.b_as_result.setChecked(False)            # 2.1: the logo is drawn on the whole frame
             self._update_frame_overlay()
             self.frame_ov.start_draw()
         elif act == "reset" and name == "color":
@@ -1850,15 +1861,43 @@ class MainWindow(MainUI, QMainWindow):
     def _update_frame_overlay(self):
         """The crop frame and the logo rectangle of the selected task over its picture."""
         j = self._first_job()
-        if j is None or j.info.video is None or self.trim_tab.job is not j:
+        if j is None or j.info is None or j.info.video is None or self.trim_tab.job is not j:
             self.frame_ov.set_state((0, 0, 1.0), None, None)
+            self.trim_tab.set_view_crop(None)
+            self.b_as_result.setEnabled(False)
+            self.cv_note.setText("")
             return
         vs = j.info.video
         sar = J._ratio(vs.sar) if vs.sar and vs.sar not in ("0:1", "1:1") else 1.0
-        crop = F.crop_values(j) if F.is_on(j, "crop") else None
+        crop = J.final_crop(j) if F.is_on(j, "crop") or J.fill_plan(j) is not None else None   # 2.1: + «Fill»
         lg = F.fset(j.settings, "delogo")
         logo = tuple(int(lg.get(k, 0) or 0) for k in ("x", "y", "w", "h")) if lg.get("on") else None
-        self.frame_ov.set_state((vs.width, vs.height, sar), crop, logo)
+        self.b_as_result.setEnabled(True)
+        rect = mpvview.crop_rect(crop, vs.width, vs.height)
+        if not self.b_as_result.isChecked():
+            self.trim_tab.set_view_crop(None)
+            self.cv_note.setText("")
+            self.frame_ov.set_state((vs.width, vs.height, sar), crop, logo)
+            return
+        # 2.1: «Show the result» — mpv shows the frame already cut, the frame drawn over it is not needed
+        self.trim_tab.set_view_crop(rect)
+        if rect is None:
+            f = F.fset(j.settings, "crop")
+            searching = f.get("on") and f.get("mode", "auto") == "auto" and j.crop_found is None
+            self.cv_note.setText(t("f_crop_searching") if searching else
+                                 t("cv_no_bars") if f.get("on") else t("cv_crop_off"))
+            self.frame_ov.set_state((vs.width, vs.height, sar), None, logo)
+            return
+        x, y, w, h = rect
+        ow, oh = J.out_size(j)
+        self.cv_note.setText(t("cv_frame", ow or w, oh or h, vs.width, vs.height))
+        if logo:
+            logo = (logo[0] - x, logo[1] - y, logo[2], logo[3])
+        self.frame_ov.set_state((w, h, sar), None, logo)
+
+    def set_crop_view(self, on: bool):
+        """2.1: the «Show the result» button over the picture (Streams, Trim)."""
+        self._update_frame_overlay()
 
     def _gain_preview(self):
         """The Volume of the first audio track, shown on the loudness curve."""
@@ -2015,7 +2054,8 @@ class MainWindow(MainUI, QMainWindow):
                 self.v_color.setText("—")
             if jr is not None and enc_on:
                 ow, oh = J.out_size(jr, enc)
-                self.v_res_hint.setText(t("res_result", jr.info.video.width, jr.info.video.height, ow, oh))
+                self.v_res_hint.setText(t("res_result", jr.info.video.width, jr.info.video.height, ow, oh)
+                                        + fill_note(J.fill_plan(jr, enc)))
             else:
                 self.v_res_hint.setText("")
             dur = J.out_duration(jobs[0]) if jobs and jobs[0].info else 0.0
@@ -2049,11 +2089,12 @@ class MainWindow(MainUI, QMainWindow):
         w, h = int(v.get("width", 0) or 0), int(v.get("height", 0) or 0)
         if h and not w:
             w = J._even(h * 16 / 9)
-        cur = f"{w}x{h}" if w and h else "0x0"
+        cur = f"{w}x{h}" if w and h else ("fill169" if v.get("fit") == "fill" else "0x0")
         b = self.v_res
         b.blockSignals(True)
         b.clear()
         b.addItem(t("as_source"), "0x0")
+        b.addItem(t("res_fill169"), "fill169")          # 2.1: the most common: 16:9 with no bars, no scaling
         b.insertSeparator(b.count())
         for rw, rh in J.RESOLUTIONS:
             b.addItem(t(f"res_{rw}x{rh}"), f"{rw}x{rh}")
@@ -2073,8 +2114,17 @@ class MainWindow(MainUI, QMainWindow):
             self.v_w.setFocus()
             self.v_w.selectAll()
             return
+        if data == "fill169":                         # 2.1: «16:9 without bars»: the source's size, edges cut
+            self._put("video", "width", 0)
+            self._put("video", "height", 0)
+            self._set("video", "fit", "fill")
+            return
         w, h = (int(x) for x in data.split("x"))
         self._put("video", "width", w)
+        if (w, h) == (0, 0) and self._shown_settings().get("video", {}).get("fit") == "fill":
+            self._put("video", "height", 0)
+            self._set("video", "fit", "fit")              # «As the source» again: nothing cut off
+            return
         self._set("video", "height", h)
 
     def _res_typed(self):
@@ -2338,6 +2388,8 @@ class MainWindow(MainUI, QMainWindow):
 
     # ── running ───────────────────────────────────────────────
     def start_queue(self):
+        if self.start_at:                                 # 2.1: «Start» while waiting: at once
+            self.cancel_delayed()
         if self._any_running():
             if self._all_paused():
                 self.toggle_queue_pause()
@@ -2714,6 +2766,7 @@ class MainWindow(MainUI, QMainWindow):
         self._update_total()
 
     def stop_queue(self):
+        self.cancel_delayed(t("dl_cancelled"))            # 2.1: «Stop» ends the waiting too
         self.running = False
         for s in self.slots:
             if s.runner.running:
@@ -2724,11 +2777,16 @@ class MainWindow(MainUI, QMainWindow):
         busy = self._any_running()
         paused = self._all_paused()
         self.b_start.setEnabled(not busy or paused or not self.running)
-        self.b_start.setText("  " + (t("resume") if busy and paused else t("start")))
+        waiting = bool(self.start_at) and not busy and not self.running
+        self.b_start.setText("  " + (t("resume") if busy and paused else
+                                     t("dl_start_at", DL.clock(self.start_at)) if waiting else t("start")))
+        self.b_start.setToolTip(t("dl_start_now_tip") if waiting else "")
+        self.b_start_at.setEnabled(not busy and not self.running)
+        self.a_start_cancel.setEnabled(bool(self.start_at))
         self.b_pause.setEnabled(busy)
         self.b_pause.setIcon(style.icon("fa6s.play" if paused else "fa6s.pause", style.ICON))
         self.b_pause.setToolTip((t("resume") if paused else t("pause")) + " (Space)")
-        self.b_stop.setEnabled(busy or self.running)
+        self.b_stop.setEnabled(busy or self.running or bool(self.start_at))
         has_sel = bool(self.view.selectedItems())
         for b in (self.b_remove, self.b_up, self.b_down):
             b.setEnabled(has_sel)
@@ -2844,6 +2902,9 @@ class MainWindow(MainUI, QMainWindow):
             return
         if self.running:
             QTimer.singleShot(0, self._next)
+            return
+        if self.start_at:                               # 2.1: a delayed start is set: the new files wait for it
+            self._toast(t("dl_waits", DL.clock(self.start_at)))
             return
         self.running = True
         self._update_buttons()
@@ -3006,6 +3067,112 @@ class MainWindow(MainUI, QMainWindow):
     def _toast(self, text: str):
         self.statusBar().showMessage(text, 4000)
 
+    # ── 2.1: the delayed start ────────────────────────────────
+    def _can_delay(self) -> bool:
+        if self.running or self._any_running():
+            self._toast(t("dl_busy"))
+            return False
+        return True
+
+    def set_delayed(self, at: float, announce: bool = True):
+        """Start the queue at <at> (epoch seconds). Kept in cfg["start_at"]: with the queue (keep_queue) the
+        waiting outlives a restart of the program. announce=False: coming back on opening (nothing to save)."""
+        self.start_at = float(at)
+        self.cfg["start_at"] = self.start_at
+        if announce:
+            config.save(self.cfg)
+            self.save_queue()
+        self._delay_tick()
+        self._update_buttons()
+        if announce:
+            self._toast(t("dl_set", DL.clock(self.start_at), DL.countdown(self.start_at - time.time())))
+
+    def start_in(self, minutes: int):
+        """«In 15 min / 30 min / 1 h / 2 h»."""
+        if self._can_delay():
+            self.set_delayed(DL.after_minutes(time.time(), minutes))
+
+    def start_at_time(self, hhmm: str):
+        """«Start at…» with the time picked: today, or tomorrow if that time has already passed today."""
+        if not self._can_delay():
+            return
+        self.cfg["start_time"] = hhmm
+        self.set_delayed(DL.next_start(time.time(), hhmm))
+
+    def start_at_dialog(self):
+        from PySide6.QtCore import QTime
+        from PySide6.QtWidgets import QDialog, QDialogButtonBox, QFormLayout, QTimeEdit
+        if not self._can_delay():
+            return
+        d = QDialog(self)
+        d.setWindowTitle(t("dl_at_title"))
+        lay = QFormLayout(d)
+        te = QTimeEdit()
+        te.setDisplayFormat("HH:mm")
+        h, m = DL.parse_hhmm(self.cfg.get("start_time", "01:00")) or (1, 0)
+        te.setTime(QTime(h, m))
+        lay.addRow(t("dl_at_label"), te)
+        note = QLabel()
+        note.setObjectName("hint")
+
+        def show_when():
+            at = DL.next_start(time.time(), te.time().toString("HH:mm"))
+            day = t("dl_today") if time.localtime(at).tm_mday == time.localtime().tm_mday else t("dl_tomorrow")
+            note.setText(t("dl_at_note", day, DL.countdown(at - time.time())))
+        te.timeChanged.connect(lambda _t: show_when())
+        show_when()
+        lay.addRow(note)
+        bb = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        bb.accepted.connect(d.accept)
+        bb.rejected.connect(d.reject)
+        lay.addRow(bb)
+        self._dl_dialog = d                                  # tests reach it
+        if d.exec():
+            self.start_at_time(te.time().toString("HH:mm"))
+        self._dl_dialog = None
+
+    def cancel_delayed(self, msg: str = ""):
+        if not self.start_at:
+            return
+        self.start_at = 0.0
+        self.cfg["start_at"] = 0
+        config.save(self.cfg)
+        self.dl_label.hide()
+        self._update_buttons()
+        if msg:
+            self._toast(msg)
+
+    def _delay_tick(self):
+        """Every second: the countdown in the status bar; at the moment — the queue starts."""
+        if not self.start_at:
+            return
+        left = self.start_at - time.time()
+        if left > 0:
+            self.dl_label.setText(t("dl_countdown", DL.clock(self.start_at), DL.countdown(left)))
+            self.dl_label.show()
+            return
+        self.cancel_delayed()
+        if not any(j.status in ("wait", "probe") for j in self.jobs):
+            self._toast(t("dl_nothing"))
+            return
+        self.start_queue()
+
+    def _restore_delay(self):
+        """On opening: a delayed start still ahead goes on waiting; one that passed while the program was closed
+        is dropped (the queue is not started by surprise)."""
+        try:
+            saved = float(self.cfg.get("start_at") or 0)
+        except (TypeError, ValueError):
+            saved = 0.0
+        at = DL.state_on_open(saved, time.time(), bool(self.cfg.get("keep_queue", True)))
+        if at:
+            self.set_delayed(at, announce=False)
+        elif saved:
+            self.cfg["start_at"] = 0
+            config.save(self.cfg)
+            if self.cfg.get("keep_queue", True):
+                self._toast(t("dl_missed", DL.clock(saved)))
+
     # ── session ───────────────────────────────────────────────
     def save_queue(self):
         if not self.cfg.get("keep_queue", True):
@@ -3014,6 +3181,7 @@ class MainWindow(MainUI, QMainWindow):
         config.write("queue.json", {"jobs": [j.to_dict() for j in self.jobs]})
 
     def restore_queue(self):
+        self._restore_delay()
         if not self.cfg.get("keep_queue", True):
             return
         data = config.read("queue.json") or {}
@@ -3134,6 +3302,18 @@ def _lang_from_name(path: str, src: str) -> str:
         if w in names:
             return names[w]
     return ""
+
+
+def fill_note(fp: dict | None) -> str:
+    """2.1: under the resolution — how much «Fill» cuts off: «… 185 + 185 pixels (19 % of the width)»."""
+    if fp is None:
+        return ""
+    fw, fh = fp["pre"]
+    if fp["lr"]:
+        return "\n" + t("res_fill_lr", fp["lr"], fp["lr"], round(200 * fp["lr"] / fw))
+    if fp["tb"]:
+        return "\n" + t("res_fill_tb", fp["tb"], fp["tb"], round(200 * fp["tb"] / fh))
+    return "\n" + t("res_fill_none")
 
 
 def _esc(s: str) -> str:

@@ -266,6 +266,7 @@ QToolButton#ctlText {{ background: transparent; border: none; border-radius: 8px
                        font-weight: 600; }}
 QToolButton#ctlText:hover {{ background: {HOVER}; }}
 QToolButton#ctlText::menu-indicator {{ image: none; width: 0; }}
+QToolButton#ctlText:checked {{ background: {PRESSED}; color: {ACCENT}; }}
 QLabel#time {{ font-size: 10pt; color: {STRONG}; padding: 0 6px; }}
 QLabel#title {{ font-size: 13pt; font-weight: 600; color: {STRONG}; }}
 QLabel#badge {{ background: rgba(255,255,255,30); border: 1px solid rgba(255,255,255,60); border-radius: 5px;

@@ -36,6 +36,10 @@ def _frame(ffmpeg: str, path: str, at: float, vf: str, out_png: str, run=None) -
 def source_vf(job, w: int, h: int) -> str:
     """The source the way the result frames it: deinterlaced, cropped, rotated, scaled to w × h."""
     chain = F.interlace_filters(job) + F.crop_filter(job) + F.rotate_filters(job)
+    fp = J.fill_plan(job)                                 # 2.1: «Fill» cuts the edges: the source too
+    if fp is not None and fp["cut"] != fp["pre"]:
+        (cw, ch), (fw, fh) = fp["cut"], fp["pre"]
+        chain.append(f"crop={cw}:{ch}:{(fw - cw) // 4 * 2}:{(fh - ch) // 4 * 2}")
     chain.append(f"scale={w}:{h}:flags=bicubic,setsar=1")
     return ",".join(chain)
 

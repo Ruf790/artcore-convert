@@ -257,6 +257,7 @@ def selftest() -> int:
         selftest_15(win, app, src, wide, tmp, lines)
         selftest_19(win, app, src, tmp, lines)
         selftest_20(win, app, src, tmp, lines)
+        selftest_21(win, app, wide, tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -532,6 +533,94 @@ def selftest_20(win, app, src: str, tmp: str, lines: list) -> None:
         lines.append(f"2.0 Explorer menu: written {on} {err!r}, removed {off} {err2!r}; file held: {busy}, freed: {free}")
         if err or err2 or not on or not off or not busy or not free:
             raise RuntimeError("2.0: Explorer's menu / the «file held open» check failed")
+
+
+def selftest_21(win, app, wide: str, tmp: str, lines: list) -> None:
+    """2.1 in the built exe: next_start (today / tomorrow); the queue started by a delayed start at its moment,
+    «Stop» cancelling another; the 2.20 film in a 1080p frame: auto Crop + «16:9 without bars» (Fill) → 1550×872;
+    the libmpv of the build shows it cut (video-crop, else a vf crop) to the very size of the result."""
+    import time
+    from . import delay as DL, mpvview, probe
+    from . import job as J
+    now = time.time()
+    same_dst = time.localtime(now).tm_isdst == time.localtime(now + 86400).tm_isdst
+    ahead = time.strftime("%H:%M", time.localtime(now + 2 * 3600))
+    passed = time.strftime("%H:%M", time.localtime(now - 2 * 3600))
+    a, b = DL.next_start(now, ahead), DL.next_start(now, passed)
+    lines.append(f"2.1 next_start: {ahead} in {DL.countdown(a - now)}, {passed} in {DL.countdown(b - now)}")
+    if not (0 < a - now <= 2 * 3600 + 60 and (not same_dst or 22 * 3600 - 120 <= b - now <= 22 * 3600 + 60)):
+        raise RuntimeError("2.1: next_start is wrong")
+    win.cfg.update(parallel=1, metrics=[], chunks={"on": False, "workers": 0, "minutes": 3})
+    win.cfg["watch"] = {"on": False, "stable": 10, "folders": []}
+    if not _wait(app, lambda: not win.running and not win._any_running(), 60):   # the 2.0 queue (watch folder)
+        win.stop_queue()
+        _wait(app, lambda: not win._any_running(), 20)
+    win.set_delayed(time.time() + 600)
+    text = win.b_start.text().strip()
+    lines.append(f"2.1 waiting: «{text}», running {win.running}, status bar «{win.dl_label.text()}»")
+    if not text.endswith(DL.clock(win.start_at)) or not win.b_stop.isEnabled():
+        raise RuntimeError("2.1: the Start button does not show the delayed start")
+    win.stop_queue()
+    if win.start_at or config.load()["start_at"]:
+        raise RuntimeError("2.1: «Stop» did not cancel the delayed start")
+    j = J.Job(src=wide, settings=J.merged({"container": "mkv", "video": {"encoder": "x264", "speed": 1, "width": 0,
+                                                                          "height": 0, "fit": "fill"},
+                                            "audio": {"codec": "aac"},
+                                            "filters": {"crop": {"on": True, "mode": "auto"}}}))
+    j.dest = os.path.join(tmp, "out21")
+    win._append(j)
+    win._queue_changed()
+    _wait(app, lambda: j.status != "probe", 30)
+    win.set_delayed(time.time() + 2)
+    started = _wait(app, lambda: win.running or j.status not in ("wait",), 15)
+    done = _wait(app, lambda: j.status in ("done", "error"), 120)
+    res = probe.probe(j.out) if done and j.status == "done" else None
+    size = (res.video.width, res.video.height) if res and res.video else None
+    sar = res.video.sar if res and res.video else ""
+    lines.append(f"2.1 delayed start: started {started}, {j.status}, crop {j.crop_found} → {size} SAR {sar}")
+    if not started or j.status != "done" or size != (1550, 872) or sar not in ("1:1", ""):   # Crop, then «16:9
+        # without bars», square pixels
+        raise RuntimeError(f"2.1: the delayed start did not encode: {j.status} {j.error} {size}")
+    # the preview of the build's libmpv, cut as the result
+    mod = mpvview.load_mpv()
+    m = mod.MPV(vo="null", ao="null", pause=True, config=False, terminal=False, ytdl=False, hr_seek="yes",
+                keep_open="yes")
+    v = mpvview.MpvView.__new__(mpvview.MpvView)
+    v.player, v.dead = m, False
+    ver = getattr(m, "mpv_version", "?")
+    try:
+        m.play(wide)
+        t0 = time.monotonic()
+        while not m.duration and time.monotonic() - t0 < 20:
+            time.sleep(0.05)
+        rect = mpvview.crop_rect(J.final_crop(j), 1920, 1080)
+        v.set_crop(rect)
+
+        def shown():
+            try:
+                o = m.video_out_params
+                return (o["dw"], o["dh"]) if o else None
+            except Exception:
+                return None
+        t0 = time.monotonic()
+        while shown() != size and time.monotonic() - t0 < 10:
+            time.sleep(0.05)
+        cut = shown()
+        shot = os.path.join(tmp, "crop21.png")
+        m.command("screenshot-to-file", shot, "video")
+        info = probe.probe(shot)
+        pic = (info.video.width, info.video.height) if info.video else None
+        v.set_crop(None)
+        t0 = time.monotonic()
+        while shown() != (1920, 1080) and time.monotonic() - t0 < 10:
+            time.sleep(0.05)
+        whole = shown()
+    finally:
+        m.terminate()
+    lines.append(f"2.1 preview: {ver} by {v.crop_by}: "
+                 f"cut {cut}, screenshot {pic}, back {whole}")
+    if cut != size or whole != (1920, 1080):
+        raise RuntimeError("2.1: libmpv did not show the frame cropped as the result")
 
 
 def selftest_19(win, app, src: str, tmp: str, lines: list) -> None:

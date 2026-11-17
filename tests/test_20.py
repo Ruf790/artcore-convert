@@ -676,12 +676,3 @@ def test_settings_dialog_has_the_new_options(qapp, data_dir):
     d.accept()
     assert cfg["shell_menu"] is True and cfg["ctx_start"] is True and cfg["tray"] is True
 
-
-def test_version_200():
-    from convert import VERSION, VERSION_TUPLE
-    assert VERSION == "2.0.0" and VERSION_TUPLE == (2, 0, 0, 0)
-    assert '#define AppVersion   "2.0.0"' in open(os.path.join(ROOT, "setup.iss"), encoding="utf-8-sig").read()
-    vi = open(os.path.join(ROOT, "version_info.txt"), encoding="utf-8").read()
-    assert "(2, 0, 0, 0)" in vi and "'2.0.0'" in vi
-    readme = open(os.path.join(ROOT, "README.md"), encoding="utf-8").read()
-    assert "2.0" in readme and "XviD" + "4PSP" not in readme
