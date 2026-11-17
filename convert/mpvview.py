@@ -59,6 +59,32 @@ def mpv_error() -> str:
     return _mpv_error
 
 
+def crop_spec(rect) -> str:
+    """2.1: (x, y, w, h) → mpv's video-crop «WxH+X+Y»; None → "" (no crop: libmpv 0.37 does not always take
+    «0x0+0+0» back)."""
+    if not rect:
+        return ""
+    x, y, w, h = (int(v) for v in rect)
+    return f"{w}x{h}+{x}+{y}"
+
+
+def crop_filter(rect) -> str:
+    """2.1: (x, y, w, h) → the crop filter (mpv's vf for a libmpv without video-crop, ffmpeg's for the still frames)."""
+    x, y, w, h = (int(v) for v in rect)
+    return f"crop={w}:{h}:{x}:{y}"
+
+
+def crop_rect(crop, width: int, height: int):
+    """2.1: filters.crop_values (left, top, right, bottom) of a width×height source → (x, y, w, h); None when
+    nothing is cut off."""
+    if not crop or not width or not height:
+        return None
+    l, t, r, b = (int(v) for v in crop)
+    if not (l or t or r or b):
+        return None
+    return l, t, width - l - r, height - t - b
+
+
 class _Bridge(QObject):
     prop = Signal(str, object)
 
@@ -265,6 +291,82 @@ class MpvView(QWidget):
         if not self.dead:
             self.player.mute = bool(on)
 
+    # ── 2.1: the picture as the result will be ────────────────
+    crop = None                                  # (x, y, w, h) of the source shown, None = the whole frame
+    crop_by = ""                                 # "video-crop" (libmpv 0.37+) | "vf" (older: a crop filter)
+
+    def set_crop(self, rect):
+        """Show only (x, y, w, h) of the source — the same numbers ffmpeg's crop gets — or the whole frame (None).
+        libmpv with the video-crop property (0.37+) (drawn by the video output, the GPU decoder stays); older libmpv: a
+        crop video filter (the decoding then on the CPU, filters cannot take GPU frames)."""
+        if rect:                                 # even: libmpv asserts on odd offsets of 4:2:0 frames
+            x, y, w, h = (int(v) for v in rect)
+            rect = (x // 2 * 2, y // 2 * 2, w // 2 * 2, h // 2 * 2)
+        else:
+            rect = None
+        if self.dead or rect == self.crop:
+            return
+        self.crop = rect
+        if self.crop_by != "vf":
+            try:
+                try:
+                    self.player["video-crop"] = crop_spec(rect)
+                    self._check_crop(3)
+                except Exception:
+                    if rect or self.crop_by != "video-crop":
+                        raise
+                    self.player["video-crop"] = "0x0+0+0"   # a libmpv that wants a rectangle to clear it
+                self.crop_by = "video-crop"
+                return
+            except Exception:                    # no such property: an older libmpv
+                self.crop_by = "vf"
+        try:
+            if rect:
+                self.player["hwdec"] = "no"
+                self.player["vf"] = crop_filter(rect)
+            else:
+                self.player["vf"] = ""
+                self.player["hwdec"] = "auto-safe"
+        except Exception:
+            pass
+
+    def _check_crop(self, tries: int):
+        """libmpv 0.37 sometimes misses a video-crop set while the previous one is still being applied (several
+        in a row: the Crop numbers typed in). A moment later: does the picture have the size asked? If not, set it
+        once more (through a different value first: setting the same one again is no change to mpv)."""
+        try:
+            QTimer.singleShot(250, lambda: self._recheck_crop(tries))
+        except Exception:
+            pass
+
+    def _recheck_crop(self, tries: int):
+        if self.dead or self.crop_by != "video-crop" or tries <= 0:
+            return
+        try:
+            o = self.player.video_out_params or {}
+            if "crop-w" not in o:
+                return
+            want = (self.crop[2], self.crop[3]) if self.crop else (o["w"], o["h"])
+            if (o["crop-w"], o["crop-h"]) == want:
+                return
+            if self.crop:
+                self.player["video-crop"] = ""
+                QTimer.singleShot(60, lambda: self._reset_crop(tries))
+            else:                                # «no crop» in its other spelling: a change mpv sees
+                self.player["video-crop"] = "0x0+0+0" if not self.player["video-crop"] else ""
+                self._check_crop(tries - 1)
+        except Exception:
+            pass
+
+    def _reset_crop(self, tries: int):
+        if self.dead:
+            return
+        try:
+            self.player["video-crop"] = crop_spec(self.crop)
+        except Exception:
+            return
+        self._check_crop(tries - 1)
+
     # ── 1.7: hear an outside sound track with the picture, at a delay ──
     def listen(self, path: str, delay: float) -> bool:
         """Play the film with <path> as its sound, <delay> seconds later (− earlier) than the picture."""
@@ -367,7 +469,7 @@ class FramePreview(QWidget):
         self.pos = max(0.0, min(t, self.dur or t))
         self.position.emit(self.pos)
         with self._lock:
-            self._want = (self.path, self.pos)
+            self._want = (self.path, self.pos, self.crop)
             if self._busy:
                 return
             self._busy = True
@@ -380,13 +482,14 @@ class FramePreview(QWidget):
                 if job is None:
                     self._busy = False
                     return
-            path, at = job
+            path, at, crop = job
             data = b""
             exe = ff.ffmpeg()
             if exe:
+                vf = (crop_filter(crop) + "," if crop else "") + "scale=640:-2"      # 2.1: as the result will be
                 try:
                     r = ff.run([exe, "-hide_banner", "-v", "error", "-ss", f"{at:.3f}", *ff.inp(path), "-map", "0:v:0",
-                                "-frames:v", "1", "-vf", "scale=640:-2", "-f", "image2pipe", "-c:v", "png", "-"],
+                                "-frames:v", "1", "-vf", vf, "-f", "image2pipe", "-c:v", "png", "-"],
                                30, binary=True)
                     data = r.stdout if r.returncode == 0 else b""
                 except Exception:
@@ -418,6 +521,16 @@ class FramePreview(QWidget):
 
     def set_mute(self, on: bool):
         pass
+
+    crop = None
+    crop_by = "ffmpeg"
+
+    def set_crop(self, rect):
+        """2.1: the still frames cut as the result will be (x, y, w, h of the source) or whole (None)."""
+        rect = tuple(int(v) for v in rect) if rect else None
+        if rect != self.crop:
+            self.crop = rect
+            self.seek(self.pos)
 
     def shutdown(self):
         pass

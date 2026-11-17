@@ -20,6 +20,7 @@ from . import encoders as E
 from . import job as J
 from . import probe as P
 from . import filters as F
+from . import delay as DL
 from .edit_tabs import ChaptersTab, MetaTab, TrimTab
 from .filter_ui import FilterRows, FrameOverlay
 from .i18n import t
@@ -389,7 +390,25 @@ class MainUI:
         self.b_start = text_button("fa6s.play", t("start"), self.start_queue, "primaryBtn")
         self.b_pause = ctl_button("fa6s.pause", t("pause"), 16, self.toggle_queue_pause)
         self.b_stop = ctl_button("fa6s.stop", t("stop"), 16, self.stop_queue)
+        # 2.1: the delayed start — an arrow beside «Start» with its menu
+        self.b_start_at = ctl_button("fa6s.caret-down", t("dl_menu_tip"), 12)
+        self.b_start_at.setPopupMode(QToolButton.InstantPopup)
+        dm = QMenu(self.b_start_at)
+        self.a_start_at = dm.addAction(style.icon("fa6s.clock"), t("dl_at"))
+        self.a_start_at.triggered.connect(lambda _c=False: self.start_at_dialog())
+        dm.addSeparator()
+        self.a_start_in = []
+        for mins in DL.IN_MINUTES:
+            a = dm.addAction(t("dl_in_min", mins) if mins < 60 else t("dl_in_h", mins // 60))
+            a.triggered.connect(lambda _c=False, m=mins: self.start_in(m))
+            self.a_start_in.append(a)
+        dm.addSeparator()
+        self.a_start_cancel = dm.addAction(style.icon("fa6s.xmark"), t("dl_cancel"))
+        self.a_start_cancel.triggered.connect(lambda _c=False: self.cancel_delayed(t("dl_cancelled")))
+        self.b_start_at.setMenu(dm)
         lay.addWidget(self.b_start)
+        lay.addWidget(self.b_start_at)
+        lay.addSpacing(4)
         lay.addWidget(self.b_pause)
         lay.addWidget(self.b_stop)
         lay.addStretch(1)
@@ -532,6 +551,20 @@ class MainUI:
         pl = QVBoxLayout(pv)
         pl.setContentsMargins(0, 0, 0, 0)
         pl.setSpacing(0)
+        # 2.1: over the picture of Streams / Trim — «Show the result»: mpv shows the frame already cropped
+        self.view_bar = QWidget()
+        vb = QHBoxLayout(self.view_bar)
+        vb.setContentsMargins(6, 2, 6, 2)
+        vb.setSpacing(6)
+        self.b_as_result = text_button("fa6s.crop-simple", t("cv_show"), None, "ctlText")
+        self.b_as_result.setCheckable(True)
+        self.b_as_result.setToolTip(t("cv_tip"))
+        self.b_as_result.toggled.connect(self.set_crop_view)
+        vb.addWidget(self.b_as_result)
+        self.cv_note = QLabel()
+        self.cv_note.setObjectName("hint")
+        vb.addWidget(self.cv_note, 1)
+        pl.addWidget(self.view_bar)
         pl.addWidget(self.trim_tab.stage, 1)
         pl.addWidget(self.trim_tab.bar)
         self.center.addWidget(pv)
@@ -585,6 +618,7 @@ class MainUI:
         self.center.setCurrentIndex(1 if status else 0)
         self.top_right.setCurrentIndex(1 if status else 0)
         self.bottom_right.setCurrentIndex(1 if status else 0)
+        self.view_bar.setVisible(SIDE[i] in ("streams", "trim"))
         self._update_buttons()
 
     def show_side(self, key: str):
@@ -1502,7 +1536,7 @@ class MainUI:
         row.addStretch(1)
         f.addRow(t("res_custom"), row)
         self.v_fit = QComboBox()
-        for key in ("fit", "pad", "stretch"):
+        for key in ("fit", "pad", "stretch", "fill"):
             self.v_fit.addItem(t("fit_" + key), key)
         self.v_fit.currentIndexChanged.connect(lambda: self._set("video", "fit", self.v_fit.currentData()))
         f.addRow(t("res_fit"), self.v_fit)

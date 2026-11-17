@@ -887,11 +887,70 @@ def target_box(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
     return (w, h) if w and h else (0, 0)
 
 
+FILL_AR = (16, 9)                 # 2.1: «16:9 without bars»: the shape of «Fill» with no frame size chosen
+
+
+def fill_plan(job: Job, enc: E.VEnc | None = None) -> dict | None:
+    """2.1: «Fill the frame (cut the edges)» — video.fit = "fill". The picture (after Crop and rotation) is scaled so
+    it COVERS the frame (k = max of the two ratios, not min), then cut in the middle to exactly W×H. One k for both
+    sides: never stretched or squeezed, only the edges cut off; an anamorphic source (SAR ≠ 1) becomes square
+    pixels first; the result has SAR 1, DAR = W/H. Without
+    upscaling, k > 1 is not done: only cut to the frame's shape at the source's size (1920×872 → 16:9 = 1550×872).
+    No frame size (the resolution «16:9 without bars»): cut to 16:9, no scaling.
+    → {"scale": (sw, sh) the scaled picture | None, "out": (ow, oh), "cut": (cw, ch) the part of the pre-scale frame
+    kept (its pixels), "lr" / "tb": pixels cut off each side of the pre-scale frame}; None if not this mode."""
+    src = job.info.video if job.info else None
+    v = job.settings.get("video", {})
+    if v.get("fit") != "fill" or src is None or not src.width:
+        return None
+    fw, fh, sar = F.pre_scale(job)
+    if not fw or not fh:
+        return None
+    w, h = target_box(job, enc)
+    dw, dh = fw * sar, float(fh)                       # the picture in square pixels
+    if w and h:
+        k = max(w / dw, h / dh)
+        if not v.get("upscale"):
+            k = min(k, 1.0)
+        aw, ah = w, h
+    else:
+        k, (aw, ah) = 1.0, FILL_AR
+    sw, sh = dw * k, dh * k
+    ratio = aw / ah
+    oh = min(sh, sw / ratio)
+    ow = oh * ratio
+    if w and h and k == max(w / dw, h / dh):            # covered: exactly the frame asked for
+        ow, oh = w, h
+    ow, oh = min(_even(ow), _even(sw)), min(_even(oh), _even(sh))
+    ssw, ssh = _even(sw), _even(sh)
+    scale = (ssw, ssh) if (ssw, ssh) != (fw, fh) or abs(sar - 1.0) > 0.001 else None
+    cw, ch = fw * ow / max(1.0, sw), fh * oh / max(1.0, sh)   # the kept part in pixels of the pre-scale frame
+    lr, tb = max(0, int(round((fw - cw) / 2))), max(0, int(round((fh - ch) / 2)))
+    return {"scale": scale, "out": (ow, oh), "cut": (fw - 2 * lr, fh - 2 * tb), "lr": lr, "tb": tb,
+            "pre": (fw, fh)}
+
+
+def final_crop(job: Job, enc: E.VEnc | None = None) -> tuple[int, int, int, int]:
+    """2.1: what is cut off the source in all — Crop and then «Fill» — as (left, top, right, bottom) in pixels of
+    the source: the frame drawn on the preview, «Show the result». (Rotation by 90°: Crop only.)"""
+    l, t, r, b = F.crop_values(job) if F.is_on(job, "crop") else (0, 0, 0, 0)
+    fp = fill_plan(job, enc)
+    if fp is None or (F.is_on(job, "rotate") and F._int(F.fset(job.settings, "rotate").get("angle")) % 180 == 90):
+        return l, t, r, b
+    cw, ch = fp["cut"]
+    fw, fh = fp["pre"]
+    el, et = (fw - cw) // 4 * 2, (fh - ch) // 4 * 2     # even, as the crop filter after the scale: 4:2:0 whole
+    return l + el, t + et, r + fw - cw - el, b + fh - ch - et
+
+
 def out_size(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
     """The frame size of the result (what the scale filters make)."""
     src = job.info.video if job.info else None
     if src is None or not src.width:
         return 0, 0
+    fp = fill_plan(job, enc)
+    if fp is not None:
+        return F.post_pad(job, *fp["out"])
     fw, fh, sar = F.pre_scale(job)
     w, h = target_box(job, enc)
     v = job.settings.get("video", {})
@@ -908,8 +967,18 @@ def out_size(job: Job, enc: E.VEnc | None = None) -> tuple[int, int]:
 
 def scale_filters(job: Job, enc: E.VEnc | None = None) -> list[str]:
     """Scale into the chosen frame: fit (inside, keeping the shape), pad (fit + black bars to exactly W×H),
-    stretch (exactly W×H). Anamorphic sources (DVD, SAR ≠ 1) become square pixels on the way."""
+    stretch (exactly W×H), 2.1 fill (cover W×H, the edges cut off in the middle). Anamorphic sources (DVD, SAR ≠ 1) become square pixels on the way."""
     src = job.info.video if job.info else None
+    fp = fill_plan(job, enc)
+    if fp is not None:                                   # 2.1: cover the frame, cut the edges in the middle
+        out = [f"scale={fp['scale'][0]}:{fp['scale'][1]}:flags=lanczos", "setsar=1"] if fp["scale"] else []
+        sw, sh = fp["scale"] or fp["pre"]
+        ow, oh = fp["out"]
+        if (ow, oh) != (sw, sh):
+            out.append(f"crop={ow}:{oh}:{(sw - ow) // 4 * 2}:{(sh - oh) // 4 * 2}")
+        if out and out[-1] != "setsar=1":
+            out.append("setsar=1")                       # square pixels: DAR = W/H, never stretched
+        return out
     w, h = target_box(job, enc)
     if src is None or not src.width or not w:
         return []

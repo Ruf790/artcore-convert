@@ -85,6 +85,7 @@ class TrimTab(QWidget):
         self.job: J.Job | None = None
         self.editable = False
         self.preview = None                      # MpvView | FramePreview, made when the tab is first shown
+        self.view_crop = None                    # 2.1: «Show the result» — (x, y, w, h) shown of the source
         self.fps = 25.0
         lay = QVBoxLayout(self)
         lay.setContentsMargins(12, 12, 12, 12)
@@ -286,11 +287,18 @@ class TrimTab(QWidget):
         p.duration.connect(lambda d: (setattr(self.bar, "dur", d or self.bar.dur), self._on_pos(self.bar.pos)))
         p.paused.connect(lambda on: self.b_play.setIcon(style.icon("fa6s.play" if on else "fa6s.pause", style.ICON)))
         p.position.connect(self.position_changed)
+        p.set_crop(self.view_crop)
         if isinstance(p, mpvview.FramePreview):
             for b in (self.b_play, self.b_mute):
                 b.setVisible(False)
             if self.job is not None:
                 self.hint.setText(t("trm_hint") + "\n⚠ " + t("trm_no_mpv"))
+
+    def set_view_crop(self, rect):
+        """2.1: the picture cut to (x, y, w, h) of the source as the result will be, or whole (None)."""
+        self.view_crop = tuple(rect) if rect else None
+        if self.preview is not None:
+            self.preview.set_crop(self.view_crop)
 
     def _gl_check(self):
         """No OpenGL 3.3 here (old driver, remote desktop): libmpv can't draw — still frames instead."""
