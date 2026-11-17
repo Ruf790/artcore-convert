@@ -551,8 +551,14 @@ def selftest_21(win, app, wide: str, tmp: str, lines: list) -> None:
     if not (0 < a - now <= 2 * 3600 + 60 and (not same_dst or 22 * 3600 - 120 <= b - now <= 22 * 3600 + 60)):
         raise RuntimeError("2.1: next_start is wrong")
     win.cfg.update(parallel=1, metrics=[], chunks={"on": False, "workers": 0, "minutes": 3})
+    win.cfg["watch"] = {"on": False, "stable": 10, "folders": []}
+    if not _wait(app, lambda: not win.running and not win._any_running(), 60):   # the 2.0 queue (watch folder)
+        win.stop_queue()
+        _wait(app, lambda: not win._any_running(), 20)
     win.set_delayed(time.time() + 600)
-    if not win.b_start.text().strip().endswith(DL.clock(win.start_at)) or not win.b_stop.isEnabled():
+    text = win.b_start.text().strip()
+    lines.append(f"2.1 waiting: «{text}», running {win.running}, status bar «{win.dl_label.text()}»")
+    if not text.endswith(DL.clock(win.start_at)) or not win.b_stop.isEnabled():
         raise RuntimeError("2.1: the Start button does not show the delayed start")
     win.stop_queue()
     if win.start_at or config.load()["start_at"]:
