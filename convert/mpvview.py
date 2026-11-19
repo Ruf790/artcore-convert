@@ -200,6 +200,8 @@ class MpvView(QWidget):
             self.player.observe_property(name, lambda n, v: self._bridge.prop.emit(n, v))
         self.ctx = None
         self._pending = ""
+        self._pending_start = 0.0                # 2.2: where the picture stands once the file is open
+        self._start_at = 0.0
         self.gl = VideoWidget(mpvmod, self.player, self)
         self.gl.ready.connect(self._gl_ready)
         lay = QStackedLayout(self)
@@ -208,7 +210,7 @@ class MpvView(QWidget):
     def _gl_ready(self):
         self.ctx = self.gl.ctx
         if self._pending:
-            QTimer.singleShot(0, lambda: self.load(self._pending))
+            QTimer.singleShot(0, lambda: self.load(self._pending, self._pending_start))
 
     def _on_prop(self, name: str, v):
         if name == "time-pos" and v is not None:
@@ -217,6 +219,9 @@ class MpvView(QWidget):
         elif name == "duration" and v is not None:
             self.dur = float(v)
             self.duration.emit(self.dur)
+            if self._start_at > 0:                # the file is open: go to where it was asked to stand
+                at, self._start_at = self._start_at, 0.0
+                self.seek(at)
         elif name == "seeking":
             self.seeking = bool(v)
             if not self.seeking and self._steps:
@@ -228,10 +233,13 @@ class MpvView(QWidget):
             self.paused.emit(self.is_paused)
 
     # ── control ───────────────────────────────────────────────
-    def load(self, path: str):
+    def load(self, path: str, start: float = 0.0):
+        """start (2.2): seconds of the file where the picture stands when it is open (0 = the beginning)."""
         if self.dead:
             return
         if self.ctx is None:                 # the GL context comes when the widget is first shown
+            if path != self._pending or start:     # a repeated call for the same file must not lose the start
+                self._pending_start = start
             self._pending = path
             return
         self._pending = ""
@@ -239,6 +247,7 @@ class MpvView(QWidget):
             return
         self.path = path
         self.pos = 0.0
+        self._start_at = max(0.0, float(start or 0.0))
         if self.listening:
             try:
                 self.player.audio_delay = 0.0
@@ -250,6 +259,7 @@ class MpvView(QWidget):
 
     def unload(self):
         self._pending = ""
+        self._start_at = 0.0
         if self.path and not self.dead:
             self.path = ""
             try:
@@ -453,10 +463,10 @@ class FramePreview(QWidget):
         self._lock = threading.Lock()
         self._frame.connect(self._on_frame, Qt.QueuedConnection)
 
-    def load(self, path: str, duration: float = 0.0, fps: float = 25.0):
+    def load(self, path: str, duration: float = 0.0, fps: float = 25.0, start: float = 0.0):
         self.path, self.dur, self.fps = path, duration, fps or 25.0
         self.duration.emit(duration)
-        self.seek(0.0)
+        self.seek(max(0.0, float(start or 0.0)))
 
     def unload(self):
         self.path = ""

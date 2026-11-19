@@ -2914,6 +2914,7 @@ class MainWindow(MainUI, QMainWindow):
             j.status, j.error, j.progress = "wait", "", 0.0        # as when a tab edits a finished task
         self._refresh(j)
         self._queue_changed()
+        self.trim_tab.open_at_start(j, a)                 # 2.2: the picture stands at the start of the piece
         it = self.items.get(j.uid)
         if it is not None:
             self.view.setCurrentItem(it)

@@ -76,6 +76,7 @@ class Stage(QWidget):
 
 
 class TrimTab(QWidget):
+    open_at = None                       # 2.2: (task, seconds): the picture of this task stands there when it is shown
     changed = Signal()
     media_wanted = Signal(object)        # a new task is shown: its strip and loudness are needed
     position_changed = Signal(float)
@@ -287,6 +288,7 @@ class TrimTab(QWidget):
         p.duration.connect(lambda d: (setattr(self.bar, "dur", d or self.bar.dur), self._on_pos(self.bar.pos)))
         p.paused.connect(lambda on: self.b_play.setIcon(style.icon("fa6s.play" if on else "fa6s.pause", style.ICON)))
         p.position.connect(self.position_changed)
+        p.duration.connect(self._opened)
         p.set_crop(self.view_crop)
         if isinstance(p, mpvview.FramePreview):
             for b in (self.b_play, self.b_mute):
@@ -321,11 +323,31 @@ class TrimTab(QWidget):
         j = self.job
         if j is None or j.info is None or j.info.error:
             return
+        o = self.open_at
+        start = o[1] if o is not None and o[0] is j else 0.0          # kept until the file is open (see _opened)
         if isinstance(self.preview, mpvview.FramePreview):
             if self.preview.path != J.media_src(j):
-                self.preview.load(J.media_src(j), J.src_duration(j), self.fps)
+                self.preview.load(J.media_src(j), J.src_duration(j), self.fps, start)
+            elif start:
+                self._seek(start)
+                self.open_at = None
+        elif start and self.preview.path == J.preview_src(j):
+            self._seek(start)                                # the file is already open: just go there
+            self.open_at = None
         else:
-            self.preview.load(J.preview_src(j))
+            self.preview.load(J.preview_src(j), start)
+
+    def open_at_start(self, job, at: float):
+        """2.2: ArtCore Player's A-B piece: the picture of this task stands at the start of the piece (not at 0:00)
+        — now if it is shown, else the next time it is."""
+        self.open_at = (job, float(at))
+        if self.job is job and self.preview is not None and self.stage.isVisible():
+            self._load_preview()
+
+    def _opened(self, dur: float):
+        """The preview opened a file: the start asked for has been handed to it, it is not needed any more."""
+        if dur and self.open_at is not None and self.open_at[0] is self.job:
+            self.open_at = None
 
     def position(self) -> float | None:
         """Where the preview stands (seconds of the source), None if it shows nothing of this task."""
