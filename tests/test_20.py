@@ -550,12 +550,12 @@ def test_shell_menu_entries_and_arguments(data_dir):
     assert any('--preset "Мой"' in c for c in cmds)
     assert all(k.startswith("Software\\Classes\\") for k in e)                            # HKCU only
     o = SM.parse_args(["--ctx", "--preset", "remux_mkv", "C:\\a b.mkv", "D:\\dir"])
-    assert o == {"ctx": True, "preset": "remux_mkv", "shell": "", "paths": ["C:\\a b.mkv", "D:\\dir"], "selftest": False}
+    assert o == {"ctx": True, "preset": "remux_mkv", "shell": "", "paths": ["C:\\a b.mkv", "D:\\dir"], "selftest": False, "clip": None}
     assert SM.parse_args(["--shell-menu", "on"])["shell"] == "on"
     from convert.main import parse_message
     got = parse_message(SM.message(["/x/a.mkv"], True, "remux_mkv"))
-    assert got == (["/x/a.mkv"], True, "remux_mkv")
-    assert parse_message("--show") == ([], False, "")
+    assert got == (["/x/a.mkv"], True, "remux_mkv", None)
+    assert parse_message("--show") == ([], False, "", None)
 
 
 def test_open_from_shell_preset_and_start(qapp, media, data_dir, tmp_path):
@@ -676,3 +676,15 @@ def test_settings_dialog_has_the_new_options(qapp, data_dir):
     d.accept()
     assert cfg["shell_menu"] is True and cfg["ctx_start"] is True and cfg["tray"] is True
 
+
+def test_shell_menu_clip_arguments():
+    """ArtCore Player's A-B segment: --start / --end in both forms, a bad piece is dropped, the message round-trips."""
+    from convert import shellmenu as SM
+    assert SM.parse_args(["--start", "83,5", "--end=120", "a.mkv"])["clip"] == (83.5, 120.0)
+    assert SM.parse_args(["--start=10", "a.mkv"])["clip"] is None
+    assert SM.parse_args(["--start=10", "--end=5", "a.mkv"])["clip"] is None
+    assert SM.parse_args(["--start=10", "--end=10.01", "a.mkv"])["clip"] is None
+    msg = SM.message(["a.mkv"], ctx=True, preset="x", clip=(1.0, 2.5))
+    assert "--start=1.000" in msg and "--end=2.500" in msg and "--ctx" in msg
+    from convert.main import parse_message
+    assert parse_message(msg) == ([os.path.abspath("a.mkv")], True, "x", (1.0, 2.5))
