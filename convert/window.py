@@ -2885,15 +2885,42 @@ class MainWindow(MainUI, QMainWindow):
         self.raise_()
         self.activateWindow()
 
-    def open_from_shell(self, paths: list[str], preset: str = "", ctx: bool = False) -> int:
+    def open_from_shell(self, paths: list[str], preset: str = "", ctx: bool = False, clip: tuple | None = None) -> int:
         """Files from Explorer (a second copy, or this one's command line): with the preset of the menu item; from
-        the menu with «start at once» on, the queue starts."""
+        the menu with «start at once» on, the queue starts. clip = (start, end): ArtCore Player's A–B segment →
+        the Trim tab of the one file (checked before the queue may start)."""
         n = self.add_paths(paths, preset)
+        if clip and len(paths) == 1:
+            self._apply_clip(paths[0], clip)
         if n and ctx and self.cfg.get("ctx_start"):
             self._auto_start()
         if n:
             self._toast(t("added_n", n))
         return n
+
+    def _apply_clip(self, path: str, clip: tuple):
+        """The A–B segment from ArtCore Player → one piece on the Trim tab (kept, the rest is thrown away).
+        Works for a file that is already in the queue too (waiting, not running)."""
+        key = os.path.normcase(os.path.abspath(path))
+        # a file added a moment ago is still "probe" (ffprobe is reading it): it is not in EDITABLE yet, but it may be set
+        j = next((x for x in reversed(self.jobs)
+                  if os.path.normcase(os.path.abspath(x.src)) == key and x.status in EDITABLE + ("probe",)
+                  and not self._busy(x)), None)
+        if j is None:
+            return
+        a, b = float(clip[0]), float(clip[1])
+        j.trim, j.trim_cut = [[a, b]], False
+        if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
+            j.status, j.error, j.progress = "wait", "", 0.0        # as when a tab edits a finished task
+        self._refresh(j)
+        self._queue_changed()
+        it = self.items.get(j.uid)
+        if it is not None:
+            self.view.setCurrentItem(it)
+        self._edit_tabs()                                 # the same task may already have been the selected one
+        ru = self.cfg.get("language", "ru") == "ru"
+        self._toast((f"Отрезок {J.fmt_tc(a)} – {J.fmt_tc(b)} задан во вкладке «Обрезка»" if ru
+                     else f"Segment {J.fmt_tc(a)} – {J.fmt_tc(b)} is set on the Trim tab"))
 
     def _auto_start(self):
         """Start (or go on with) the queue without leaving the tab the user is on."""
