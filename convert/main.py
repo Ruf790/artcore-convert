@@ -1,7 +1,5 @@
 """Entry point: one window; files sent from Explorer («Convert with ArtCore Convert») go to the running copy.
-ArtCoreConvert.exe [--ctx] [--preset KEY] [--start S --end E] [files / folders …]
-                                                                (2.0: from Explorer's menu, with a preset;
-                                                                 --start / --end: a piece for the Trim tab, seconds)
+ArtCoreConvert.exe [--ctx] [--preset KEY] [files / folders …]   (2.0: from Explorer's menu, with a preset)
 ArtCoreConvert.exe --shell-menu on | off                        (2.0: the installer: Explorer's menu in HKCU)"""
 from __future__ import annotations
 
@@ -20,13 +18,13 @@ from .i18n import set_lang
 SERVER_NAME = "ArtCoreConvert-" + (os.environ.get("USERNAME") or os.environ.get("USER") or "user")
 
 
-def _send_to_running(paths: list[str], ctx: bool = False, preset: str = "", clip: tuple | None = None) -> bool:
+def _send_to_running(paths: list[str], ctx: bool = False, preset: str = "") -> bool:
     from .shellmenu import message
     s = QLocalSocket()
     s.connectToServer(SERVER_NAME)
     if not s.waitForConnected(400):
         return False
-    s.write(message(paths, ctx, preset, clip).encode("utf-8"))
+    s.write(message(paths, ctx, preset).encode("utf-8"))
     s.waitForBytesWritten(1000)
     s.disconnectFromServer()
     return True
@@ -43,21 +41,17 @@ def start_lock():
     return lock
 
 
-def parse_message(data: str) -> tuple[list[str], bool, str, tuple | None]:
-    """The lines a second copy sent → (paths, from Explorer's menu, preset, the Trim piece (start, end) or None)."""
-    from .shellmenu import _clip, _seconds
-    paths, ctx, preset, seg = [], False, "", {}
+def parse_message(data: str) -> tuple[list[str], bool, str]:
+    """The lines a second copy sent → (paths, from Explorer's menu, preset)."""
+    paths, ctx, preset = [], False, ""
     for ln in data.splitlines():
         if ln == "--ctx":
             ctx = True
         elif ln.startswith("--preset="):
             preset = ln.split("=", 1)[1]
-        elif ln.startswith(("--start=", "--end=")):
-            k, v = ln[2:].split("=", 1)
-            seg[k] = _seconds(v)
         elif ln and not ln.startswith("--"):
             paths.append(ln)
-    return paths, ctx, preset, _clip(seg.get("start"), seg.get("end"))
+    return paths, ctx, preset
 
 
 def _surface_format() -> None:
@@ -744,7 +738,7 @@ def main() -> int:
         if tr.load("qtbase_ru", QLibraryInfo.path(QLibraryInfo.TranslationsPath)):
             app.installTranslator(tr)
     lock = start_lock() if cfg.get("single_window", True) else None
-    if lock is not None and _send_to_running(paths, opt["ctx"], opt["preset"], opt["clip"]):
+    if lock is not None and _send_to_running(paths, opt["ctx"], opt["preset"]):
         lock.unlock()
         return 0
     server = QLocalServer()
@@ -766,11 +760,11 @@ def main() -> int:
 
         def done():
             read()
-            got, ctx, preset, clip = parse_message(b"".join(buf).decode("utf-8", "replace"))
+            got, ctx, preset = parse_message(b"".join(buf).decode("utf-8", "replace"))
             buf.clear()
             win.bring_up()
             if got:
-                win.open_from_shell(got, preset, ctx, clip)
+                win.open_from_shell(got, preset, ctx)
         s.readyRead.connect(read)
         s.disconnected.connect(done)
     server.newConnection.connect(on_conn)
@@ -778,7 +772,7 @@ def main() -> int:
     def start():
         win.restore_queue()
         if paths:
-            win.open_from_shell(paths, opt["preset"], opt["ctx"], opt["clip"])
+            win.open_from_shell(paths, opt["preset"], opt["ctx"])
     QTimer.singleShot(0, start)
     QTimer.singleShot(4000, win.maybe_check_updates)
     code = app.exec()

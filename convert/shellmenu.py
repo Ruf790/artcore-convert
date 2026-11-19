@@ -49,11 +49,8 @@ def apply(cfg: dict, user_presets: dict | None = None) -> str:
 
 
 def parse_args(args: list[str]) -> dict:
-    """ArtCoreConvert.exe [--ctx] [--preset KEY] [--shell-menu on|off] [--start S --end E] [files / folders …].
-    --start / --end (seconds of the source; --start=83.5 or --start 83.5): the piece the Trim tab opens with —
-    ArtCore Player's A–B segment. "clip" is (start, end) when both are given and end > start, else None."""
-    out = {"ctx": False, "preset": "", "shell": "", "paths": [], "selftest": False, "clip": None}
-    seg: dict[str, float] = {}
+    """ArtCoreConvert.exe [--ctx] [--preset KEY] [--shell-menu on|off] [files / folders …]."""
+    out = {"ctx": False, "preset": "", "shell": "", "paths": [], "selftest": False}
     i = 0
     while i < len(args):
         a = args[i]
@@ -69,39 +66,14 @@ def parse_args(args: list[str]) -> dict:
             i += 1
         elif a == "--selftest":
             out["selftest"] = True
-        elif a in ("--start", "--end") and i + 1 < len(args):
-            seg[a[2:]] = _seconds(args[i + 1])
-            i += 1
-        elif a.startswith(("--start=", "--end=")):
-            k, v = a[2:].split("=", 1)
-            seg[k] = _seconds(v)
         elif not a.startswith("--"):
             out["paths"].append(a)
         i += 1
-    out["clip"] = _clip(seg.get("start"), seg.get("end"))
     return out
 
 
-def _seconds(v: str) -> float | None:
-    try:
-        x = float(str(v).strip().replace(",", "."))
-    except ValueError:
-        return None
-    return x if x >= 0 else None
-
-
-def _clip(a: float | None, b: float | None) -> tuple[float, float] | None:
-    """A piece needs both ends, the end after the start (the Trim tab drops anything shorter than a frame)."""
-    if a is None or b is None or b - a < 0.04:
-        return None
-    return round(a, 3), round(b, 3)
-
-
-def message(paths: list[str], ctx: bool = False, preset: str = "", clip: tuple | None = None) -> str:
-    """What a second copy sends to the running one: «--ctx», «--preset=KEY», «--start=S», «--end=E», the paths —
-    a line each."""
+def message(paths: list[str], ctx: bool = False, preset: str = "") -> str:
+    """What a second copy sends to the running one: «--ctx», «--preset=KEY», the paths — a line each."""
     lines = (["--ctx"] if ctx else []) + ([f"--preset={preset}"] if preset else [])
-    if clip:
-        lines += [f"--start={clip[0]:.3f}", f"--end={clip[1]:.3f}"]
     lines += [os.path.abspath(p) for p in paths]
     return "\n".join(lines) if lines else "--show"
