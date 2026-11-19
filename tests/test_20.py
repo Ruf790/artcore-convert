@@ -550,7 +550,7 @@ def test_shell_menu_entries_and_arguments(data_dir):
     assert any('--preset "Мой"' in c for c in cmds)
     assert all(k.startswith("Software\\Classes\\") for k in e)                            # HKCU only
     o = SM.parse_args(["--ctx", "--preset", "remux_mkv", "C:\\a b.mkv", "D:\\dir"])
-    assert o == {"ctx": True, "preset": "remux_mkv", "shell": "", "paths": ["C:\\a b.mkv", "D:\\dir"], "selftest": False}
+    assert o == {"ctx": True, "preset": "remux_mkv", "shell": "", "paths": ["C:\\a b.mkv", "D:\\dir"], "selftest": False, "clip": None}
     assert SM.parse_args(["--shell-menu", "on"])["shell"] == "on"
     from convert.main import parse_message
     got = parse_message(SM.message(["/x/a.mkv"], True, "remux_mkv"))
