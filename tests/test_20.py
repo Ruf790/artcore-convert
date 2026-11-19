@@ -554,8 +554,8 @@ def test_shell_menu_entries_and_arguments(data_dir):
     assert SM.parse_args(["--shell-menu", "on"])["shell"] == "on"
     from convert.main import parse_message
     got = parse_message(SM.message(["/x/a.mkv"], True, "remux_mkv"))
-    assert got == (["/x/a.mkv"], True, "remux_mkv")
-    assert parse_message("--show") == ([], False, "")
+    assert got == (["/x/a.mkv"], True, "remux_mkv", None)
+    assert parse_message("--show") == ([], False, "", None)
 
 
 def test_open_from_shell_preset_and_start(qapp, media, data_dir, tmp_path):
