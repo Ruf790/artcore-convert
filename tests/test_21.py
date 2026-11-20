@@ -406,10 +406,10 @@ def test_strings_both_languages():
 def test_version_210():
     from convert import VERSION, VERSION_TUPLE
     root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    assert VERSION == "2.2.0" and VERSION_TUPLE == (2, 2, 0, 0)
-    assert '#define AppVersion   "2.2.0"' in open(os.path.join(root, "setup.iss"), encoding="utf-8-sig").read()
+    assert VERSION == "2.2.1" and VERSION_TUPLE == (2, 2, 1, 0)
+    assert '#define AppVersion   "2.2.1"' in open(os.path.join(root, "setup.iss"), encoding="utf-8-sig").read()
     vi = open(os.path.join(root, "version_info.txt"), encoding="utf-8").read()
-    assert "(2, 2, 0, 0)" in vi and "'2.2.0'" in vi
+    assert "(2, 2, 1, 0)" in vi and "'2.2.1'" in vi
     readme = open(os.path.join(root, "README.md"), encoding="utf-8").read()
     assert "2.1" in readme and "XviD" + "4PSP" not in readme
 
