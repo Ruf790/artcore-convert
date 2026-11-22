@@ -586,6 +586,19 @@ def selftest_23(tmp: str, lines: list) -> None:
                  f"{bool(res['sample'])}, errors {res['errors']}")
     if len(res["shots"]) != 4 or not res["sheet"] or not res["sample"] or not res["info"].startswith("General"):
         raise RuntimeError("2.4: the release kit is incomplete")
+    import numpy as np                                       # 2.5: numpy of the build, the matching itself
+    from . import subsync
+    rng = np.random.default_rng(1)
+    k25 = J.fps_scale(25, 23.976)
+    sp = np.zeros(30000, np.float32)
+    cues = []
+    for a0 in np.sort(rng.uniform(5, 280, 40)):
+        sp[int(a0 / subsync.STEP):int((a0 + 1.5) / subsync.STEP)] = 2.0
+        cues.append(((a0 - 2.0) / k25, (a0 + 1.5 - 2.0) / k25))
+    r = subsync.find(sp, cues)
+    lines.append(f"2.5 sync: x{r['scale']:.6f} {r['delay']:+.3f} s, sure {r['sure']:.1f}")
+    if abs(r["scale"] - k25) > 1e-6 or abs(r["delay"] - 2.0) > 0.05:
+        raise RuntimeError(f"2.5: the subtitle sync found {r}")
 
 
 def selftest_21(win, app, wide: str, tmp: str, lines: list) -> None:

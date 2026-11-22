@@ -49,6 +49,8 @@ class Bridge(QObject):
     extra = Signal(int, str, object)      # 1.4: uid, path, MediaInfo of a joined / external file
     split = Signal(int, object)           # 1.4: slot number, the cut times (by size) or an error text
     propedit = Signal(int, bool, str, object)   # 2.3: uid, ok, mkvpropedit's message, the file read again
+    subsync = Signal(int, object, object)       # 2.5: uid, the track's key, the result (dict) or an error text
+    subsync_p = Signal(float)
 
 
 class Slot:
@@ -171,6 +173,8 @@ class MainWindow(MainUI, QMainWindow):
         self.bridge.extra.connect(self._on_extra)
         self.bridge.split.connect(self._on_split_times)
         self.bridge.propedit.connect(self._on_propedit)
+        self.bridge.subsync.connect(self._on_subsync)
+        self.bridge.subsync_p.connect(lambda x: self.statusBar().showMessage(t("sync_running", int(x * 100))))
         self.worker = Worker(self.bridge)
         self.slots: list[Slot] = [Slot(self, 0)]
         self.runner = self.slots[0].runner       # the first place (older code, tests)
@@ -1590,6 +1594,135 @@ class MainWindow(MainUI, QMainWindow):
         self._queue_changed()
         self._show_info(j)
         QTimer.singleShot(0, self._fill_tracks)
+
+    # ── 2.5: subtitle timing ─────────────────────────────────
+    def _sync_job(self):
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or self._busy(jobs[0]) or jobs[0].info is None or jobs[0].info.error:
+            return None
+        return jobs[0]
+
+    def _sync_stream(self, j: J.Job, key: tuple):
+        if key[0] == "ext":
+            return next((x for k2, x in J.ext_streams(j) if k2 == key[1]), None)
+        return next((x for x in j.info.streams if x.index == key[1]), None)
+
+    def set_sub_sync(self, key: tuple, scale: float | None = None, delay: int | None = None):
+        """A subtitle's stretch / delay (ms) from the Streams tab, «Two points» or «By the sound»."""
+        j = self._sync_job()
+        if j is None:
+            return
+        if key[0] == "ext":
+            if key[1] >= len(j.ext):
+                return
+            e = j.ext[key[1]]
+            if scale is not None:
+                e["scale"] = round(float(scale), 9)
+            if delay is not None:
+                e["delay"] = int(delay)
+        else:
+            tr = j.tracks.setdefault(str(key[1]), {})
+            if scale is not None:
+                if abs(scale - 1) < 1e-9:
+                    tr.pop("scale", None)
+                else:
+                    tr["scale"] = round(float(scale), 9)
+            if delay is not None:
+                if delay:
+                    tr["delay"] = int(delay)
+                else:
+                    tr.pop("delay", None)
+            if not tr:
+                j.tracks.pop(str(key[1]), None)
+        if j.status in ("done", "error", "stop", "skip"):
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        QTimer.singleShot(0, self._fill_tracks)
+
+    def sync_two_points(self, key: tuple):
+        j = self._sync_job()
+        s = self._sync_stream(j, key) if j is not None else None
+        if s is None:
+            self._toast(t("tr_pick_one"))
+            return None
+        from .dialogs import SyncPointsDialog
+        pos = getattr(self, "trim_tab", None)
+        d = SyncPointsDialog(lambda: pos.position() if pos is not None else None, self)
+        self._sync_dlg = d
+        if d.exec() and d.result_ks is not None:
+            k, dd = d.result_ks
+            self.set_sub_sync(key, scale=k, delay=int(round(dd * 1000)))
+            self._toast(t("sync_set", f"{k:.6f}", f"{dd:+.3f}"))
+        return d
+
+    def _sync_audio(self, j: J.Job) -> int | None:
+        """The sound to listen to: the first kept sound track of the source, else its first one."""
+        src_a = j.info.of("audio")
+        if not src_a:
+            return None
+        kept = [s for s, _c in J.plan(j)["audio"] if J.ext_no(s) is None]
+        first = kept[0] if kept else src_a[0]
+        return next((i for i, s in enumerate(src_a) if s.index == first.index), 0)
+
+    def sync_auto(self, key: tuple, confirm: bool = True):
+        """«By the sound»: the lines matched to the speech of the film, in the background."""
+        j = self._sync_job()
+        s = self._sync_stream(j, key) if j is not None else None
+        if s is None:
+            self._toast(t("tr_pick_one"))
+            return
+        a = self._sync_audio(j)
+        if a is None:
+            self._toast(t("sync_no_audio"))
+            return
+        if key[0] == "ext":
+            path, start = j.ext[key[1]]["path"], 0.0
+        else:
+            path, start = j.src, float(j.info.start or 0)
+        self._sync_confirm = confirm
+        uid, src, dur = j.uid, j.src, J.src_duration(j)
+        self.statusBar().showMessage(t("sync_running", 0))
+
+        def work():
+            from . import subsync as SS
+            try:
+                res = SS.sync(ff.ffmpeg() or "ffmpeg", ff.ffprobe() or "ffprobe", src, a, path, s.index, dur, start,
+                              lambda x: self.bridge.subsync_p.emit(x))
+            except Exception as e:                       # noqa: BLE001
+                res = str(e)
+            self.bridge.subsync.emit(uid, key, res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_subsync(self, uid: int, key, res):
+        self.statusBar().clearMessage()
+        j = next((x for x in self.jobs if x.uid == uid), None)
+        if j is None:
+            return
+        if isinstance(res, str) or not res or res.get("lines", 0) < 5:
+            self._toast(t("sync_failed") + (f": {res}" if isinstance(res, str) else ""))
+            return
+        k, d = float(res["scale"]), float(res["delay"])
+        from .job import SYNC_FPS, fps_scale
+        name = next((t("sync_fps", f"{a:g}", f"{b:g}") for a, b in SYNC_FPS if abs(fps_scale(a, b) - k) < 1e-6),
+                    t("sync_no_stretch"))
+        from .subsync import SURE
+        sure = res.get("sure", 0) >= SURE
+        text = t("sync_found", f"{d:+.3f}", name, t("sync_sure") if sure else t("sync_unsure"), res.get("lines", 0))
+        self.log.appendPlainText("⏱ " + text.replace("\n", " "))
+        self._sync_last = res
+        if getattr(self, "_sync_confirm", True):
+            box = QMessageBox(QMessageBox.Question if sure else QMessageBox.Warning, APP_TITLE, text, parent=self)
+            ok_b = box.addButton(t("sync_apply"), QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is not ok_b:
+                return
+        sel = self.selected_jobs()
+        if not sel or sel[0] is not j:
+            return
+        self.set_sub_sync(key, scale=k, delay=int(round(d * 1000)))
 
     # ── 2.3: attachments ─────────────────────────────────────
     def _att_job(self):

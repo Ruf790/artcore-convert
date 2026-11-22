@@ -572,7 +572,7 @@ def build(j, J, lines: list[str], kinds: list[tuple[str, float]], *, started: fl
                 L.append(f"Resumed: {m.group(1)} of {m.group(2)} chunks were encoded before — reused")
             L.append(LINE)
             continue
-        elif p["kind"] == "main" and any(x["kind"] == "chunk" for x in runs):
+        elif p["kind"] == "main" and any(x["kind"] in ("chunk", "resume") for x in runs):   # (all reused: too)
             title = "MUXING"
         p["title"] = title
         when = " FINISHED " if p["kind"] == "chunk" else " STARTED "     # a chunk is logged when it is done

@@ -237,7 +237,8 @@ def time_map(job, b: Burn) -> list[tuple[int, int, int]]:
         else:
             info = files[k][1]
             start = info.start if info is not None and not info.error else 0.0
-            out.append((_us(at), k * BIG + _us(start + a), _us(length)))
+            d = J.sub_timing(job, b.stream)[1] if J.sync_ok(job) else 0.0      # 2.5: its delay
+            out.append((_us(at), k * BIG + _us(start + a - d), _us(length)))
         at += length
     return out
 
