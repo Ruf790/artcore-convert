@@ -91,8 +91,11 @@ def test_chunks_run_stop_and_resume(qapp, films, data_dir):
     assert abs(info.duration - 34.0) < 0.15
     assert not os.path.isdir(slot.chunked.dir)                                          # done: chunks gone
     text = open(j.log_path, encoding="utf-8").read()
-    for part in ("ENCODING IN CHUNKS", "Chunks: 3, 3 at a time", f"Resumed: {len(kept)} of 3", "CHUNK ",
-                 "JOINING THE CHUNKS", "SOUND AND SUBTITLES", "MUXING", "ENCODING COMPLETED!"):
+    parts = ["ENCODING IN CHUNKS", "Chunks: 3, 3 at a time", f"Resumed: {len(kept)} of 3", "JOINING THE CHUNKS",
+             "SOUND AND SUBTITLES", "MUXING", "ENCODING COMPLETED!"]
+    if len(kept) < 3:                       # all three done before the stop: none is encoded again, no «CHUNK»
+        parts.append("CHUNK ")
+    for part in parts:
         assert part in text, part
     C.purge(0)
     w.close()
