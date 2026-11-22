@@ -754,7 +754,7 @@ class MainWindow(MainUI, QMainWindow):
         for f in files:
             if not os.path.isfile(f) or os.path.normcase(os.path.abspath(f)) in have:
                 continue
-            j.ext.append(J.clean_ext({"path": os.path.abspath(f), "kind": J.ext_kind(f), "lang": _lang_from_name(f, j.src)}))
+            j.ext.append(J.clean_ext({"path": os.path.abspath(f), "kind": J.ext_kind(f), "lang": _ext_lang(f, j.src)}))
         if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
             j.status, j.error, j.progress = "wait", "", 0.0
         self._probe_extra(j)
@@ -1408,7 +1408,7 @@ class MainWindow(MainUI, QMainWindow):
             if not os.path.isfile(f):
                 continue
             kind = J.ext_kind(f)
-            lang = _lang_from_name(f, j.src)
+            lang = _ext_lang(f, j.src)
             j.ext.append(J.clean_ext({"path": os.path.abspath(f), "kind": kind, "lang": lang}))
         if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
             j.status, j.error, j.progress = "wait", "", 0.0
@@ -3594,23 +3594,40 @@ def _pids(runner) -> list[int]:
     return [int(p.processId())] if p is not None and p.processId() else []
 
 
+def _ext_lang(path: str, src: str) -> str:
+    """2.5.1: an outside track's language — a tag at the end of its name, else the text of the subtitles."""
+    lang = _lang_from_name(path, src)
+    if not lang and J.ext_kind(path) == "subtitle":
+        from .langdetect import detect_file
+        lang = detect_file(path)
+    return lang
+
+
 def _lang_from_name(path: str, src: str) -> str:
     """«Film.rus.ac3», «Film_eng.srt», «Film.Russian.srt» → the language code (ISO 639-2), else ""."""
     import re as _re
     from .edit_tabs import LANGS
     stem = os.path.splitext(os.path.basename(path))[0].lower()
     base = os.path.splitext(os.path.basename(src))[0].lower()
-    if stem.startswith(base):
+    same = stem.startswith(base)
+    if same:
         stem = stem[len(base):]
     words = [w for w in _re.split(r"[^a-zа-яё]+", stem) if w]
     names = {"russian": "rus", "english": "eng", "bulgarian": "bul", "german": "deu", "french": "fra",
              "ukrainian": "ukr", "spanish": "spa", "italian": "ita", "japanese": "jpn", "русский": "rus",
-             "английский": "eng", "ru": "rus", "en": "eng", "bg": "bul", "de": "deu", "fr": "fra", "uk": "ukr"}
-    for w in reversed(words):
-        if w in LANGS and w != "und":
+             "английский": "eng"}
+    short = {"ru": "rus", "en": "eng", "bg": "bul", "de": "deu", "fr": "fra", "uk": "ukr", "ja": "jpn"}
+    skip = {"forced", "sdh", "full", "signs", "songs", "cc", "hi", "default"}
+    # 2.5.1: a name that isn't the film's — only its end counts («Hitori.de.Shinitai…» is not German)
+    tail = [w for w in words if w not in skip]
+    look = tail if same else tail[-1:]
+    for i, w in enumerate(reversed(look)):
+        if w in LANGS and w != "und" and len(w) == 3:
             return w
         if w in names:
             return names[w]
+        if w in short and i == 0:
+            return short[w]
     return ""
 
 

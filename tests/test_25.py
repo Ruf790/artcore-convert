@@ -201,3 +201,45 @@ def test_streams_tab_two_points_and_auto(qapp, talky, data_dir):
     assert pump(qapp, 60, lambda: "2" in j.tracks)
     assert j.tracks["2"]["scale"] == pytest.approx(K, abs=1e-6) and abs(j.tracks["2"]["delay"] - 3200) < 200
     w.close()
+
+
+# ── 2.5.1 ──
+def test_language_from_a_file_name():
+    from convert.window import _lang_from_name as L
+    v = "/d/Hitori.de.Shinitai.S01E01.1080p-playWEB.mkv"
+    assert L("/d/Hitori.de.Shinitai.S01E01.1080p.AMZN.WEB-DL.srt", v) == ""        # «.de.» of the title: not German
+    assert L("/d/Hitori.de.Shinitai.S01E01.1080p-playWEB.rus.srt", v) == "rus"
+    assert L("/d/Hitori.de.Shinitai.S01E01.1080p-playWEB.de.srt", v) == "deu"
+    assert L("/d/Film.eng.forced.srt", "/d/Film.mkv") == "eng"
+    assert L("/d/Other.Russian.srt", "/d/Film.mkv") == "rus"
+    assert L("/d/Film.rus.ac3", "/d/Film.mkv") == "rus"
+
+
+def test_language_from_the_subtitles_text(tmp_path):
+    from convert.langdetect import detect_file
+    from convert.window import _ext_lang
+    ru = ("Я не знаю, о чём ты говоришь. Это не моя вина, ты это знаешь. Нам надо идти сейчас, поезд уходит. "
+          "Это твоя машина? Нет, это моего брата. Чего ты от меня хочешь? Я больше не могу этого делать.")
+    bg = ("Не знам за какво говориш. Това не е моя вина, знаеш го. Трябва да тръгваме сега, влакът заминава. "
+          "Това твоята кола ли е? Не, на брат ми е. Какво искаш от мен? Не мога повече да правя това.")
+    en = ("I don't know what you are talking about. It's not my fault, you know that. We have to go now, the train "
+          "is leaving. Is this your car? No, it's my brother's. What do you want from me? I can't do this anymore.")
+    cues = lambda txt: "".join(f"{i}\n00:00:{i:02d},000 --> 00:00:{i:02d},900\n{s.strip()}.\n\n"
+                               for i, s in enumerate(txt.split(".")[:-1], 1))
+    a = tmp_path / "Hitori.de.Shinitai.S01E01.DD_2.0.srt"
+    a.write_text(cues(ru), encoding="cp1251")                                   # an old Windows encoding
+    assert detect_file(str(a)) == "rus"
+    assert _ext_lang(str(a), str(tmp_path / "Hitori.de.Shinitai.S01E01.DD+2.0.mkv")) == "rus"   # not «deu»
+    b = tmp_path / "x.srt"
+    b.write_text(cues(bg), encoding="utf-8-sig")
+    assert detect_file(str(b)) == "bul"
+    c = tmp_path / "x.ass"
+    c.write_text("[Script Info]\n\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, "
+                 "Effect, Text\n" + "".join(f"Dialogue: 0,0:00:0{i}.00,0:00:0{i}.90,Default,,0,0,0,,{{\\i1}}{s}\n"
+                                              for i, s in enumerate(en.split(". "))), encoding="utf-8")
+    assert detect_file(str(c)) == "eng"
+    assert _ext_lang(str(c), str(tmp_path / "Film.mkv")) == "eng"
+    d = tmp_path / "Film.rus.srt"
+    d.write_text(cues(en), encoding="utf-8")
+    assert _ext_lang(str(d), str(tmp_path / "Film.mkv")) == "rus"              # the name's tag wins
+    assert detect_file(str(tmp_path / "x.sup")) == ""
