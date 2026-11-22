@@ -1152,6 +1152,7 @@ class MainUI:
                 g.addWidget(QLabel(t("codec") + ":"), 0, 0)
                 g.addWidget(QLabel(text), 0, 1)
                 self._burn_row(g, 1, j, s, ("src", s.index), burn if mine else None, ed)
+                self._sync_rows(g, 2, j, s, ("src", s.index), ed and keep and J.sync_ok(j), True)   # 2.5
                 if burnt:
                     cb.setEnabled(False)
             g.setColumnStretch(1, 1)
@@ -1159,6 +1160,57 @@ class MainUI:
             self.tracks_lay.addWidget(body)
             self._fold_body(j, s.index, body, is_open)
         self._compact(self.tracks_box, 8)
+
+    def _sync_rows(self, g: QGridLayout, row: int, j, s, key: tuple, ed: bool, with_delay: bool):
+        """2.5: a subtitle's timing — delay (ms), the stretch of another frame rate, «Two points…», «By the sound»."""
+        k, d = J.sub_timing(j, s)
+        fps = QComboBox()
+        fps.setObjectName("syncFps")
+        fps.addItem(t("sync_no_stretch"), 1.0)
+        for a, b in J.SYNC_FPS:
+            fps.addItem(t("sync_fps", f"{a:g}", f"{b:g}"), J.fps_scale(a, b))
+        i = next((x for x in range(fps.count()) if abs(float(fps.itemData(x)) - k) < 1e-6), -1)
+        if i < 0:
+            fps.addItem(t("sync_custom", f"{k:.6f}"), k)
+            i = fps.count() - 1
+        fps.setCurrentIndex(i)
+        fps.setToolTip(t("sync_fps_tip"))
+        fps.setEnabled(ed)
+        fps.currentIndexChanged.connect(lambda _i, b=fps, kk=key: self.set_sub_sync(kk, scale=float(b.currentData())))
+        line = QHBoxLayout()
+        line.setSpacing(4)
+        if with_delay:
+            dl = QSpinBox()
+            dl.setObjectName("syncDelay")
+            dl.setRange(-600000, 600000)
+            dl.setSingleStep(100)
+            dl.setSuffix(" " + t("ms"))
+            dl.setKeyboardTracking(False)
+            dl.setToolTip(t("sync_delay_tip"))
+            dl.setValue(int(round(d * 1000)))
+            dl.setEnabled(ed)
+            dl.valueChanged.connect(lambda x, kk=key: self.set_sub_sync(kk, delay=int(x)))
+            line.addWidget(dl, 1)
+        line.addWidget(fps, 2)
+        g.addWidget(QLabel(t("sync") + ":"), row, 0)
+        g.addLayout(line, row, 1)
+        btns = QHBoxLayout()
+        btns.setSpacing(4)
+        b2 = ctl_button("fa6s.arrows-left-right-to-line", t("sync_two_tip"), 13, lambda _c=False, kk=key: self.sync_two_points(kk))
+        b2.setObjectName("ctlText")
+        b2.setText(" " + t("sync_two"))
+        b2.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        ba = ctl_button("fa6s.wand-magic-sparkles", t("sync_auto_tip"), 13, lambda _c=False, kk=key: self.sync_auto(kk))
+        ba.setObjectName("ctlText")
+        ba.setText(" " + t("sync_auto"))
+        ba.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        for b in (b2, ba):
+            b.setEnabled(ed)
+            btns.addWidget(b)
+        btns.addStretch(1)
+        g.addLayout(btns, row + 1, 1)
+        if not ed and key[0] == "src" and not J.sync_ok(j):
+            g.addWidget(_hint(t("w_sync_ignored")), row + 2, 1)
 
     def _burn_row(self, g: QGridLayout, row: int, j, s, key: tuple, b, ed: bool):
         """2.0: «Burn in: no / into the picture / the forced ones only» of a subtitle track, ⚙ = how text looks."""
@@ -1282,6 +1334,10 @@ class MainUI:
                 codec.currentIndexChanged.connect(lambda _i, b=codec, k=n: self._ext_opt(k, "codec", b.currentData()))
                 g.addWidget(QLabel(t("codec") + ":"), 1, 0)
                 g.addWidget(codec, 1, 1)
+            if not audio and info is not None and not bad:          # 2.5: stretch, two points, by the sound
+                st1 = next((x for k2, x in J.ext_streams(j) if k2 == n), None)
+                if st1 is not None:
+                    self._sync_rows(g, 4, j, st1, ("ext", n), ed, False)
             dft = QCheckBox(t("ext_default"))
             dft.setChecked(bool(e.get("default")))
             dft.setEnabled(ed)

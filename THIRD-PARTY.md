@@ -11,6 +11,7 @@ ArtCore Convert is free software under the GNU GPL v3 (see LICENSE). It ships wi
 | **Qt 6 / PySide6** | LGPL v3 | https://www.qt.io · https://wiki.qt.io/Qt_for_Python |
 | **QtAwesome** + Font Awesome 6 Free, Material Design Icons | MIT; icons CC BY 4.0 / SIL OFL 1.1 / Apache 2.0 | https://github.com/spyder-ide/qtawesome |
 | **psutil** | BSD 3-Clause | https://github.com/giampaolo/psutil |
+| **NumPy** | BSD 3-Clause | https://numpy.org |
 | **Python** | PSF License | https://www.python.org |
 
 The FFmpeg source code for the bundled build is available from the links above (the exact build is named in

@@ -257,7 +257,7 @@ class Job:
 
 
 EXT_KEYS = {"path": "", "kind": "audio", "delay": 0, "lang": "", "title": "", "codec": "", "kbps": 0,
-            "default": False, "burn": ""}         # 2.0: burn: "" | all | forced — an outside subtitle burnt in
+            "default": False, "burn": "", "scale": 1.0}   # 2.5: scale — a subtitle's stretch (new = scale·t + delay)         # 2.0: burn: "" | all | forced — an outside subtitle burnt in
 EXT_AUDIO = (".ac3", ".eac3", ".dts", ".aac", ".m4a", ".mka", ".mp3", ".flac", ".wav", ".opus", ".ogg", ".thd",
              ".mp2", ".wv", ".ape")
 EXT_SUBS = (".srt", ".ass", ".ssa", ".sup", ".vtt", ".sub", ".idx", ".mks")
@@ -740,6 +740,8 @@ def plan(job: Job) -> dict:
             w.append(why)
             burn = None
     out["burn"] = burn
+    if burn is not None and abs(sub_timing(job, burn.stream)[0] - 1) > 1e-7:
+        w.append("w_sync_burn_scale")                             # burnt in: the delay is kept, not the stretch
     burnt = burn.key() if burn is not None else None
     subs = info.of("subtitle")
     if lang:
@@ -762,6 +764,8 @@ def plan(job: Job) -> dict:
         if joined:
             w.append("w_trim_subs")
             continue
+        if sub_timed(job, s) and not sync_ok(job):
+            w.append("w_sync_ignored")
         if c.subs == "any":
             out["subs"].append((s, "copy"))
         elif s.codec in E.TEXT_SUBS:
@@ -1504,6 +1508,61 @@ def _graph_video(job: Job, enc, src: str, ov_in: int | None, transforms: str, de
     return nodes
 
 
+# ── 2.5: subtitle timing — new time = scale · old time + delay ──
+FPS_EXACT = {23.976: 24000 / 1001, 29.97: 30000 / 1001, 59.94: 60000 / 1001}
+SYNC_FPS = ((25, 23.976), (23.976, 25), (25, 24), (24, 25), (24, 23.976), (23.976, 24), (29.97, 25), (25, 29.97))
+
+
+def fps_scale(made_for: float, video: float) -> float:
+    """Subtitles timed for a «made_for» fps version on a «video» fps one: 25 → 23.976 = ×1.0427 (PAL runs faster)."""
+    return FPS_EXACT.get(made_for, made_for) / FPS_EXACT.get(video, video)
+
+
+def sub_timing(job: Job, s: Stream) -> tuple[float, float]:
+    """(scale, delay in seconds) of a subtitle track — of the source (Streams tab) or an outside one."""
+    n = ext_no(s)
+    if n is not None:
+        e = job.ext[n] if n < len(job.ext) else {}
+        return float(e.get("scale", 1.0) or 1.0), float(e.get("delay", 0) or 0) / 1000
+    tr = job.tracks.get(str(s.index), {})
+    return float(tr.get("scale", 1.0) or 1.0), float(tr.get("delay", 0) or 0) / 1000
+
+
+def sub_timed(job: Job, s: Stream) -> bool:
+    k, d = sub_timing(job, s)
+    return abs(k - 1) > 1e-7 or abs(d) > 0.0005
+
+
+def sync_ok(job: Job) -> bool:
+    """A source subtitle track can be re-timed: no joined files and at most one trim piece."""
+    return not job.joins and len(segments(job)) <= 1
+
+
+def two_points(s1: float, r1: float, s2: float, r2: float) -> tuple[float, float]:
+    """Two lines: «at s1 on the subtitles it should be r1», «at s2 — r2» → (scale, delay seconds)."""
+    if abs(s2 - s1) < 1:
+        raise ValueError("the two points are too close")
+    k = (r2 - r1) / (s2 - s1)
+    if not 0.8 < k < 1.25:
+        raise ValueError("the stretch is out of range")
+    return k, r1 - k * s1
+
+
+def timed_input(path: str, k: float, d: float, segs) -> list[str]:
+    """-i of a subtitle file / the source again with its own time: ffmpeg makes it (t + itsoffset) · itsscale,
+    -ss counts in the file's own time. Output time = k·t + d − (the piece's start)."""
+    a = segs[0][0] if segs else 0.0
+    start = (a - d) / k                                   # the subtitles' time that lands at 0 of the result
+    opt = ["-itsscale", f"{k:.9f}"] if abs(k - 1) > 1e-7 else []
+    if start > 0.0005:
+        opt += ["-ss", f"{start:.3f}"]
+    elif start < -0.0005:
+        opt += ["-itsoffset", f"{-start:.3f}"]
+    if segs:
+        opt += ["-t", f"{(segs[0][1] - segs[0][0]) / k:.3f}"]
+    return opt + ["-i", path]
+
+
 def ext_delay(job: Job, s: Stream) -> float:
     n = ext_no(s)
     return float(job.ext[n].get("delay", 0) or 0) / 1000 if n is not None and n < len(job.ext) else 0.0
@@ -1513,14 +1572,9 @@ def _ext_input(job: Job, s: Stream, segs) -> list[str]:
     """The input options of an external track: its delay moves it (or, cut / joined, its filters do)."""
     d = ext_delay(job, s)
     path = job.ext[ext_no(s)]["path"]
-    if s.kind == "subtitle" and segs:                               # one piece (more: the subtitles are dropped)
-        a = segs[0][0]
-        opt = []
-        if a - d > 0.0005:
-            opt += ["-ss", f"{a - d:.3f}"]
-        if d - a > 0.0005:
-            opt += ["-itsoffset", f"{d - a:.3f}"]
-        return opt + ["-i", path]
+    if s.kind == "subtitle":                                        # one piece (more: the subtitles are dropped)
+        k, d = sub_timing(job, s)
+        return timed_input(path, k, d, segs)
     if segs:                                                        # sound: aligned and cut in the graph
         return ["-i", path]
     if d > 0:
@@ -1665,6 +1719,13 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         if ext_no(s) is not None:
             args += _ext_input(job, s, segs)
             ext_in[ext_no(s)] = n_in
+            n_in += 1
+    emb_in: dict[int, int] = {}                                   # 2.5: a re-timed subtitle of the source
+    for s, _how in p["subs"]:
+        if ext_no(s) is None and sub_timed(job, s) and sync_ok(job):
+            k, d = sub_timing(job, s)
+            args += timed_input(job.src, k, d, segs)
+            emb_in[s.index] = n_in
             n_in += 1
     dist_in = None
     if mode == "metrics":
@@ -1871,6 +1932,9 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         en = ext_no(s)
         if en is not None:
             args += ["-map", f"{ext_in[en]}:{s.index}", f"-c:s:{n}", how]
+            continue
+        if s.index in emb_in:
+            args += ["-map", f"{emb_in[s.index]}:{s.index}", f"-c:s:{n}", how]
             continue
         ss = match_stream(job, base, s) or s
         args += ["-map", f"0:{ss.index}", f"-c:s:{n}", how]

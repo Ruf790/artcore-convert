@@ -1154,3 +1154,71 @@ class ReleaseDialog(QDialog):
         from . import winint
         if self.res:
             winint.show_in_explorer(self.res["sheet"] or self.res["dir"])
+
+
+class SyncPointsDialog(QDialog):
+    """2.5: «Two points» — two lines of the subtitles and when they really are spoken → the stretch and delay."""
+
+    def __init__(self, position=None, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QGridLayout, QToolButton
+        from . import job as J
+        self.J, self.position, self.result_ks = J, position, None
+        self.setWindowTitle(t("sync_two_title"))
+        self.setMinimumWidth(560)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(_head(t("sync_two_title")))
+        lay.addWidget(_hint(t("sync_two_hint")))
+        g = QGridLayout()
+        g.addWidget(QLabel(t("sync_col_sub")), 0, 1)
+        g.addWidget(QLabel(t("sync_col_real")), 0, 2)
+        self.edits = []
+        for r, name in ((1, t("sync_first")), (2, t("sync_last"))):
+            g.addWidget(QLabel(name), r, 0)
+            a, b = QLineEdit(), QLineEdit()
+            for e in (a, b):
+                e.setPlaceholderText("0:01:05.250")
+                e.textChanged.connect(self._calc)
+            g.addWidget(a, r, 1)
+            row = QHBoxLayout()
+            row.addWidget(b, 1)
+            pick = QToolButton()
+            pick.setObjectName("ctl")
+            pick.setIcon(style.icon("fa6s.location-crosshairs", style.ICON))
+            pick.setToolTip(t("sync_from_view"))
+            pick.clicked.connect(lambda _c=False, e=b: self._from_view(e))
+            pick.setEnabled(position is not None)
+            row.addWidget(pick)
+            g.addLayout(row, r, 2)
+            self.edits.append((a, b))
+        lay.addLayout(g)
+        self.state = _hint("")
+        lay.addWidget(self.state)
+        bb = _buttons(self)
+        self.ok = bb.button(QDialogButtonBox.Ok)
+        self.ok.setEnabled(False)
+        lay.addWidget(bb)
+
+    def _from_view(self, e):
+        pos = self.position() if self.position is not None else None
+        if pos is not None:
+            e.setText(self.J.fmt_tc(pos))
+
+    def _calc(self):
+        J = self.J
+        v = [J.parse_tc(x.text()) for pair in self.edits for x in pair]
+        self.result_ks = None
+        if any(x is None for x in v):
+            self.state.setText("")
+            self.ok.setEnabled(False)
+            return
+        try:
+            k, d = J.two_points(v[0], v[1], v[2], v[3])
+        except ValueError:
+            self.state.setText("⚠ " + t("sync_two_bad"))
+            self.ok.setEnabled(False)
+            return
+        self.result_ks = (k, d)
+        self.state.setText(t("sync_two_result", f"{k:.6f}", f"{d:+.3f}"))
+        self.ok.setEnabled(True)
