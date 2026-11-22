@@ -306,7 +306,7 @@ def test_release_kit(qapp, att, tmp_path):
     assert smp.duration <= 5.5 and smp.of("audio") and smp.of("subtitle") and smp.video is not None
     assert steps[-1] == (9, 9)
     res2 = R.make("ffmpeg", P.probe(src), {"shots": 4, "cols": 2, "singles": False, "sample": 0, "dir": str(tmp_path / "b")})
-    assert res2["shots"] == [] and os.listdir(str(tmp_path / "b")) == sorted(os.listdir(str(tmp_path / "b"))) and \
+    assert res2["shots"] == [] and \
         sorted(os.listdir(str(tmp_path / "b"))) == ["Film_bbcode.txt", "Film_mediainfo.txt", "Film_sheet.png"]
 
 

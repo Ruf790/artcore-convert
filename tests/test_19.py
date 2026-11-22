@@ -391,7 +391,13 @@ def test_open_source_player_or_default(qapp, bd, clips, data_dir, monkeypatch, t
     w = _win(qapp)
     jobs = _queue(qapp, w, clips, ["clip1.mkv"])
     ran, urls = [], []
-    monkeypatch.setattr(subprocess, "Popen", lambda args, **k: ran.append(args))
+    real_popen = subprocess.Popen
+
+    def popen(args, **k):                         # the strip's thumbnails (ffmpeg) run in the background too
+        if isinstance(args, (list, tuple)) and args and "ffmpeg" in os.path.basename(str(args[0])).lower():
+            return real_popen(args, **k)
+        ran.append(args)
+    monkeypatch.setattr(subprocess, "Popen", popen)
     monkeypatch.setattr(QDesktopServices, "openUrl", lambda u: urls.append(u.toLocalFile()) or True)
     player = tmp_path / "ArtCorePlayer.exe"
     player.write_bytes(b"")
