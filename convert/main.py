@@ -264,6 +264,7 @@ def selftest() -> int:
         selftest_19(win, app, src, tmp, lines)
         selftest_20(win, app, src, tmp, lines)
         selftest_21(win, app, wide, tmp, lines)
+        selftest_23(tmp, lines)
         win.close()
         with open(out, "w", encoding="utf-8") as f:
             f.write("\n".join(lines) + "\n")
@@ -539,6 +540,45 @@ def selftest_20(win, app, src: str, tmp: str, lines: list) -> None:
         lines.append(f"2.0 Explorer menu: written {on} {err!r}, removed {off} {err2!r}; file held: {busy}, freed: {free}")
         if err or err2 or not on or not off or not busy or not free:
             raise RuntimeError("2.0: Explorer's menu / the «file held open» check failed")
+
+
+def selftest_23(tmp: str, lines: list) -> None:
+    """2.3 in the built exe: a font attached to an MKV survives a remux and gets its mimetype; the result is cut
+    at its chapters (copied, «Name_01 Title»); mkvpropedit is looked for (it may be missing)."""
+    from . import ff, probe, propedit
+    from . import job as J
+    from . import encoders as E
+    font = os.path.join(tmp, "font23.ttf")
+    with open(font, "wb") as f:
+        f.write(b"\x00\x01\x00\x00" + b"\x00" * 2044)
+    chap = os.path.join(tmp, "ch23.txt")
+    with open(chap, "w", encoding="utf-8") as f:
+        f.write(";FFMETADATA1\n[CHAPTER]\nTIMEBASE=1/1000\nSTART=0\nEND=1000\ntitle=One\n"
+                "[CHAPTER]\nTIMEBASE=1/1000\nSTART=1000\nEND=2000\ntitle=Two\n")
+    src = os.path.join(tmp, "src23.mkv")
+    r = ff.run([ff.ffmpeg(), "-hide_banner", "-v", "error", "-y", "-f", "lavfi", "-i", "testsrc2=s=320x240:r=25:d=2",
+                "-i", chap, "-map", "0", "-map_chapters", "1", "-c:v", "libx264", "-g", "25", "-preset", "ultrafast",
+                src], 60)
+    if r.returncode != 0:
+        raise RuntimeError("2.3: making the clip failed: " + r.stderr[-300:])
+    j = J.Job(src=src, settings=J.merged({"container": "mkv", "video": {"mode": "copy"}}))
+    j.info = probe.probe(src)
+    j.attach = [font]
+    out = os.path.join(tmp, "out23.mkv")
+    r = ff.run(J.build_args(j, ff.ffmpeg(), out, E.Available({"x264": True}), False), 60)
+    res = probe.probe(out)
+    att = [(s.filename, s.mime) for s in res.of("attachment")] if not res.error else []
+    lines.append(f"2.3 attachments: {att}")
+    if r.returncode != 0 or att != [("font23.ttf", "font/ttf")]:
+        raise RuntimeError(f"2.3: the font was not attached: {att} {r.stderr[-300:]}")
+    j2 = J.Job(src=out, settings=J.merged({"container": "mkv", "split": {"mode": "chapters", "chapters_n": 1}}))
+    cuts, titles = J.chapter_cuts(J.read_chapters(ff.ffprobe(), out), 1)
+    r = ff.run(J.split_args(j2, ff.ffmpeg(), out, cuts), 60)
+    parts = J.split_parts(out)
+    lines.append(f"2.3 by chapters: {cuts} {titles} → {[os.path.basename(p) for p in J.part_names(parts, titles)]}")
+    if r.returncode != 0 or len(parts) != 2:
+        raise RuntimeError(f"2.3: the split by chapters gave {len(parts)} parts")
+    lines.append(f"2.3 mkvpropedit: {propedit.find() or 'not found'}")
 
 
 def selftest_21(win, app, wide: str, tmp: str, lines: list) -> None:

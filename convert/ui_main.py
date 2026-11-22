@@ -600,6 +600,7 @@ class MainUI:
         self.side.addWidget(_scroll(self._tab_info()))
         self.meta_tab = MetaTab()
         self.meta_tab.changed.connect(self._job_edited)
+        self.meta_tab.apply_file.connect(self.apply_inplace)
         self.side.addWidget(_scroll(self.meta_tab))
         self.chap_tab = ChaptersTab(lambda: self.trim_tab.position())
         self.chap_tab.changed.connect(self._job_edited)
@@ -911,6 +912,14 @@ class MainUI:
         self.ext_lay.setContentsMargins(0, 0, 0, 0)
         self.ext_lay.setSpacing(0)
         lay.addWidget(self.ext_box)
+        self.b_att = ctl_button("fa6s.plus", t("att_add"), 14, lambda: self.add_attachment_dialog())   # 2.3
+        self.att_head = self._section(t("att_section"), self.b_att)
+        lay.addWidget(self.att_head)
+        self.att_box = QWidget()
+        self.att_lay = QVBoxLayout(self.att_box)
+        self.att_lay.setContentsMargins(12, 4, 12, 8)
+        self.att_lay.setSpacing(2)
+        lay.addWidget(self.att_box)
         self.tr_hint = _hint()
         self.tr_hint.setContentsMargins(12, 8, 12, 8)
         lay.addWidget(self.tr_hint)
@@ -989,15 +998,16 @@ class MainUI:
             if it.widget() is not None:
                 it.widget().hide()                       # gone at once, not when Qt gets round to deleting it
                 it.widget().deleteLater()
-        while self.ext_lay.count():
-            it = self.ext_lay.takeAt(0)
-            if it.widget() is not None:
-                it.widget().hide()
-                it.widget().deleteLater()
+        for lay_ in (self.ext_lay, self.att_lay):
+            while lay_.count():
+                it = lay_.takeAt(0)
+                if it.widget() is not None:
+                    it.widget().hide()
+                    it.widget().deleteLater()
         jobs = self.selected_jobs()
         one = len(jobs) == 1 and jobs[0].info is not None and not jobs[0].info.error
-        self.ext_head.setVisible(one)
-        self.ext_box.setVisible(one)
+        for wdg in (self.ext_head, self.ext_box, self.att_head, self.att_box):
+            wdg.setVisible(one)
         if not one:
             self.tr_hint.setText(t("tr_pick_one"))
             return
@@ -1005,6 +1015,7 @@ class MainUI:
         ed = j.status in EDITABLE_ and not self._busy(j)
         self.b_ext.setEnabled(ed)
         self._fill_ext(j, ed)
+        self._fill_att(j, ed)
         self.tr_hint.setText(t("tr_hint"))
         pl = J.plan(j)
         out_audio = {s.index: c for s, c in pl["audio"]}
@@ -1287,6 +1298,47 @@ class MainUI:
         if not j.ext:
             self.ext_lay.addWidget(_hint(t("ext_hint")))
         self._compact(self.ext_box, 8)
+
+    def _fill_att(self, j, ed: bool):
+        """2.3: the attachments — the source's (a tick each) and the added files (× each)."""
+        mkv = J.attach_ok(j.settings)
+        self.b_att.setEnabled(ed and mkv)
+
+        def row(text: str, tip: str, check=None, rm=None):
+            w = QWidget()
+            hl = QHBoxLayout(w)
+            hl.setContentsMargins(0, 0, 0, 0)
+            if check is not None:
+                cb = QCheckBox(text)
+                cb.setChecked(check[0])
+                cb.setEnabled(ed and mkv)
+                cb.toggled.connect(check[1])
+                cb.setToolTip(tip)
+                hl.addWidget(cb, 1)
+            else:
+                lab = QLabel(text)
+                lab.setToolTip(tip)
+                hl.addWidget(lab, 1)
+            if rm is not None:
+                b = ctl_button("fa6s.xmark", t("att_remove"), 13, rm)
+                b.setEnabled(ed)
+                hl.addWidget(b)
+            self.att_lay.addWidget(w)
+        for s in j.info.of("attachment"):
+            size = s.att_size
+            text = f"📎 {s.filename or '#' + str(s.index)} · {s.mime or '?'}" + (f" · {P.fmt_size(size)}" if size else "")
+            row(text, s.mime, (j.track(s).get("keep", True),
+                               lambda on, idx=s.index: self._att_keep(idx, bool(on))))
+        for n, path in enumerate(j.attach):
+            try:
+                size = os.path.getsize(path)
+            except OSError:
+                size = 0
+            text = f"➕ {os.path.basename(path)} · {J.attach_mime(path)}" + (f" · {P.fmt_size(size)}" if size else "") + \
+                ("" if size else " — " + t("f_overlay_missing"))
+            row(text, path, None, lambda _c=False, k=n: self._att_remove(k))
+        hint = t("att_hint") if mkv else t("att_not_here")
+        self.att_lay.addWidget(_hint(hint))
 
     # 1.7: before / after with a curtain
     def toggle_compare(self, on: bool | None = None, at: float | None = None):
@@ -1639,7 +1691,7 @@ class MainUI:
         sg = QGridLayout(box)
         mode = QComboBox()
         mode.setObjectName("splitMode")
-        for key in ("off", "size", "time"):
+        for key in ("off", "size", "time", "chapters"):
             mode.addItem(t("split_" + key), key)
         mode.setCurrentIndex(max(0, mode.findData(sp.get("mode", "off"))))
         size = QComboBox()
@@ -1653,27 +1705,48 @@ class MainUI:
         mins.setRange(1, 600)
         mins.setSuffix(" " + t("minutes"))
         mins.setValue(int(sp.get("minutes", 20) or 20))
+        chn = QSpinBox()                                                # 2.3: by chapters
+        chn.setObjectName("splitChapters")
+        chn.setRange(1, 99)
+        chn.setValue(int(sp.get("chapters_n", 1) or 1))
+        names = QComboBox()
+        names.setObjectName("splitNames")
+        for key in ("num", "title"):
+            names.addItem(t("split_names_" + key), key)
+        names.setCurrentIndex(max(0, names.findData(sp.get("names", "num"))))
 
-        def upd():
+        def enable():
             m = mode.currentData()
             size.setEnabled(m == "size")
             mins.setEnabled(m == "time")
+            chn.setEnabled(m == "chapters")
+            names.setEnabled(m == "chapters")
+
+        def upd():
+            m = mode.currentData()
+            enable()
             try:
                 mb_v = float(size.currentText().split()[0].replace(",", "."))
             except (ValueError, IndexError):
                 mb_v = float(sp.get("size_mb", 700) or 700)
-            self._set(None, "split", {"mode": m, "size_mb": max(1, int(mb_v)), "minutes": int(mins.value())})
+            self._set(None, "split", {"mode": m, "size_mb": max(1, int(mb_v)), "minutes": int(mins.value()),
+                                      "chapters_n": int(chn.value()), "names": names.currentData()})
         mode.currentIndexChanged.connect(lambda _i: upd())
         size.currentTextChanged.connect(lambda _x: upd() if mode.currentData() == "size" else None)
         mins.valueChanged.connect(lambda _x: upd() if mode.currentData() == "time" else None)
-        size.setEnabled(mode.currentData() == "size")
-        mins.setEnabled(mode.currentData() == "time")
+        chn.valueChanged.connect(lambda _x: upd() if mode.currentData() == "chapters" else None)
+        names.currentIndexChanged.connect(lambda _x: upd() if mode.currentData() == "chapters" else None)
+        enable()
         sg.addWidget(mode, 0, 0, 1, 2)
         sg.addWidget(QLabel(t("split_size")), 1, 0)
         sg.addWidget(size, 1, 1)
         sg.addWidget(QLabel(t("split_time")), 2, 0)
         sg.addWidget(mins, 2, 1)
-        sg.addWidget(_hint(t("split_hint")), 3, 0, 1, 2)
+        sg.addWidget(QLabel(t("split_chap_n")), 3, 0)
+        sg.addWidget(chn, 3, 1)
+        sg.addWidget(QLabel(t("split_names")), 4, 0)
+        sg.addWidget(names, 4, 1)
+        sg.addWidget(_hint(t("split_hint")), 5, 0, 1, 2)
         box.setEnabled(c.id != "gif")
         lay.addWidget(box)
         d = SmallDialog(c.label, body, self)

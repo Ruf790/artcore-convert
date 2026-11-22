@@ -49,7 +49,7 @@ DEFAULT_SETTINGS = {
     "lang": "",          # «Select streams»: only the audio / subtitles of this language ("" = any)
     "meta": True,
     "filters": F.defaults(),     # 1.3: the filter rows of the Streams tab (filters.py)
-    "split": {"mode": "off", "size_mb": 700, "minutes": 20},     # 1.4: the result in parts
+    "split": {"mode": "off", "size_mb": 700, "minutes": 20, "chapters_n": 1, "names": "num"},  # 1.4 / 2.3: parts
     "fmt": {},           # 1.5: the preset of the format (formats.py; {} = the plain container)
     "mux": dict(FM.MUX_DEFAULT),     # 1.5: the container options (Format options)
     "venc": {},          # 1.5: the advanced settings of every encoder {encoder id: {…}} (advanced.py)
@@ -169,6 +169,7 @@ class Job:
     infos: dict = field(default_factory=dict, repr=False)   # path → MediaInfo of joined / external files
     out_dir: str = ""                               # 2.0: a watch folder's result folder (the name as usual)
     origin: str = ""                                # 2.0: "watch" — came from a watch folder
+    attach: list = field(default_factory=list)      # 2.3: files attached to the result (fonts …): [path, …]
 
     def to_dict(self) -> dict:
         return {"src": self.src, "settings": self.settings, "preset": self.preset, "tracks": self.tracks,
@@ -179,7 +180,7 @@ class Job:
                 "joins": list(self.joins), "ext": [dict(e) for e in self.ext],
                 "metrics": dict(self.metrics) if self.status == "done" else {},
                 "parts": list(self.parts) if self.status == "done" else [],
-                "out_dir": self.out_dir, "origin": self.origin}
+                "out_dir": self.out_dir, "origin": self.origin, "attach": list(self.attach)}
 
     @classmethod
     def from_dict(cls, d: dict) -> "Job":
@@ -197,6 +198,7 @@ class Job:
             if isinstance(ch, list) else None
         j.joins = [str(x) for x in (d.get("joins") or []) if isinstance(x, str) and x]
         j.ext = [clean_ext(e) for e in (d.get("ext") or []) if isinstance(e, dict) and e.get("path")]
+        j.attach = [str(x) for x in (d.get("attach") or []) if isinstance(x, str) and x]
         j.metrics = {k: float(v) for k, v in (d.get("metrics") or {}).items() if isinstance(v, (int, float))}
         j.parts = [str(x) for x in (d.get("parts") or []) if isinstance(x, str)]
         j.out_dir = str(d.get("out_dir") or "")
@@ -796,6 +798,104 @@ def plan(job: Job) -> dict:
                 w.append("w_dv_kept")
             if dyn["hdr10p"]:
                 w.append("w_hdr10p_kept")
+    if split_on(job) and (st.get("split") or {}).get("mode") == "chapters" and chapter_starts(job) == []:
+        w.append("split_no_chapters")
+    if not attach_ok(st) and (kept_attachments(job) or job.attach) and \
+            any(s.codec in ("ass", "ssa") for s, _h in out["subs"]):          # 2.3: the fonts stay behind
+        w.append("w_attach_lost")
+    return out
+
+
+# ── 2.3: attachments (fonts of ASS subtitles, covers …) — Matroska only ──
+ATTACH_MIME = {".ttf": "font/ttf", ".otf": "font/otf", ".ttc": "font/collection", ".woff": "font/woff",
+               ".woff2": "font/woff2", ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+               ".txt": "text/plain"}
+
+
+def attach_mime(path: str) -> str:
+    return ATTACH_MIME.get(os.path.splitext(path)[1].lower(), "application/octet-stream")
+
+
+def attach_ok(st: dict) -> bool:
+    """Only Matroska (MKV / MKA) carries attachments."""
+    return E.container(st.get("container", "mkv")).fmt == "matroska"
+
+
+def kept_attachments(job: Job) -> list[Stream]:
+    """The source's attachments that stay (each has its tick on the Streams tab)."""
+    if job.info is None or job.info.error:
+        return []
+    return [s for s in job.info.of("attachment") if job.track(s).get("keep", True)]
+
+
+def attach_args(job: Job, src_in: int | None) -> list[str]:
+    """-map of the kept attachments of input src_in (the source) and -attach of the added files."""
+    if not attach_ok(job.settings):
+        return []
+    out: list[str] = []
+    kept = kept_attachments(job) if src_in is not None else []
+    for s in kept:
+        out += ["-map", f"{src_in}:{s.index}"]
+    if kept:
+        out += ["-c:t", "copy"]
+    n = len(kept)
+    for path in job.attach:
+        if not os.path.isfile(path):
+            continue
+        out += ["-attach", path, f"-metadata:s:t:{n}", f"mimetype={attach_mime(path)}",
+                f"-metadata:s:t:{n}", f"filename={os.path.basename(path)}"]
+        n += 1
+    return out
+
+
+# ── 2.3: the result in parts by chapters ───────────────────────
+def chapter_starts(job: Job) -> list[float] | None:
+    """The chapter starts of the result as far as they are known before encoding (None: not known)."""
+    if job.chapters is not None:
+        return [float(c[0]) for c in job.chapters]
+    if job.info is None or job.info.error or segments(job) or job.joins:
+        return None
+    return [float(a) for a, _b, _t in job.info.chapter_list]
+
+
+def chapter_cuts(chaps: list[tuple[float, str]], every: int) -> tuple[list[float], list[str]]:
+    """Chapters [(start, title)] → the cut times (every N chapters, not at 0) and the title of every part."""
+    every = max(1, int(every or 1))
+    chaps = sorted(chaps)
+    groups = [chaps[i:i + every] for i in range(0, len(chaps), every)]
+    cuts = [g[0][0] for g in groups[1:] if g[0][0] > 0.05]
+    titles = [g[0][1] for g in groups]
+    return cuts, titles
+
+
+def read_chapters(ffprobe: str, path: str) -> list[tuple[float, str]]:
+    import json
+    import subprocess
+    kw = {"creationflags": 0x08000000} if os.name == "nt" else {}
+    r = subprocess.run([ffprobe, "-v", "error", "-show_chapters", "-show_entries",
+                        "format=start_time:stream=codec_type,start_time", "-of", "json", path],
+                       capture_output=True, timeout=60, **kw)
+    j = json.loads(r.stdout.decode("utf-8", "replace") or "{}")
+    vs = [x for x in j.get("streams") or [] if x.get("codec_type") == "video" and x.get("start_time") is not None]
+    t0 = float((vs[0] if vs else (j.get("format") or {})).get("start_time") or 0)
+    # the segment muxer counts from the first picture: a film whose video begins at 0.023 s is cut 0.023 s early
+    out = []
+    for ch in j.get("chapters") or []:
+        tg = {k.lower(): v for k, v in (ch.get("tags") or {}).items()}
+        out.append((round(max(0.0, float(ch.get("start_time") or 0) - t0), 3), str(tg.get("title", ""))))
+    return out
+
+
+_BAD = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def part_names(parts: list[str], titles: list[str]) -> list[str]:
+    """«Name_01 Title.mkv»: the parts named after their first chapter (a part without a title keeps _NN)."""
+    out = []
+    for n, p in enumerate(parts):
+        tt = _BAD.sub("_", titles[n]).strip(" .") if n < len(titles) and titles[n] else ""
+        stem, ext = os.path.splitext(p)
+        out.append(f"{stem} {tt[:80]}{ext}" if tt else p)
     return out
 
 
@@ -1674,6 +1774,13 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
                 args += ["-force_key_frames", f"expr:gte(t,n_forced*{float(sp.get('minutes', 20)) * 60:g})"]
                 if enc.vendor == "nvidia":                          # (both passes: x264 keeps pass 1's types)
                     args += ["-forced-idr", "1"]
+            elif split_on(job) and sp.get("mode") == "chapters":    # 2.3: a keyframe at every cut
+                cs = chapter_starts(job)
+                cuts = chapter_cuts([(x, "") for x in cs], sp.get("chapters_n", 1))[0] if cs else []
+                if cuts:
+                    args += ["-force_key_frames", ",".join(f"{x:.3f}" for x in cuts)]
+                    if enc.vendor == "nvidia":
+                        args += ["-forced-idr", "1"]
             if mode == "pass1":
                 break
             args += F.fps_args(job)
@@ -1769,6 +1876,9 @@ def build_args(job: Job, ffmpeg: str, out_path: str, av: E.Available, hw_decode:
         args += ["-map", f"0:{ss.index}", f"-c:s:{n}", how]
     if not p["subs"]:
         args += ["-sn"]
+    if not side and mode == "main":
+        src_in = meta_in if (not pcs or not joined and len(pcs) > 1 or pcs[0][0] == 0) else None
+        args += attach_args(job, src_in)                          # 2.3: fonts and other attachments
     args += meta_args(job, p, joined, meta_on)
     args += ["-dn", "-max_muxing_queue_size", "4096"]
     args += FM.mux_args(st, cont)                                 # 1.5: the container options
@@ -1810,7 +1920,7 @@ def split_on(job: Job) -> bool:
     mode = sp.get("mode", "off")
     return job.settings.get("container", "mkv") != "gif" and (
         (mode == "size" and float(sp.get("size_mb", 0) or 0) > 0) or
-        (mode == "time" and float(sp.get("minutes", 0) or 0) > 0))
+        (mode == "time" and float(sp.get("minutes", 0) or 0) > 0) or mode == "chapters")
 
 
 def split_pattern(out: str) -> str:
@@ -2046,6 +2156,8 @@ def describe(st: dict, av: E.Available | None = None, tr=None) -> str:
         bits.append(tr("split_short_size", sp["size_mb"]))
     elif sp.get("mode") == "time" and sp.get("minutes"):
         bits.append(tr("split_short_time", sp["minutes"]))
+    elif sp.get("mode") == "chapters":
+        bits.append(tr("split_short_chap", int(sp.get("chapters_n", 1) or 1)))
     return " · ".join(bits)
 
 
