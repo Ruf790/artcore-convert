@@ -2890,15 +2890,14 @@ class MainWindow(MainUI, QMainWindow):
         the menu with «start at once» on, the queue starts. clip = (start, end): ArtCore Player's A–B segment →
         the Trim tab of the one file (checked before the queue may start)."""
         n = self.add_paths(paths, preset)
-        if clip and len(paths) == 1:
-            self._apply_clip(paths[0], clip)
+        clipped = bool(clip and len(paths) == 1 and self._apply_clip(paths[0], clip))
         if n and ctx and self.cfg.get("ctx_start"):
             self._auto_start()
-        if n:
+        if n and not clipped:                 # 2.2.2: the segment's message is not covered by «Added: 1»
             self._toast(t("added_n", n))
         return n
 
-    def _apply_clip(self, path: str, clip: tuple):
+    def _apply_clip(self, path: str, clip: tuple) -> bool:
         """The A–B segment from ArtCore Player → one piece on the Trim tab (kept, the rest is thrown away).
         Works for a file that is already in the queue too (waiting, not running)."""
         key = os.path.normcase(os.path.abspath(path))
@@ -2907,7 +2906,10 @@ class MainWindow(MainUI, QMainWindow):
                   if os.path.normcase(os.path.abspath(x.src)) == key and x.status in EDITABLE + ("probe",)
                   and not self._busy(x)), None)
         if j is None:
-            return
+            if any(os.path.normcase(os.path.abspath(x.src)) == key for x in self.jobs):     # 2.2.2: say so
+                self._toast(t("clip_busy", os.path.basename(path)))
+                return True
+            return False
         a, b = float(clip[0]), float(clip[1])
         j.trim, j.trim_cut = [[a, b]], False
         if j.status in ("done", "error", "stop", "skip") and j.info is not None and not j.info.error:
@@ -2919,9 +2921,8 @@ class MainWindow(MainUI, QMainWindow):
         if it is not None:
             self.view.setCurrentItem(it)
         self._edit_tabs()                                 # the same task may already have been the selected one
-        ru = self.cfg.get("language", "ru") == "ru"
-        self._toast((f"Отрезок {J.fmt_tc(a)} – {J.fmt_tc(b)} задан во вкладке «Обрезка»" if ru
-                     else f"Segment {J.fmt_tc(a)} – {J.fmt_tc(b)} is set on the Trim tab"))
+        self._toast(t("clip_set", J.fmt_tc(a), J.fmt_tc(b)))
+        return True
 
     def _auto_start(self):
         """Start (or go on with) the queue without leaving the tab the user is on."""
