@@ -333,6 +333,7 @@ class MainUI:
         A(m, "fa6s.clone", t("apply_to") + "…", lambda: self.apply_dialog())
         A(m, "fa6s.file-export", t("demux") + "…", lambda: self.demux_dialog())
         A(m, "fa6s.scale-balanced", t("est_menu") + "…", lambda: self.estimate_dialog())
+        A(m, "fa6s.camera", t("rel_menu") + "…", lambda: self.release_dialog())
         A(m, "fa6s.link", t("join_add") + "…", self.join_add_dialog)
         A(m, "fa6s.plus", t("ext_add") + "…", self.add_external_dialog)
         m.addSeparator()

@@ -916,6 +916,32 @@ STRINGS = {
     "split_short_time": ("части по {} мин", "parts of {} min"),
     "split_running":  ("разбиение на части", "splitting into parts"),
     "split_failed":   ("разбить не удалось, файл остался целым", "the split failed, the file stays whole"),
+    # 2.4: for a release
+    "rel_menu":       ("Для раздачи", "For a release"),
+    "rel_title":      ("Для раздачи", "For a release"),
+    "rel_hint":       ("{0} · {1}\nMediaInfo, скриншоты и сетка кадров с таймкодами, сэмпл без перекодирования и BBCode "
+                       "для описания — в папку рядом с файлом. Если задание готово, берётся результат, иначе исходник.",
+                       "{0} · {1}\nMediaInfo, screenshots and a contact sheet with time codes, a sample without "
+                       "re-encoding and BBCode for the description — into a folder next to the file. A finished task "
+                       "gives its result, otherwise the source is used."),
+    "rel_shots":      ("Скриншоты:", "Screenshots:"),
+    "rel_no_shots":   ("Без скриншотов", "No screenshots"),
+    "rel_cols":       ("Столбцов в сетке:", "Columns in the sheet:"),
+    "rel_singles":    ("Оставить и отдельные PNG", "Keep the single PNGs too"),
+    "rel_sample":     ("Сэмпл:", "Sample:"),
+    "rel_sample_none": ("Без сэмпла", "No sample"),
+    "rel_sample_s":   ("{0} секунд", "{0} seconds"),
+    "rel_folder":     ("Папка:", "Folder:"),
+    "rel_make":       ("Сделать", "Make"),
+    "rel_copy_info":  ("Копировать MediaInfo", "Copy MediaInfo"),
+    "rel_copy_bb":    ("Копировать BBCode", "Copy BBCode"),
+    "rel_open":       ("Открыть папку", "Open the folder"),
+    "rel_running":    ("Делаю…", "Working…"),
+    "rel_n_shots":    ("скриншотов: {0}", "screenshots: {0}"),
+    "rel_sheet_done": ("сетка кадров", "contact sheet"),
+    "rel_sample_done": ("сэмпл", "sample"),
+    "rel_done":       ("Готово: {0}. Ниже — BBCode для описания.", "Done: {0}. Below is the BBCode for the description."),
+    "rel_copied":     ("Скопировано", "Copied"),
     # 2.3: by chapters
     "split_chapters": ("По главам", "By chapters"),
     "split_chap_n":   ("Глав в части", "Chapters a part"),

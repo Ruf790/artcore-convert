@@ -579,6 +579,13 @@ def selftest_23(tmp: str, lines: list) -> None:
     if r.returncode != 0 or len(parts) != 2:
         raise RuntimeError(f"2.3: the split by chapters gave {len(parts)} parts")
     lines.append(f"2.3 mkvpropedit: {propedit.find() or 'not found'}")
+    from . import release                                   # 2.4: «For a release» (Qt paints the sheet)
+    res = release.make(ff.ffmpeg(), probe.probe(src), {"shots": 4, "cols": 2, "sample": 1,
+                                                       "dir": os.path.join(tmp, "release24")})
+    lines.append(f"2.4 for a release: {len(res['shots'])} shots, sheet {bool(res['sheet'])}, sample "
+                 f"{bool(res['sample'])}, errors {res['errors']}")
+    if len(res["shots"]) != 4 or not res["sheet"] or not res["sample"] or not res["info"].startswith("General"):
+        raise RuntimeError("2.4: the release kit is incomplete")
 
 
 def selftest_21(win, app, wide: str, tmp: str, lines: list) -> None:

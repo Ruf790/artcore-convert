@@ -266,3 +266,67 @@ def test_empty_preview_is_not_black(qapp, data_dir):
         assert tt.stage.styleSheet() == "background: #000;"
     finally:
         style.set_theme(old)
+
+
+# ── 2.4: for a release ──
+def test_release_text_times_and_bbcode(att):
+    from convert import release as R
+    info = P.probe(att["src"])
+    txt = R.info_text(info)
+    for part in ("General", "Complete name", "Matroska", "Video", "H.264", "Audio", "Language", "jpn", "Text",
+                 "ASS", "Menu", "Part: two"):
+        assert part in txt, part
+    assert R.shot_times(100, 4) == [16.25, 38.75, 61.25, 83.75]
+    assert R._dar("12:5") == "2.40:1" and R._dar("16:9") == "16:9"
+    assert R.folder_for("/d/Film.mkv") == "/d/Film_release"
+    bb = R.bbcode(txt, ["/d/a_01.png"], "a_sheet.png")
+    assert bb.startswith("[spoiler][nfo]General") and "[img]a_sheet.png[/img]\n[img]a_01.png[/img]" in bb
+    s = info.video
+    s.sar = "4:3"
+    assert "scale=trunc(iw*sar/2)*2:ih" in R.shot_filter(s, True)
+    s.hdr = "HDR10"
+    assert "tonemap=tonemap=hable" in R.shot_filter(s, True) and "tonemap" not in R.shot_filter(s, False)
+
+
+def test_release_kit(qapp, att, tmp_path):
+    from PySide6.QtGui import QImage
+    from convert import release as R
+    src = shutil.copy(att["src"], str(tmp_path / "Film.mkv"))
+    steps = []
+    res = R.make("ffmpeg", P.probe(src), {"shots": 6, "cols": 3, "sample": 5},
+                 lambda k, n, w: steps.append((k, n)))
+    d = str(tmp_path / "Film_release")
+    assert res["dir"] == d and not res["errors"]
+    assert sorted(os.listdir(d)) == ["Film_01.png", "Film_02.png", "Film_03.png", "Film_04.png", "Film_05.png",
+                                     "Film_06.png", "Film_bbcode.txt", "Film_mediainfo.txt", "Film_sample.mkv",
+                                     "Film_sheet.png"]
+    im = QImage(res["sheet"])
+    assert im.width() == 1920 and im.height() > 2 * 240
+    smp = P.probe(res["sample"])
+    assert smp.duration <= 5.5 and smp.of("audio") and smp.of("subtitle") and smp.video is not None
+    assert steps[-1] == (9, 9)
+    res2 = R.make("ffmpeg", P.probe(src), {"shots": 4, "cols": 2, "singles": False, "sample": 0, "dir": str(tmp_path / "b")})
+    assert res2["shots"] == [] and os.listdir(str(tmp_path / "b")) == sorted(os.listdir(str(tmp_path / "b"))) and \
+        sorted(os.listdir(str(tmp_path / "b"))) == ["Film_bbcode.txt", "Film_mediainfo.txt", "Film_sheet.png"]
+
+
+def test_release_dialog_from_the_queue(qapp, att, data_dir, tmp_path):
+    from test_14_ui import _select, _win
+    from PySide6.QtWidgets import QApplication
+    src = shutil.copy(att["src"], str(tmp_path / "Rip.mkv"))
+    w = _win(qapp)
+    assert w.add_paths([src]) == 1
+    assert pump(qapp, 15, lambda: w.jobs[-1].status != "probe")
+    _select(qapp, w, [w.jobs[-1]])
+    d = w.release_dialog()
+    assert d is not None and "General" in d.text.toPlainText()
+    d.n.setCurrentIndex(d.n.findData(4))
+    d.sample.setCurrentIndex(d.sample.findData(0))
+    d.make()
+    assert pump(qapp, 60, lambda: d.res is not None)
+    assert d.res["sheet"] and len(d.res["shots"]) == 4 and d.b_bb.isEnabled()
+    assert w.cfg["release"]["shots"] == 4 and w.cfg["release"]["sample"] == 0
+    d.b_bb.click()
+    assert QApplication.clipboard().text().startswith("[spoiler][nfo]General")
+    d.close()
+    w.close()
