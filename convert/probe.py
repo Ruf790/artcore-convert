@@ -59,6 +59,7 @@ class Stream:
     tag: int = 0                    # 1.9: the codec tag (a Blu-ray's stream type: 0x86 = DTS-HD MA, 0x85 = HRA)
     filename: str = ""              # 2.0: an attachment's file name (fonts of ASS subtitles in MKV)
     mime: str = ""
+    att_size: int = 0               # 2.3: an attachment's size in bytes
 
     def lang_label(self) -> str:
         return self.lang if self.lang and self.lang != "und" else ""
@@ -157,6 +158,7 @@ def parse(path: str, j: dict) -> MediaInfo:
             s.width, s.height = int(st.get("width") or 0), int(st.get("height") or 0)     # 2.0: a PGS / VobSub canvas
         elif kind == "attachment":
             s.filename, s.mime = stags.get("filename", ""), stags.get("mimetype", "")
+            s.att_size = int(_num(st.get("extradata_size")))
         try:
             s.tag = int(st.get("codec_tag") or "0", 16)
         except (TypeError, ValueError):

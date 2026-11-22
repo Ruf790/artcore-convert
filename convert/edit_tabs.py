@@ -548,6 +548,7 @@ COMMON_TAGS = ("title", "artist", "date", "genre", "comment", "description", "co
 
 class MetaTab(QWidget):
     changed = Signal()
+    apply_file = Signal()                                # 2.3: write the edits into the MKV itself
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -600,7 +601,31 @@ class MetaTab(QWidget):
         v.addWidget(self.streams)
         v.addWidget(_hint(t("md_tracks_hint")))
         lay.addWidget(box, 1)
+        row = QHBoxLayout()                              # 2.3: like mkvpropedit — no new file
+        self.b_inplace = _btn("fa6s.pen-to-square", t("pe_apply_tip"), lambda: self.apply_file.emit(), t("pe_apply"))
+        row.addWidget(self.b_inplace)
+        row.addStretch(1)
+        lay.addLayout(row)
+        self.pe_hint = _hint()
+        self.pe_hint.setOpenExternalLinks(True)
+        lay.addWidget(self.pe_hint)
+        self.changed.connect(self._pe_state)
         self.set_job(None, False)
+
+    def _pe_state(self):
+        from . import propedit as PE
+        j = self.job
+        mkv = PE.can(j)
+        exe = PE.find() if mkv else ""
+        self.b_inplace.setVisible(bool(exe))
+        self.b_inplace.setEnabled(bool(exe) and self.editable and bool(PE.changes(j)))
+        if mkv and not exe:
+            self.pe_hint.setText(t("pe_missing", PE.URL))
+        elif exe:
+            self.pe_hint.setText(t("pe_hint"))
+        else:
+            self.pe_hint.setText("")
+        self.pe_hint.setVisible(mkv)
 
     def set_job(self, job: J.Job | None, editable: bool):
         self.job, self.editable = job, editable
@@ -620,6 +645,7 @@ class MetaTab(QWidget):
             self._fill_streams()
         finally:
             self._filling = False
+            self._pe_state()
 
     def _tags(self) -> dict:
         j = self.job

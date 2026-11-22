@@ -48,6 +48,7 @@ class Bridge(QObject):
     crop = Signal(int, object)            # uid, (l, t, r, b) | None — the automatic crop
     extra = Signal(int, str, object)      # 1.4: uid, path, MediaInfo of a joined / external file
     split = Signal(int, object)           # 1.4: slot number, the cut times (by size) or an error text
+    propedit = Signal(int, bool, str, object)   # 2.3: uid, ok, mkvpropedit's message, the file read again
 
 
 class Slot:
@@ -169,6 +170,7 @@ class MainWindow(MainUI, QMainWindow):
         self._crop_busy: set[int] = set()        # tasks whose black bars are being looked for
         self.bridge.extra.connect(self._on_extra)
         self.bridge.split.connect(self._on_split_times)
+        self.bridge.propedit.connect(self._on_propedit)
         self.worker = Worker(self.bridge)
         self.slots: list[Slot] = [Slot(self, 0)]
         self.runner = self.slots[0].runner       # the first place (older code, tests)
@@ -1036,6 +1038,9 @@ class MainWindow(MainUI, QMainWindow):
                 times = None
                 if sp.get("mode") == "size":                    # cut times are known only after encoding:
                     times = J.estimate_size_times(j, self.av)    # here from the planned bit rate
+                elif sp.get("mode") == "chapters":
+                    cs = J.chapter_starts(j) or []
+                    times = J.chapter_cuts([(x, "") for x in cs], sp.get("chapters_n", 1))[0]
                 cmds.append(J.split_args(j, exe, out, times))
         except (RuntimeError, OSError) as e:
             self._toast(t(str(e)))
@@ -1566,6 +1571,60 @@ class MainWindow(MainUI, QMainWindow):
         self._queue_changed()
         self._show_info(j)
         QTimer.singleShot(0, self._fill_tracks)
+
+    # ── 2.3: attachments ─────────────────────────────────────
+    def _att_job(self):
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or self._busy(jobs[0]) or jobs[0].info is None or jobs[0].info.error:
+            return None
+        return jobs[0]
+
+    def _att_changed(self, j: J.Job):
+        if j.status in ("done", "error", "stop", "skip"):
+            j.status, j.error, j.progress = "wait", "", 0.0
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        QTimer.singleShot(0, self._fill_tracks)
+
+    def add_attachment_dialog(self, files: list[str] | None = None):
+        """«+» of «Attachments»: a font or another file goes into the MKV."""
+        j = self._att_job()
+        if j is None:
+            self._toast(t("tr_pick_one"))
+            return
+        if not isinstance(files, (list, tuple)):
+            files = None
+        if files is None:
+            files, _ = QFileDialog.getOpenFileNames(self, t("att_add"), os.path.dirname(j.src),
+                                                    f"{t('att_files')} (*.ttf *.otf *.ttc *.woff *.woff2);;"
+                                                    f"{t('all_files')} (*)")
+        have = {os.path.normcase(x) for x in j.attach}
+        new = [f for f in files or [] if os.path.isfile(f) and os.path.normcase(f) not in have]
+        if not new:
+            return
+        j.attach += new
+        self._att_changed(j)
+
+    def _att_keep(self, idx: int, on: bool):
+        j = self._att_job()
+        if j is None:
+            return
+        tr = j.tracks.setdefault(str(idx), {})
+        if on:
+            tr.pop("keep", None)
+            if not tr:
+                j.tracks.pop(str(idx), None)
+        else:
+            tr["keep"] = False
+        self._att_changed(j)
+
+    def _att_remove(self, n: int):
+        j = self._att_job()
+        if j is None or n >= len(j.attach):
+            return
+        j.attach.pop(n)
+        self._att_changed(j)
 
     def bench_dialog(self):
         from .dialogs import BenchDialog
@@ -2592,6 +2651,17 @@ class MainWindow(MainUI, QMainWindow):
         elif slot.stage == "split":
             if ok:
                 parts = J.split_parts(j.out)
+                if parts and getattr(slot, "split_titles", None):     # 2.3: «Name_01 Chapter title»
+                    named = []
+                    for a, b in zip(parts, J.part_names(parts, slot.split_titles)):
+                        try:
+                            if a != b and not os.path.exists(b):
+                                os.replace(a, b)
+                                a = b
+                        except OSError:
+                            pass
+                        named.append(a)
+                    parts = named
                 if parts:
                     try:
                         os.remove(j.out)
@@ -2651,14 +2721,21 @@ class MainWindow(MainUI, QMainWindow):
         slot.stage = "split"
         sp = j.settings.get("split") or {}
         self.log.appendPlainText("✂ " + t("split_running"))
-        if sp.get("mode") != "size":
+        slot.split_titles = []
+        if sp.get("mode") not in ("size", "chapters"):
             self._on_split_times(slot.n, None)
             return
         path, mb = j.out, float(sp.get("size_mb", 700) or 700)
+        by_ch, every = sp.get("mode") == "chapters", int(sp.get("chapters_n", 1) or 1)
 
         def work():
             try:
-                self.bridge.split.emit(slot.n, J.size_times(ff.ffprobe() or "ffprobe", path, mb))
+                if by_ch:                                   # 2.3: at the chapters of the finished file
+                    cuts, titles = J.chapter_cuts(J.read_chapters(ff.ffprobe() or "ffprobe", path), every)
+                    slot.split_titles = titles if sp.get("names") == "title" else []
+                    self.bridge.split.emit(slot.n, cuts)
+                else:
+                    self.bridge.split.emit(slot.n, J.size_times(ff.ffprobe() or "ffprobe", path, mb))
             except Exception as e:                          # noqa: BLE001
                 self.bridge.split.emit(slot.n, str(e))
         threading.Thread(target=work, daemon=True).start()
@@ -2678,6 +2755,58 @@ class MainWindow(MainUI, QMainWindow):
         slot.runner = slot.plain
         slot.runner.start(args, J.split_pattern(j.out), J.out_duration(j), self.cfg.get("priority", "below"),
                           cores=self._cores(slot), direct=True, kinds=["split"])
+
+    # ── 2.3: the edits of «Metadata» written into the MKV itself (mkvpropedit) ──
+    def apply_inplace(self):
+        from . import propedit as PE
+        jobs = self.selected_jobs(editable=True)
+        if len(jobs) != 1 or self._busy(jobs[0]) or not PE.can(jobs[0]):
+            self._toast(t("tr_pick_one"))
+            return
+        j = jobs[0]
+        exe = PE.find()
+        if not exe:
+            self._toast(t("pe_none"))
+            return
+        if not PE.changes(j):
+            self._toast(t("pe_nothing"))
+            return
+        if getattr(self, "_pe_confirm", True):
+            box = QMessageBox(QMessageBox.Question, APP_TITLE, t("pe_ask", os.path.basename(j.src)), parent=self)
+            ok_b = box.addButton(t("pe_apply"), QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is not ok_b:
+                return
+        uid, src = j.uid, j.src
+
+        def work():
+            ok, msg = PE.run(j, exe)
+            self.bridge.propedit.emit(uid, ok, msg, P.probe(src))
+        threading.Thread(target=work, daemon=True).start()
+
+    def _on_propedit(self, uid: int, ok: bool, msg: str, info):
+        j = next((x for x in self.jobs if x.uid == uid), None)
+        if j is None:
+            return
+        if not ok:
+            self.log.appendPlainText("⚠ mkvpropedit: " + msg)
+            self._toast(t("pe_failed"))
+            return
+        j.meta.pop("streams", None)                       # in the file now: nothing left to change
+        if info is not None and not info.error:
+            j.info = info
+            tags = j.meta.get("tags")
+            if tags is not None and tags == J.source_tags(info):
+                j.meta.pop("tags", None)
+        self.log.appendPlainText("✎ " + t("pe_done", os.path.basename(j.src)))
+        self._toast(t("pe_done", os.path.basename(j.src)))
+        self._refresh(j)
+        self._queue_changed()
+        self._show_info(j)
+        for tab in (self.trim_tab, self.meta_tab, self.chap_tab):
+            tab.set_job(j, True)
+        self._fill_tracks()
 
     def _save_log(self, j: J.Job, slot: Slot | None = None):
         """The conversion's log file (Settings → keep logs): what, into what, the result, all of ffmpeg."""

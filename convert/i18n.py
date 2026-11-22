@@ -916,6 +916,47 @@ STRINGS = {
     "split_short_time": ("части по {} мин", "parts of {} min"),
     "split_running":  ("разбиение на части", "splitting into parts"),
     "split_failed":   ("разбить не удалось, файл остался целым", "the split failed, the file stays whole"),
+    # 2.3: by chapters
+    "split_chapters": ("По главам", "By chapters"),
+    "split_chap_n":   ("Глав в части", "Chapters a part"),
+    "split_names":    ("Имена частей", "Part names"),
+    "split_names_num": ("Имя_01, Имя_02 …", "Name_01, Name_02 …"),
+    "split_names_title": ("Имя_01 Название главы …", "Name_01 Chapter title …"),
+    "split_short_chap": ("части по {} гл.", "parts of {} ch."),
+    "split_no_chapters": ("В файле нет глав — разбивать по главам нечего", "The file has no chapters to split at"),
+    # 2.3: attachments
+    "att_section":    ("Вложения", "Attachments"),
+    "att_add":        ("Добавить вложение (шрифт TTF / OTF или другой файл)", "Add an attachment (a TTF / OTF font or another file)"),
+    "att_remove":     ("Убрать вложение", "Remove the attachment"),
+    "att_files":      ("Шрифты", "Fonts"),
+    "att_added":      ("добавлено", "added"),
+    "att_hint":       ("Шрифты для ASS-субтитров и другие файлы внутри MKV. Галочка — оставить вложение из исходника, "
+                       "«+» — добавить файл.",
+                       "Fonts for ASS subtitles and other files inside an MKV. The tick keeps an attachment of the "
+                       "source, «+» adds a file."),
+    "att_not_here":   ("Вложения бывают только в MKV / MKA — в этот формат они не попадут.",
+                       "Only MKV / MKA carry attachments — this format leaves them out."),
+    "w_attach_lost":  ("Шрифты (вложения) в MP4 не сохраняются — ASS-субтитры покажутся другим шрифтом. Для шрифтов — MKV.",
+                       "MP4 keeps no fonts (attachments) — the ASS subtitles will show in another font. Use MKV for fonts."),
+    # 2.3: mkvpropedit
+    "pe_apply":       ("Применить к файлу (без перепаковки)", "Apply to the file (no remux)"),
+    "pe_apply_tip":   ("Записать название, язык, имена и флаги дорожек прямо в MKV — за секунду, без нового файла",
+                       "Write the title, languages, track names and flags straight into the MKV — in a second, no new file"),
+    "pe_hint":        ("Можно сразу записать правки в сам MKV, как mkvpropedit: название фильма, язык, имя, "
+                       "«Осн.» и «Принуд.» дорожек.",
+                       "The edits can be written into the MKV itself, as mkvpropedit does: the film's title, the "
+                       "tracks' language, name, default and forced."),
+    "pe_missing":     ("Мгновенная правка MKV без перепаковки работает через mkvpropedit из "
+                       "<a href='{0}'>MKVToolNix</a> — установите его или положите mkvpropedit.exe рядом с программой.",
+                       "Instant MKV editing without a remux uses mkvpropedit of <a href='{0}'>MKVToolNix</a> — install "
+                       "it or put mkvpropedit.exe next to the program."),
+    "pe_ask":         ("Записать правки прямо в «{0}»?\n\nФайл изменится на месте, новой копии не будет.",
+                       "Write the edits straight into «{0}»?\n\nThe file changes in place, there is no new copy."),
+    "pe_none":        ("mkvpropedit не найден", "mkvpropedit is not found"),
+    "pe_nothing":     ("Править нечего: название и дорожки как в файле", "Nothing to change: the title and tracks are as in the file"),
+    "pe_done":        ("Правки записаны в {0}", "The edits are written into {0}"),
+    "pe_failed":      ("mkvpropedit не смог изменить файл — подробности в журнале",
+                       "mkvpropedit could not change the file — see the log"),
     "parts_n":        ("частей: {}", "parts: {}"),
     "minutes":        ("мин", "min"),
     "bench":          ("Тест скорости", "Speed test"),
