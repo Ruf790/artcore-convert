@@ -244,3 +244,25 @@ def test_propedit_missing_hides_the_button(qapp, att, data_dir, monkeypatch):
     assert not w.meta_tab.b_inplace.isVisibleTo(w.meta_tab)
     assert "MKVToolNix" in w.meta_tab.pe_hint.text() and PE.URL in t("pe_missing", PE.URL)
     w.close()
+
+
+# ── 2.3.1 ──
+def test_empty_preview_is_not_black(qapp, data_dir):
+    from convert import style
+    from convert.edit_tabs import TrimTab
+    old = "dark" if style.IS_DARK else "light"
+    try:
+        style.set_theme("light")
+        tt = TrimTab()
+        assert tt.stage_lay.currentWidget() is tt.placeholder
+        assert "#ffffff" in tt.stage.styleSheet() and "#000" not in tt.stage.styleSheet()
+        style.set_theme("dark")
+        tt._stage_bg()
+        assert style.PANEL in tt.stage.styleSheet()
+        from PySide6.QtWidgets import QLabel
+        pic = QLabel()
+        tt.stage_lay.addWidget(pic)
+        tt.stage_lay.setCurrentWidget(pic)                     # a picture: black under it
+        assert tt.stage.styleSheet() == "background: #000;"
+    finally:
+        style.set_theme(old)
