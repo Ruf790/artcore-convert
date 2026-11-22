@@ -1026,3 +1026,131 @@ class EstimateDialog(QDialog):
     def reject(self):
         self.est.stop = True
         super().reject()
+
+
+class ReleaseDialog(QDialog):
+    """2.4: «For a release» — MediaInfo, screenshots with a contact sheet, a sample and BBCode for a tracker."""
+    _step = Signal(int, int)
+    _done = Signal(object)
+
+    def __init__(self, info, cfg: dict, tonemap: bool = True, parent=None):
+        super().__init__(parent)
+        from PySide6.QtWidgets import QPlainTextEdit, QSpinBox
+        from . import release as R
+        from . import probe as P
+        self.info, self.cfg, self.tonemap, self.R = info, cfg, tonemap, R
+        self.res = None
+        o = dict(cfg.get("release") or {})
+        self.setWindowTitle(t("rel_title"))
+        self.setMinimumSize(720, 600)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(18, 14, 18, 14)
+        lay.addWidget(_head(t("rel_title")))
+        lay.addWidget(_hint(t("rel_hint", os.path.basename(info.path), P.summary(info))))
+        form = QFormLayout()
+        self.n = QComboBox()
+        self.n.setObjectName("relShots")
+        self.n.addItem(t("rel_no_shots"), 0)
+        for k in R.EVERY:
+            self.n.addItem(str(k), k)
+        self.n.setCurrentIndex(max(0, self.n.findData(int(o.get("shots", 12)))))
+        self.cols = QSpinBox()
+        self.cols.setRange(1, 8)
+        self.cols.setValue(int(o.get("cols", 4)))
+        self.singles = QCheckBox(t("rel_singles"))
+        self.singles.setChecked(bool(o.get("singles", True)))
+        self.sample = QComboBox()
+        self.sample.setObjectName("relSample")
+        for sec in (0, 30, 60, 120):
+            self.sample.addItem(t("rel_sample_none") if not sec else t("rel_sample_s", sec), sec)
+        self.sample.setCurrentIndex(max(0, self.sample.findData(int(o.get("sample", 60)))))
+        form.addRow(t("rel_shots"), self.n)
+        form.addRow(t("rel_cols"), self.cols)
+        form.addRow("", self.singles)
+        form.addRow(t("rel_sample"), self.sample)
+        self.dir = R.folder_for(info.path)
+        form.addRow(t("rel_folder"), _hint(self.dir))
+        lay.addLayout(form)
+        self.bar = QProgressBar()
+        self.bar.setRange(0, 1000)
+        self.bar.setValue(0)
+        lay.addWidget(self.bar)
+        self.text = QPlainTextEdit()
+        self.text.setReadOnly(True)
+        self.text.setStyleSheet("font-family: Consolas, 'DejaVu Sans Mono', monospace;")
+        self.text.setPlainText(R.info_text(info))
+        lay.addWidget(self.text, 1)
+        self.state = _hint("")
+        lay.addWidget(self.state)
+        row = QHBoxLayout()
+        self.b_make = QPushButton(t("rel_make"))
+        self.b_make.setObjectName("primary")
+        self.b_make.clicked.connect(self.make)
+        self.b_info = QPushButton(t("rel_copy_info"))
+        self.b_info.clicked.connect(lambda: self._copy(self.R.info_text(self.info)))
+        self.b_bb = QPushButton(t("rel_copy_bb"))
+        self.b_bb.setEnabled(False)
+        self.b_bb.clicked.connect(lambda: self._copy(self.res["bbcode"] if self.res else ""))
+        self.b_dir = QPushButton(t("rel_open"))
+        self.b_dir.setEnabled(False)
+        self.b_dir.clicked.connect(self._open)
+        for b in (self.b_make, self.b_info, self.b_bb, self.b_dir):
+            row.addWidget(b)
+        row.addStretch(1)
+        close = QPushButton(t("close"))
+        close.clicked.connect(self.reject)
+        row.addWidget(close)
+        lay.addLayout(row)
+        self._step.connect(lambda k, n: self.bar.setValue(int(1000 * k / max(1, n))))
+        self._done.connect(self._finished)
+
+    def opts(self) -> dict:
+        return {"shots": int(self.n.currentData()), "cols": int(self.cols.value()), "singles": self.singles.isChecked(),
+                "sample": int(self.sample.currentData()), "tonemap": self.tonemap, "dir": self.dir}
+
+    def make(self):
+        import threading
+        o = self.opts()
+        self.cfg["release"] = {k: o[k] for k in ("shots", "cols", "singles", "sample")}
+        self.b_make.setEnabled(False)
+        self.bar.setValue(0)
+        self.state.setText(t("rel_running"))
+        exe = ff.ffmpeg() or "ffmpeg"
+
+        def work():
+            try:
+                res = self.R.make(exe, self.info, o, lambda k, n, _w: self._step.emit(k, n))
+            except Exception as e:                       # noqa: BLE001
+                res = {"fail": str(e)}
+            self._done.emit(res)
+        threading.Thread(target=work, daemon=True).start()
+
+    def _finished(self, res: dict):
+        self.b_make.setEnabled(True)
+        if res.get("fail"):
+            self.state.setText("⚠ " + res["fail"])
+            return
+        self.res = res
+        self.bar.setValue(1000)
+        self.text.setPlainText(res["bbcode"])
+        self.b_bb.setEnabled(True)
+        self.b_dir.setEnabled(True)
+        bits = [t("rel_n_shots", len(res["shots"]))] if res["shots"] else []
+        if res["sheet"]:
+            bits.append(t("rel_sheet_done"))
+        if res["sample"]:
+            bits.append(t("rel_sample_done"))
+        msg = t("rel_done", ", ".join(bits) or "MediaInfo")
+        if res["errors"]:
+            msg += "\n⚠ " + "; ".join(res["errors"])
+        self.state.setText(msg)
+
+    def _copy(self, text: str):
+        from PySide6.QtWidgets import QApplication
+        QApplication.clipboard().setText(text)
+        self.state.setText(t("rel_copied"))
+
+    def _open(self):
+        from . import winint
+        if self.res:
+            winint.show_in_explorer(self.res["sheet"] or self.res["dir"])

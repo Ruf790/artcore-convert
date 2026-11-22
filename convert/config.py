@@ -13,6 +13,7 @@ DEFAULTS = {
     "look":          "classic",     # 1.6: classic (flat, square, compact) | modern (rounded, 1.0–1.5)
     "single_window": True,          # files opened from Explorer go to the running converter
     "check_updates": True,
+    "release":       {"shots": 12, "cols": 4, "singles": True, "sample": 60},   # 2.4: «For a release»
     "last_update_check": 0,
     "update_notified": "",
     "geometry":      "",

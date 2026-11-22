@@ -81,6 +81,14 @@ class TrimTab(QWidget):
     media_wanted = Signal(object)        # a new task is shown: its strip and loudness are needed
     position_changed = Signal(float)
 
+    def _stage_bg(self):
+        """2.3.1: black only under a picture; with no video the empty area is the window's own colour
+        (white in the light theme)."""
+        empty = self.stage_lay.currentWidget() is self.placeholder
+        bg = ("#ffffff" if not style.IS_DARK else style.PANEL) if empty else "#000"
+        self.stage.setStyleSheet(f"background: {bg};")
+        self.placeholder.setStyleSheet(f"color: {style.MUTED}; font-size: 11pt; background: {bg};")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.job: J.Job | None = None
@@ -104,8 +112,9 @@ class TrimTab(QWidget):
         self.placeholder = QLabel(t("trm_placeholder"))
         self.placeholder.setAlignment(Qt.AlignCenter)
         self.placeholder.setWordWrap(True)
-        self.placeholder.setStyleSheet("color: #8a8f99; font-size: 11pt; background: #000;")
         self.stage_lay.addWidget(self.placeholder)
+        self.stage_lay.currentChanged.connect(lambda _i: self._stage_bg())
+        self._stage_bg()
         self.bar = Timeline()
         self.bar.seek.connect(lambda s: self._seek(s, exact=False))
         self.transport = QWidget()

@@ -998,6 +998,7 @@ class MainWindow(MainUI, QMainWindow):
                     m.addAction(style.icon("fa6s.scale-balanced"), t("est_menu") + "…", lambda: self.estimate_dialog(j))
                 if j.info.video is not None:
                     m.addAction(style.icon("fa6s.ranking-star"), t("cmp_title") + "…", lambda: self.compare_dialog(j))
+                m.addAction(style.icon("fa6s.camera"), t("rel_menu") + "…", lambda: self.release_dialog(j))
             if len(jobs) == 1 and j in ed:
                 m.addAction(style.icon("fa6s.link"), t("join_add") + "…", lambda: self.join_add_dialog())
                 if j.joins:
@@ -1134,6 +1135,24 @@ class MainWindow(MainUI, QMainWindow):
             self._select_changed()
         d = EstimateDialog(j, self.av, bool(self.cfg.get("hw_decode", True)), self, picked)
         self._est_dlg = d
+        d.show()
+        return d
+
+    def release_dialog(self, j: J.Job | None = None):
+        """2.4: «For a release» — of the result when the task is done, else of the source."""
+        if j is None:
+            sel = self.selected_jobs()
+            j = sel[0] if len(sel) == 1 else None
+        if j is None or j.info is None or j.info.error:
+            self._toast(t("tr_pick_one"))
+            return None
+        info = j.info
+        if j.status == "done" and j.out and os.path.isfile(j.out):
+            r = P.probe(j.out)
+            info = r if not r.error else info
+        from .dialogs import ReleaseDialog
+        d = ReleaseDialog(info, self.cfg, "zscale" in (getattr(self.av, "filters", None) or ()), self)
+        self._rel_dlg = d
         d.show()
         return d
 
