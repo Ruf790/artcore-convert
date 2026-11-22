@@ -1,7 +1,7 @@
 """ArtCore Convert — a video converter on FFmpeg with a Qt interface (NVENC / AMF / QSV / x264 / x265 / SVT-AV1 / VP9 /
 Xvid / ProRes …) and a libmpv preview for trimming."""
-VERSION_TUPLE = (2, 2, 1, 0)
-VERSION       = "2.2.1"
+VERSION_TUPLE = (2, 2, 2, 0)
+VERSION       = "2.2.2"
 APP_TITLE     = "ArtCore Convert"
 APP_ID        = "ArtCore.Convert"
 REPO          = "Ruf790/artcore-convert"

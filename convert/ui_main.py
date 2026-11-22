@@ -356,9 +356,7 @@ class MainUI:
         A(m, "fa6s.microchip", t("encoders_here") + "…", self.encoders_dialog)
         A(m, "fa6s.gauge-high", t("bench") + "…", self.bench_dialog)
         A(m, "fa6s.scale-balanced", t("cmp_title") + "…", self.compare_dialog)
-        m = mb.addMenu(t("m_help"))
-        A(m, "fa6s.circle-info", t("about"), self.about)
-        return mb
+        return mb                        # 2.2.2: no «Help» menu — «About» is in the ArtCore Convert menu
 
     def _fill_preset_del(self):
         m = self.preset_del_menu
