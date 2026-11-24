@@ -980,6 +980,10 @@ class MainWindow(MainUI, QMainWindow):
                 m.addAction(style.icon("fa6s.folder-open"), t("show_result"), lambda: winint.show_in_explorer(j.out))
             m.addAction(style.icon("fa6s.folder"), t("show_source"), lambda: winint.show_in_explorer(j.src))
             m.addAction(style.icon("fa6s.circle-play"), t("open_source"), lambda: self.open_source(j))
+            if os.path.isfile(j.src):
+                m.addAction(style.icon("fa6s.wave-square"), t("snd_open_src"), lambda: self.open_in_sound([j.src]))
+            if j.status == "done" and j.out and os.path.isfile(j.out):
+                m.addAction(style.icon("fa6s.wave-square"), t("snd_open_out"), lambda: self.open_in_sound([j.out]))
             m.addSeparator()
             jobs = self.selected_jobs()
             if j.status in EDITABLE and not self._busy(j):
@@ -1060,6 +1064,39 @@ class MainWindow(MainUI, QMainWindow):
         from PySide6.QtCore import QUrl
         from PySide6.QtGui import QDesktopServices
         QDesktopServices.openUrl(QUrl.fromLocalFile(j.out))
+
+    # ── 2.5.2: «Open in ArtCore Sound» ────────────────────────
+    def open_in_sound(self, paths: list[str]) -> bool:
+        """The files in ArtCore Sound (the audio editor). Not found: download it or show where its exe is."""
+        from . import soundlink
+        while True:
+            try:
+                if soundlink.open_files(paths, self.cfg):
+                    self._toast(t("snd_sent"))
+                    return True
+            except OSError as e:
+                QMessageBox.warning(self, APP_TITLE, t("snd_failed", e.strerror or str(e)))
+                return False
+            box = QMessageBox(QMessageBox.Information, APP_TITLE, t("snd_missing"), QMessageBox.NoButton, self)
+            b_browse = box.addButton(t("snd_browse"), QMessageBox.AcceptRole)
+            b_get = box.addButton(t("snd_download"), QMessageBox.ActionRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+            if box.clickedButton() is b_get:
+                from PySide6.QtCore import QUrl
+                from PySide6.QtGui import QDesktopServices
+                QDesktopServices.openUrl(QUrl(soundlink.DOWNLOAD_URL))
+                return False
+            if box.clickedButton() is not b_browse:
+                return False
+            path, _f = QFileDialog.getOpenFileName(self, t("snd_browse"), "", f"ArtCore Sound ({soundlink.EXE})")
+            if not path:
+                return False
+            if not soundlink.is_sound_exe(path):
+                QMessageBox.warning(self, APP_TITLE, t("snd_not_exe"))
+                continue
+            self.cfg["sound_exe"] = os.path.normpath(path)
+            config.save(self.cfg)
 
     # ── 1.4: the order with the mouse, the list in a file ─────
     def _on_reordered(self):
