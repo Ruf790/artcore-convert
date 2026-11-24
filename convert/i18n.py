@@ -1257,6 +1257,18 @@ STRINGS = {
                        "The core alone: the compatible part (DTS 5.1 up to 1.5 Mbit/s, AC3) any receiver plays. "
                        "Cut out without re-encoding."),
     "demux_empty":    ("пустые, удалены: {0}", "came out empty, deleted: {0}"),
+    # ── 2.5.2: «Open in ArtCore Sound» ───────────────────────
+    "snd_open_src":   ("Открыть исходник в ArtCore Sound", "Open the source in ArtCore Sound"),
+    "snd_open_out":   ("Открыть результат в ArtCore Sound", "Open the result in ArtCore Sound"),
+    "snd_missing":    ("ArtCore Sound не найден. Это звуковой редактор ArtCore — скачайте и установите его "
+                       "или укажите, где лежит ArtCoreSound.exe.",
+                       "ArtCore Sound was not found. It is the ArtCore audio editor — download and install it, "
+                       "or show where ArtCoreSound.exe is."),
+    "snd_browse":     ("Указать ArtCoreSound.exe…", "Locate ArtCoreSound.exe…"),
+    "snd_download":   ("Скачать", "Download"),
+    "snd_not_exe":    ("Это не ArtCoreSound.exe", "This is not ArtCoreSound.exe"),
+    "snd_failed":     ("Не удалось запустить ArtCore Sound: {0}", "Could not start ArtCore Sound: {0}"),
+    "snd_sent":       ("Открывается в ArtCore Sound", "Opening in ArtCore Sound"),
     # ── 1.9: the task's menu ─────────────────────────────────
     "open_source":    ("Открыть исходник", "Open the source"),
     "q_first":        ("Кодировать первым", "Encode first"),

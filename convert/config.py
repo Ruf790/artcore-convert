@@ -53,6 +53,8 @@ DEFAULTS = {
     # 2.1
     "start_at":      0,             # the delayed start of the queue (seconds since the epoch, 0 = none; delay.py)
     "start_time":    "01:00",       # the time last picked in «Start at…»
+    # 2.5.2
+    "sound_exe":     "",            # ArtCoreSound.exe when it is not where the registry says («Open in ArtCore Sound»)
 }
 
 CPU_LIMITS = (100, 75, 50, 25)
